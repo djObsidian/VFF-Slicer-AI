@@ -24,8 +24,65 @@ from __future__ import annotations
 
 import numpy as np
 import trimesh
+from scipy.ndimage import gaussian_filter
 
 from .growth import GrowthResult
+
+
+def smoothed_depth_field(growth: GrowthResult, sigma: float = 1.5) -> np.ndarray:
+    """Continuous "depth from bed" field used by both surface viz and deform.
+
+    Combines two ideas:
+
+      1. Outside the model the field is VERTICAL: `field = k - k_bed_layer`.
+         So iso-surfaces in empty space are exact horizontal planes — the
+         normals there point straight up, matching the print head's default
+         orientation. No more radial flood-fill perturbations near the model.
+
+      2. Inside the model the field starts as the integer BFS step, which is
+         anisotropic — it depends on how the model's features happen to line
+         up with the voxel grid axes. Two geometrically-identical features
+         at different angles (e.g. propeller blades) end up with slightly
+         different step distributions, which makes their deformations look
+         different. A Gaussian smoothing of the whole field (interior +
+         vertical exterior, jointly) averages this anisotropy out and gives
+         a continuous "depth" that respects the model's symmetry.
+
+    Key boundary property: inside the model at the bed (k = k_bed_layer)
+    step is 0; the vertical extension at the same k is also 0 (=
+    k - k_bed_layer). They agree on the bed surface, so Gaussian smoothing
+    doesn't introduce a gradient across the bed boundary — bed contact is
+    preserved.
+
+    `sigma` is in voxel units. Default 1.5 = light smoothing that visibly
+    symmetrizes the field without erasing real growth geometry. Heavier
+    sigma symmetrizes more but starts to round off real overhangs.
+    """
+    step = growth.step
+    if step.size == 0 or not (step >= 0).any():
+        return np.zeros(step.shape, dtype=np.float32)
+
+    nx, ny, nz = step.shape
+
+    # k_bed_layer = lowest Z-layer that contains any model voxel.
+    # Matches _seed_bed_mask convention (step=0 voxels live here).
+    has_model_in_z = (step >= 0).any(axis=(0, 1))
+    k_bed_layer = int(np.argmax(has_model_in_z))
+
+    # Initialize with BFS step inside the model.
+    field = step.astype(np.float32).copy()
+
+    # Vertical extension outside the model: step = k - k_bed_layer.
+    k_axis = np.arange(nz, dtype=np.float32) - float(k_bed_layer)
+    k_grid = np.broadcast_to(k_axis[None, None, :], step.shape)
+    empty = step < 0
+    field[empty] = k_grid[empty]
+
+    # Joint Gaussian smoothing across interior + vertical exterior.
+    if sigma > 0:
+        field = gaussian_filter(field, sigma=sigma, mode="nearest")
+
+    return field
 
 
 def _extended_step_field(growth: GrowthResult) -> np.ndarray:
@@ -126,6 +183,7 @@ def deform_mesh(
     dz_per_layer: float | None = None,
     bed_z: float = 0.0,
     bed_blend_height: float | None = None,
+    smooth_sigma: float = 1.5,
 ) -> trimesh.Trimesh:
     """Return a deformed copy of `mesh` whose Z is driven by the growth step.
 
@@ -155,7 +213,10 @@ def deform_mesh(
     if bed_blend_height is None:
         bed_blend_height = 2.0 * growth.pitch
 
-    field = _extended_step_field(growth)
+    # smoothed_depth_field gives a continuous, symmetry-respecting field that
+    # agrees with the BFS step inside the model and with vertical depth
+    # outside it. See its docstring for why this matters for symmetric parts.
+    field = smoothed_depth_field(growth, sigma=smooth_sigma)
     verts = mesh.vertices.astype(np.float64, copy=False)
     step_continuous = _sample_trilinear(field, growth.origin, growth.pitch, verts).astype(np.float64)
 

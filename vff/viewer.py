@@ -38,7 +38,7 @@ import vtk
 from vtk.util import numpy_support as vns
 
 from .build_volume import BuildVolume
-from .deform import deform_mesh, _extended_step_field
+from .deform import deform_mesh, smoothed_depth_field
 from .growth import GrowthResult, compute_growth
 from .voxelize import VoxelGrid, voxelize_solid
 
@@ -862,11 +862,14 @@ class Viewer:
         image.SetSpacing(gr.pitch, gr.pitch, gr.pitch)
         image.SetOrigin(float(gr.origin[0]), float(gr.origin[1]), float(gr.origin[2]))
 
-        # Extend the step field into the empty volume around the model so the
-        # iso-surface is defined throughout the model's bounding parallelepiped,
-        # not clipped to the model's voxels. _extended_step_field does an
-        # iterative 26-conn flood-fill that propagates step values outward.
-        extended = _extended_step_field(gr)
+        # Smoothed continuous depth field — see deform.smoothed_depth_field.
+        # Inside the model: BFS step values, Gaussian-smoothed so symmetric
+        # features (e.g. propeller blades) end up with symmetric depth even
+        # though raw BFS is anisotropic in voxel-grid coordinates.
+        # Outside the model: vertical depth (k - k_bed_layer), so iso-surfaces
+        # extend as horizontal planes with vertical normals — no flood-fill
+        # perturbations near the model boundary.
+        extended = smoothed_depth_field(gr, sigma=1.5)
         step_flat = extended.flatten(order="F")
         arr = vns.numpy_to_vtk(step_flat, deep=True, array_type=vtk.VTK_FLOAT)
         arr.SetName("step")
