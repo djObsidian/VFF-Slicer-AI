@@ -428,6 +428,11 @@ class Viewer:
         self.plotter.render()
 
     def rebuild_voxels(self) -> None:
+        # Rebuilding voxels invalidates any growth result built from them.
+        # Drop growth state so the next G press recomputes cleanly.
+        if self.growth is not None:
+            _log("[vff] rebuild_voxels: invalidating prior growth state")
+            self._invalidate_growth()
         self.show_voxels = True
         self._rebuild_voxels()
         self._refresh_hud()
@@ -447,7 +452,36 @@ class Viewer:
     # ----- growth -----
 
     def do_compute_growth(self) -> None:
+        """G hotkey: toggle in/out of growth view.
+
+        - First press (no growth yet): voxelize if needed, run BFS, build
+          actors + slider, enter growth view with sensible defaults
+          (translucent voxels + arrows + surface visible, mesh hidden).
+        - Subsequent press: toggles the whole growth-view subsystem on/off.
+          The growth result and actors are kept; only visibility flips.
+        - Recompute is on-demand: clear with `B` (rebuild voxels) and press
+          `G` again, or call `force_recompute_growth` programmatically.
+        """
         _log("[vff] do_compute_growth: entering")
+
+        if self.growth is not None:
+            # Toggle existing view.
+            in_view = (
+                self.show_growth_step
+                or self.show_growth_vec
+                or self.show_growth_surface
+            )
+            if in_view:
+                _log("[vff] do_compute_growth: exiting growth view")
+                self._exit_growth_view()
+            else:
+                _log("[vff] do_compute_growth: re-entering growth view")
+                self._enter_growth_view()
+            self._refresh_hud()
+            self.plotter.render()
+            return
+
+        # First time: compute everything.
         if self.voxel_grid is None:
             _log("[vff] do_compute_growth: rebuilding voxels first")
             self.rebuild_voxels()
@@ -471,15 +505,6 @@ class Viewer:
         self._growth_max_step = max(self.growth.n_steps - 1, 0)
         self._growth_current_step = self._growth_max_step
 
-        # Plain mesh + voxel shell would just clutter; turn them off when the
-        # growth view comes up. User can re-enable with M / V.
-        if self.mesh_actor is not None:
-            self.show_mesh = False
-            self.mesh_actor.SetVisibility(False)
-        if self.voxel_actor is not None:
-            self.show_voxels = False
-            self.voxel_actor.SetVisibility(False)
-
         _log("[vff] do_compute_growth: building step actor")
         self._build_growth_step_actor()
         _log("[vff] do_compute_growth: building vector actor")
@@ -488,10 +513,84 @@ class Viewer:
         self._build_growth_surface_actor()
         _log("[vff] do_compute_growth: adding slider")
         self._add_growth_slider()
-        _log("[vff] do_compute_growth: refresh hud + render")
+        _log("[vff] do_compute_growth: entering growth view")
+        self._enter_growth_view()
         self._refresh_hud()
         self.plotter.render()
         _log("[vff] do_compute_growth: done")
+
+    def _enter_growth_view(self) -> None:
+        """Show growth visualisation: translucent voxels (so arrows + surface
+        underneath are visible), arrows, and surface. Hide raw mesh, voxel
+        shell, and deformed mesh — only one view at a time."""
+        self.show_mesh = False
+        self.show_voxels = False
+        self.show_deformed = False
+        self.show_growth_step = True
+        self._growth_step_opaque = False  # translucent so vectors + surface show
+        self.show_growth_vec = True
+        self.show_growth_surface = True
+        self._apply_growth_visibility()
+
+    def _exit_growth_view(self) -> None:
+        """Hide all growth actors, bring the mesh back."""
+        self.show_growth_step = False
+        self.show_growth_vec = False
+        self.show_growth_surface = False
+        self.show_deformed = False
+        self.show_mesh = True
+        self._apply_growth_visibility()
+
+    def _apply_growth_visibility(self) -> None:
+        if self.mesh_actor is not None:
+            self.mesh_actor.SetVisibility(self.show_mesh)
+        if self.voxel_actor is not None:
+            self.voxel_actor.SetVisibility(self.show_voxels)
+        if self._growth_step_actor is not None:
+            self._growth_step_actor.SetVisibility(self.show_growth_step)
+            self._growth_step_actor.GetProperty().SetOpacity(
+                1.0 if self._growth_step_opaque else self._growth_translucent_alpha
+            )
+        if self._growth_vec_actor is not None:
+            self._growth_vec_actor.SetVisibility(self.show_growth_vec)
+        if self._growth_surface_actor is not None:
+            self._growth_surface_actor.SetVisibility(self.show_growth_surface)
+        if self._deformed_actor is not None:
+            self._deformed_actor.SetVisibility(self.show_deformed)
+
+    def _invalidate_growth(self) -> None:
+        """Drop all growth state and actors. Next G press recomputes from
+        scratch. Used when the underlying voxel grid changes (B hotkey)."""
+        renderer = self.plotter.renderer
+        for attr in (
+            "_growth_step_actor",
+            "_growth_vec_actor",
+            "_growth_surface_actor",
+            "_deformed_actor",
+        ):
+            actor = getattr(self, attr, None)
+            if actor is not None:
+                renderer.RemoveActor(actor)
+                setattr(self, attr, None)
+        self._growth_step_threshold = None
+        self._growth_vec_threshold = None
+        self._growth_surface_contour = None
+        if self._growth_slider is not None:
+            try:
+                self.plotter.clear_slider_widgets()
+            except Exception:
+                pass
+            self._growth_slider = None
+        self.growth = None
+        self.deformed_mesh = None
+        self.show_growth_step = False
+        self.show_growth_vec = False
+        self.show_growth_surface = False
+        self.show_deformed = False
+        # Bring the mesh back into the picture.
+        self.show_mesh = True
+        if self.mesh_actor is not None:
+            self.mesh_actor.SetVisibility(True)
 
     def toggle_growth_step(self) -> None:
         if self._growth_step_actor is None:
