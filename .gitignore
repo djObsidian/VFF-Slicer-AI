@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Local debug / screenshot artifacts
+_*.png
+_*.txt
+_*.log
+
+# IDE
+.idea/
+.vscode/
+*.swp
