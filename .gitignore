@@ -9,6 +9,18 @@ _*.png
 _*.txt
 _*.log
 
+# Locally generated artefacts (regenerated from the pipeline)
+deformed.stl
+deformed.gcode
+propeller_inverse*.gcode
+propeller_nonplanar*.gcode
+propeller_conformed*.gcode
+propeller_clipped*.gcode
+
+# OS / non-ASCII-named screenshots
+Снимок*.png
+Скриншот*.png
+
 # IDE
 .idea/
 .vscode/
