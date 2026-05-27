@@ -65,7 +65,14 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     viewer = Viewer(mesh, volume, initial_pitch=args.pitch)
-    print("Viewer ready. Hotkeys: M / V / B / [ / ] (or Up / Down) / F5", flush=True)
+    print(
+        "Viewer ready. Hotkeys: M/V/B  G/C/N  [ / ]  Up/Down  F5",
+        flush=True,
+    )
+    print(
+        "  M mesh  V voxel-shell  B re-voxel | G growth  C step-color  N vectors",
+        flush=True,
+    )
     viewer.show()
     print("Viewer closed.", flush=True)
     return 0

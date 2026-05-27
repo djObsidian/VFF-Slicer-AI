@@ -7,14 +7,20 @@ Scene composition (all in world coords, Z up):
 - World-origin axis triad
 - Loaded mesh (centered on bed)
 - Voxel grid (built on demand)
+- Growth-step coloured voxels + per-voxel "toward older" vector arrows
 
 Hotkeys:
-- M : toggle mesh visibility
-- V : toggle voxels (builds them the first time if needed)
+- M : toggle mesh
+- V : toggle plain voxel shell (builds voxels lazily)
 - B : (re)build voxels at current pitch
-- [ / ] : decrease / increase pitch by 25%
-- R : reset camera
-- W : wireframe (built into VTK)
+- G : (re)compute spatial growth from the bed
+- C : toggle growth step-coloured voxels
+- N : toggle growth vector arrows
+- [ / ] or Up / Down : pitch -/+ 25%
+- F5 : reset view
+- W / S / R : VTK default (wireframe / surface / reset camera)
+
+The growth step slider appears at the bottom of the viewport after G.
 """
 
 from __future__ import annotations
@@ -27,8 +33,11 @@ from typing import Callable
 import numpy as np
 import pyvista as pv
 import trimesh
+import vtk
+from vtk.util import numpy_support as vns
 
 from .build_volume import BuildVolume
+from .growth import GrowthResult, compute_growth
 from .voxelize import VoxelGrid, voxelize_solid
 
 
@@ -62,6 +71,35 @@ _VOXEL_COLOR = "#ff8855"
 _BACKGROUND = "#1e1e22"
 _BACKGROUND_TOP = "#3a3a44"
 _HUD_COLOR = "#eeeeee"
+
+
+def _threshold_points_between(filt: "vtk.vtkThresholdPoints", lo: float, hi: float) -> None:
+    """vtkThresholdPoints.ThresholdBetween is deprecated in VTK 9.6. Prefer
+    the new (SetLower/SetUpper/SetThresholdFunction) API when available."""
+    if hasattr(filt, "SetLowerThreshold") and hasattr(filt, "SetUpperThreshold"):
+        filt.SetLowerThreshold(float(lo))
+        filt.SetUpperThreshold(float(hi))
+        if hasattr(filt, "SetThresholdFunction") and hasattr(vtk, "vtkThresholdPoints"):
+            # Constants on vtkThresholdPoints in 9.6:
+            #   THRESHOLD_BETWEEN / THRESHOLD_LOWER / THRESHOLD_UPPER
+            cls = vtk.vtkThresholdPoints
+            if hasattr(cls, "THRESHOLD_BETWEEN"):
+                filt.SetThresholdFunction(cls.THRESHOLD_BETWEEN)
+    else:
+        filt.ThresholdBetween(float(lo), float(hi))
+
+
+def _growth_lut(n_steps: int) -> vtk.vtkLookupTable:
+    """Blue (bed) -> red (top) hue ramp for growth-step coloring.
+    Same LUT is used for voxels and arrows so they stay visually consistent."""
+    lut = vtk.vtkLookupTable()
+    lut.SetTableRange(0.0, max(float(n_steps - 1), 1.0))
+    lut.SetHueRange(0.66, 0.0)
+    lut.SetSaturationRange(0.7, 0.9)
+    lut.SetValueRange(0.95, 0.95)
+    lut.SetNumberOfTableValues(max(n_steps, 2) * 4)
+    lut.Build()
+    return lut
 
 
 def trimesh_to_pv(mesh: trimesh.Trimesh) -> pv.PolyData:
@@ -135,6 +173,19 @@ class Viewer:
         self.voxel_grid: VoxelGrid | None = None
         self._last_voxelize_ms: float | None = None
         self._hud_actor = None  # persistent text actor; updated via SetInput
+
+        # Growth-field state.
+        self.growth: GrowthResult | None = None
+        self._growth_step_actor = None        # vtkActor for step-colored voxels
+        self._growth_step_threshold = None    # vtkThreshold (updated by slider)
+        self._growth_vec_actor = None         # vtkActor for arrow glyphs
+        self._growth_vec_threshold = None     # vtkThresholdPoints (updated by slider)
+        self._growth_slider = None
+        self._growth_current_step = 0
+        self._growth_max_step = 0
+        self._last_growth_ms: float | None = None
+        self.show_growth_step = True
+        self.show_growth_vec = True
 
         self.show_mesh = True
         self.show_voxels = False
@@ -261,12 +312,14 @@ class Viewer:
 
     def _bind_keys(self) -> None:
         # `r`, `w`, `s` are reserved by VTK's default interactor (reset cam,
-        # wireframe, surface). Don't double-bind them — use uppercase / safer
-        # alternatives for things we control.
+        # wireframe, surface). Don't double-bind them — use safer alternatives.
         bindings = {
             "m": ("toggle_mesh", self.toggle_mesh),
             "v": ("toggle_voxels", self.toggle_voxels),
             "b": ("rebuild_voxels", self.rebuild_voxels),
+            "g": ("compute_growth", self.do_compute_growth),
+            "c": ("toggle_growth_step", self.toggle_growth_step),
+            "n": ("toggle_growth_vec", self.toggle_growth_vec),
             "bracketleft": ("decrease_pitch", self.decrease_pitch),
             "bracketright": ("increase_pitch", self.increase_pitch),
             "Up": ("increase_pitch", self.increase_pitch),
@@ -315,6 +368,245 @@ class Viewer:
         self._refresh_hud()
         self.plotter.render()
 
+    # ----- growth -----
+
+    def do_compute_growth(self) -> None:
+        if self.voxel_grid is None:
+            self.rebuild_voxels()
+        if self.voxel_grid is None:
+            _log("[vff] growth: no voxel grid available, aborting")
+            return
+
+        t0 = time.perf_counter()
+        self.growth = compute_growth(self.voxel_grid, connectivity=6)
+        self._last_growth_ms = (time.perf_counter() - t0) * 1000.0
+        _log(
+            f"[vff] growth: {self.growth.n_steps} steps, "
+            f"{self.growth.painted_count} voxels, {self._last_growth_ms:.0f} ms"
+        )
+
+        self._growth_max_step = max(self.growth.n_steps - 1, 0)
+        self._growth_current_step = self._growth_max_step
+
+        # Plain mesh + voxel shell would just clutter; turn them off when the
+        # growth view comes up. User can re-enable with M / V.
+        if self.mesh_actor is not None:
+            self.show_mesh = False
+            self.mesh_actor.SetVisibility(False)
+        if self.voxel_actor is not None:
+            self.show_voxels = False
+            self.voxel_actor.SetVisibility(False)
+
+        self._build_growth_step_actor()
+        self._build_growth_vec_actor()
+        self._add_growth_slider()
+        self._refresh_hud()
+        self.plotter.render()
+
+    def toggle_growth_step(self) -> None:
+        if self._growth_step_actor is None:
+            return
+        self.show_growth_step = not self.show_growth_step
+        self._growth_step_actor.SetVisibility(self.show_growth_step)
+        self._refresh_hud()
+        self.plotter.render()
+
+    def toggle_growth_vec(self) -> None:
+        if self._growth_vec_actor is None:
+            return
+        self.show_growth_vec = not self.show_growth_vec
+        self._growth_vec_actor.SetVisibility(self.show_growth_vec)
+        self._refresh_hud()
+        self.plotter.render()
+
+    def _build_growth_step_actor(self) -> None:
+        gr = self.growth
+        assert gr is not None
+        renderer = self.plotter.renderer
+
+        if self._growth_step_actor is not None:
+            renderer.RemoveActor(self._growth_step_actor)
+            self._growth_step_actor = None
+            self._growth_step_threshold = None
+
+        nx, ny, nz = gr.step.shape
+
+        image = vtk.vtkImageData()
+        image.SetDimensions(nx + 1, ny + 1, nz + 1)  # cell dims = point dims - 1
+        image.SetSpacing(gr.pitch, gr.pitch, gr.pitch)
+        image.SetOrigin(float(gr.origin[0]), float(gr.origin[1]), float(gr.origin[2]))
+
+        # VTK cell ordering matches numpy 'F' (X fastest).
+        step_flat = gr.step.astype(np.int32).flatten(order="F")
+        step_arr = vns.numpy_to_vtk(step_flat, deep=True, array_type=vtk.VTK_INT)
+        step_arr.SetName("step")
+        image.GetCellData().AddArray(step_arr)
+        image.GetCellData().SetActiveScalars("step")
+
+        threshold = vtk.vtkThreshold()
+        threshold.SetInputData(image)
+        threshold.SetInputArrayToProcess(
+            0, 0, 0,
+            vtk.vtkDataObject.FIELD_ASSOCIATION_CELLS,
+            "step",
+        )
+        # vtk 9 API.
+        threshold.SetLowerThreshold(0.0)
+        threshold.SetUpperThreshold(float(self._growth_current_step))
+        if hasattr(threshold, "SetThresholdFunction"):
+            threshold.SetThresholdFunction(vtk.vtkThreshold.THRESHOLD_BETWEEN)
+
+        geom = vtk.vtkGeometryFilter()
+        geom.SetInputConnection(threshold.GetOutputPort())
+
+        lut = _growth_lut(gr.n_steps)
+
+        mapper = vtk.vtkPolyDataMapper()
+        mapper.SetInputConnection(geom.GetOutputPort())
+        mapper.SetScalarModeToUseCellData()
+        mapper.SelectColorArray("step")
+        mapper.SetScalarRange(0.0, max(float(gr.n_steps - 1), 1.0))
+        mapper.SetLookupTable(lut)
+        mapper.ScalarVisibilityOn()
+
+        actor = vtk.vtkActor()
+        actor.SetMapper(mapper)
+        actor.SetVisibility(self.show_growth_step)
+
+        renderer.AddActor(actor)
+        self._growth_step_actor = actor
+        self._growth_step_threshold = threshold
+
+    def _build_growth_vec_actor(self) -> None:
+        gr = self.growth
+        assert gr is not None
+        renderer = self.plotter.renderer
+
+        if self._growth_vec_actor is not None:
+            renderer.RemoveActor(self._growth_vec_actor)
+            self._growth_vec_actor = None
+            self._growth_vec_threshold = None
+
+        # Vectors live on step>=1 voxels only.
+        xs, ys, zs = np.where(gr.step >= 1)
+        if xs.size == 0:
+            return
+
+        centers = (
+            gr.origin
+            + (np.column_stack([xs, ys, zs]).astype(np.float64) + 0.5) * gr.pitch
+        )
+        vecs = gr.vectors[xs, ys, zs].astype(np.float64)
+        steps = gr.step[xs, ys, zs].astype(np.int32)
+        n = len(xs)
+
+        # Polydata of vertex cells so vtkThresholdPoints sees the points.
+        polydata = vtk.vtkPolyData()
+        points = vtk.vtkPoints()
+        points.SetData(vns.numpy_to_vtk(centers, deep=True, array_type=vtk.VTK_DOUBLE))
+        polydata.SetPoints(points)
+
+        vec_arr = vns.numpy_to_vtk(vecs, deep=True, array_type=vtk.VTK_DOUBLE)
+        vec_arr.SetName("vector")
+        polydata.GetPointData().SetVectors(vec_arr)
+
+        step_arr = vns.numpy_to_vtk(steps, deep=True, array_type=vtk.VTK_INT)
+        step_arr.SetName("step")
+        polydata.GetPointData().AddArray(step_arr)
+        polydata.GetPointData().SetActiveScalars("step")
+
+        verts = vtk.vtkCellArray()
+        # One vertex cell per point.
+        conn = np.empty(2 * n, dtype=np.int64)
+        conn[0::2] = 1
+        conn[1::2] = np.arange(n, dtype=np.int64)
+        # vtkCellArray.SetCells using vtkIdTypeArray is fast but version-sensitive.
+        # Use InsertNextCell loop — n is at most a few hundred thousand, fine.
+        for i in range(n):
+            verts.InsertNextCell(1)
+            verts.InsertCellPoint(i)
+        polydata.SetVerts(verts)
+
+        threshold = vtk.vtkThresholdPoints()
+        threshold.SetInputData(polydata)
+        threshold.SetInputArrayToProcess(
+            0, 0, 0,
+            vtk.vtkDataObject.FIELD_ASSOCIATION_POINTS,
+            "step",
+        )
+        _threshold_points_between(threshold, 1, self._growth_current_step)
+
+        arrow = vtk.vtkArrowSource()
+        arrow.SetTipLength(0.32)
+        arrow.SetTipRadius(0.13)
+        arrow.SetShaftRadius(0.04)
+
+        glyph = vtk.vtkGlyph3D()
+        glyph.SetInputConnection(threshold.GetOutputPort())
+        glyph.SetSourceConnection(arrow.GetOutputPort())
+        glyph.SetVectorModeToUseVector()
+        glyph.SetScaleModeToScaleByVector()
+        glyph.SetScaleFactor(gr.pitch * 0.7)
+        glyph.OrientOn()
+        glyph.SetColorModeToColorByScalar()
+
+        lut = _growth_lut(gr.n_steps)
+
+        mapper = vtk.vtkPolyDataMapper()
+        mapper.SetInputConnection(glyph.GetOutputPort())
+        mapper.SetScalarModeToUsePointFieldData()
+        mapper.SelectColorArray("step")
+        mapper.SetScalarRange(0.0, max(float(gr.n_steps - 1), 1.0))
+        mapper.SetLookupTable(lut)
+        mapper.ScalarVisibilityOn()
+
+        actor = vtk.vtkActor()
+        actor.SetMapper(mapper)
+        actor.SetVisibility(self.show_growth_vec)
+
+        renderer.AddActor(actor)
+        self._growth_vec_actor = actor
+        self._growth_vec_threshold = threshold
+
+    def _add_growth_slider(self) -> None:
+        # Replace any previous growth slider (pitch is controlled by hotkeys).
+        try:
+            self.plotter.clear_slider_widgets()
+        except Exception:
+            pass
+        self._growth_slider = None
+
+        max_step = self._growth_max_step
+
+        def on_slider(value: float) -> None:
+            try:
+                step = int(round(float(value)))
+                step = max(0, min(step, max_step))
+                self._growth_current_step = step
+                if self._growth_step_threshold is not None:
+                    self._growth_step_threshold.SetUpperThreshold(float(step))
+                    self._growth_step_threshold.Modified()
+                if self._growth_vec_threshold is not None:
+                    # Step=0 has zero vector, so always lower-bound at 1.
+                    _threshold_points_between(self._growth_vec_threshold, 1, step)
+                    self._growth_vec_threshold.Modified()
+                self._refresh_hud()
+                self.plotter.render()
+            except BaseException:
+                _log("[vff] ERROR in growth slider callback:")
+                _log(traceback.format_exc())
+
+        self._growth_slider = self.plotter.add_slider_widget(
+            callback=on_slider,
+            rng=[0, max_step] if max_step > 0 else [0, 1],
+            value=max_step,
+            title="growth step",
+            pointa=(0.30, 0.05),
+            pointb=(0.95, 0.05),
+            style="modern",
+            fmt="%.0f",
+        )
+
     # ----- HUD -----
 
     def _init_hud(self) -> None:
@@ -347,13 +639,28 @@ class Viewer:
             )
             if self._last_voxelize_ms is not None:
                 lines.append(f"Voxelize     : {self._last_voxelize_ms:.0f} ms")
+        if self.growth is not None:
+            lines.append(
+                f"Growth       : {self.growth.n_steps} steps  "
+                f"(showing 0..{self._growth_current_step})"
+            )
+            if self._last_growth_ms is not None:
+                lines.append(f"Growth time  : {self._last_growth_ms:.0f} ms")
         lines.append("")
-        lines.append(
+        layers = (
             f"mesh: {'on' if self.show_mesh else 'off'}   "
             f"voxels: {'on' if self.show_voxels else 'off'}"
         )
+        if self.growth is not None:
+            layers += (
+                f"   growth: {'on' if self.show_growth_step else 'off'}"
+                f"   vectors: {'on' if self.show_growth_vec else 'off'}"
+            )
+        lines.append(layers)
         lines.append("")
-        lines.append("[M] mesh  [V] voxels  [B] re-voxelize")
+        lines.append("[M] mesh  [V] voxels  [B] re-voxel  [G] growth")
+        if self.growth is not None:
+            lines.append("[C] growth voxels  [N] growth vectors  slider: step")
         lines.append("[ [ / ] ] or Up/Down pitch -/+   [F5] reset view")
         return "\n".join(lines)
 
