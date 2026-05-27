@@ -161,10 +161,14 @@ class Viewer:
         mesh: trimesh.Trimesh,
         volume: BuildVolume,
         initial_pitch: float = 1.0,
+        max_tilt_deg: float = 30.0,
     ) -> None:
         self.mesh = mesh
         self.volume = volume
         self.pitch = float(initial_pitch)
+        # Print-head tilt limit. Set at startup; per the spec, NOT changed
+        # dynamically — clamp is part of the underlying growth field.
+        self.max_tilt_deg = float(max_tilt_deg)
 
         self.plotter = pv.Plotter(title="VFF Slicer — Visualizer", window_size=(1280, 800))
         self.plotter.set_background(_BACKGROUND, top=_BACKGROUND_TOP)
@@ -199,12 +203,15 @@ class Viewer:
         self._growth_step_threshold = None    # vtkThreshold (updated by slider)
         self._growth_vec_actor = None         # vtkActor for arrow glyphs
         self._growth_vec_threshold = None     # vtkThresholdPoints (updated by slider)
+        self._growth_surface_actor = None     # vtkActor for current-step iso-surface
+        self._growth_surface_contour = None   # vtkContourFilter (slider sets iso value)
         self._growth_slider = None
         self._growth_current_step = 0
         self._growth_max_step = 0
         self._last_growth_ms: float | None = None
         self.show_growth_step = True
         self.show_growth_vec = True
+        self.show_growth_surface = False  # off by default — it obstructs the voxel/arrow view
         # When True, growth-step voxels render fully opaque; when False, they
         # render translucent so the vector field underneath is visible.
         # V hotkey toggles this in growth mode.
@@ -344,6 +351,7 @@ class Viewer:
             "g": ("compute_growth", self.do_compute_growth),
             "c": ("toggle_growth_step", self.toggle_growth_step),
             "n": ("toggle_growth_vec", self.toggle_growth_vec),
+            "h": ("toggle_growth_surface", self.toggle_growth_surface),
             "bracketleft": ("decrease_pitch", self.decrease_pitch),
             "bracketright": ("increase_pitch", self.increase_pitch),
             "Up": ("increase_pitch", self.increase_pitch),
@@ -442,7 +450,11 @@ class Viewer:
 
         _log("[vff] do_compute_growth: running BFS")
         t0 = time.perf_counter()
-        self.growth = compute_growth(self.voxel_grid, connectivity=26)
+        self.growth = compute_growth(
+            self.voxel_grid,
+            connectivity=26,
+            max_tilt_deg=self.max_tilt_deg,
+        )
         self._last_growth_ms = (time.perf_counter() - t0) * 1000.0
         _log(
             f"[vff] growth: {self.growth.n_steps} steps, "
@@ -465,6 +477,8 @@ class Viewer:
         self._build_growth_step_actor()
         _log("[vff] do_compute_growth: building vector actor")
         self._build_growth_vec_actor()
+        _log("[vff] do_compute_growth: building surface actor")
+        self._build_growth_surface_actor()
         _log("[vff] do_compute_growth: adding slider")
         self._add_growth_slider()
         _log("[vff] do_compute_growth: refresh hud + render")
@@ -485,6 +499,14 @@ class Viewer:
             return
         self.show_growth_vec = not self.show_growth_vec
         self._growth_vec_actor.SetVisibility(self.show_growth_vec)
+        self._refresh_hud()
+        self.plotter.render()
+
+    def toggle_growth_surface(self) -> None:
+        if self._growth_surface_actor is None:
+            return
+        self.show_growth_surface = not self.show_growth_surface
+        self._growth_surface_actor.SetVisibility(self.show_growth_surface)
         self._refresh_hud()
         self.plotter.render()
 
@@ -642,6 +664,75 @@ class Viewer:
         self._growth_vec_actor = actor
         self._growth_vec_threshold = threshold
 
+    def _build_growth_surface_actor(self) -> None:
+        """Iso-surface of the step field at iso = current_step + 0.5.
+
+        Marching cubes on the (cell -> point converted) step scalar gives the
+        boundary between voxels painted by step N and step > N. Per the
+        spec, those boundaries are the "target surfaces" of the non-planar
+        slicer; the growth vector field is the (clamped) normal field on
+        them. Pipeline is persistent — only the iso-value changes on slider.
+        """
+        gr = self.growth
+        assert gr is not None
+        renderer = self.plotter.renderer
+
+        if self._growth_surface_actor is not None:
+            renderer.RemoveActor(self._growth_surface_actor)
+            self._growth_surface_actor = None
+            self._growth_surface_contour = None
+
+        nx, ny, nz = gr.step.shape
+
+        image = vtk.vtkImageData()
+        image.SetDimensions(nx + 1, ny + 1, nz + 1)
+        image.SetSpacing(gr.pitch, gr.pitch, gr.pitch)
+        image.SetOrigin(float(gr.origin[0]), float(gr.origin[1]), float(gr.origin[2]))
+
+        # Float cells so marching cubes can interpolate between them.
+        # Outside-model cells stay at -1 — marching cubes won't generate
+        # iso-surfaces in that region because the iso value is always >= 0.
+        step_flat = gr.step.astype(np.float32).flatten(order="F")
+        arr = vns.numpy_to_vtk(step_flat, deep=True, array_type=vtk.VTK_FLOAT)
+        arr.SetName("step")
+        image.GetCellData().AddArray(arr)
+        image.GetCellData().SetActiveScalars("step")
+
+        # Marching cubes needs point data. Convert cell -> point (each vertex
+        # gets the average of its incident cells' values).
+        c2p = vtk.vtkCellDataToPointData()
+        c2p.SetInputData(image)
+        c2p.PassCellDataOff()
+
+        contour = vtk.vtkContourFilter()
+        contour.SetInputConnection(c2p.GetOutputPort())
+        contour.SetInputArrayToProcess(
+            0, 0, 0,
+            vtk.vtkDataObject.FIELD_ASSOCIATION_POINTS,
+            "step",
+        )
+        contour.SetNumberOfContours(1)
+        contour.SetValue(0, float(self._growth_current_step) + 0.5)
+        contour.ComputeNormalsOn()
+
+        mapper = vtk.vtkPolyDataMapper()
+        mapper.SetInputConnection(contour.GetOutputPort())
+        mapper.ScalarVisibilityOff()  # single solid colour; vectors carry the step info
+
+        actor = vtk.vtkActor()
+        actor.SetMapper(mapper)
+        # Lime-green so it stands out from the blue->red voxel/arrow LUT.
+        actor.GetProperty().SetColor(0.65, 0.95, 0.40)
+        actor.GetProperty().SetOpacity(0.85)
+        actor.GetProperty().SetAmbient(0.25)
+        actor.GetProperty().SetDiffuse(0.65)
+        actor.GetProperty().SetSpecular(0.20)
+        actor.SetVisibility(self.show_growth_surface)
+
+        renderer.AddActor(actor)
+        self._growth_surface_actor = actor
+        self._growth_surface_contour = contour
+
     def _add_growth_slider(self) -> None:
         # Replace any previous growth slider (pitch is controlled by hotkeys).
         try:
@@ -664,6 +755,10 @@ class Viewer:
                     # Step=0 has zero vector, so always lower-bound at 1.
                     _threshold_points_between(self._growth_vec_threshold, 1, step)
                     self._growth_vec_threshold.Modified()
+                if self._growth_surface_contour is not None:
+                    # Iso-value sits between step N and N+1 -> N + 0.5.
+                    self._growth_surface_contour.SetValue(0, float(step) + 0.5)
+                    self._growth_surface_contour.Modified()
                 self._refresh_hud()
                 self.plotter.render()
             except BaseException:
@@ -704,6 +799,7 @@ class Viewer:
             f"Build volume : {sx:.0f} x {sy:.0f} x {sz:.0f} mm",
             f"Triangles    : {len(self.mesh.faces):,}",
             f"Pitch        : {self.pitch:.3f} mm",
+            f"Max tilt     : {self.max_tilt_deg:.1f} deg from +Z",
         ]
         if self.voxel_grid is not None:
             nx, ny, nz = self.voxel_grid.shape
@@ -730,13 +826,14 @@ class Viewer:
             layers += (
                 f"   growth: {'on' if self.show_growth_step else 'off'} ({opacity_tag})"
                 f"   vectors: {'on' if self.show_growth_vec else 'off'}"
+                f"   surface: {'on' if self.show_growth_surface else 'off'}"
             )
         lines.append(layers)
         lines.append("")
         lines.append("[M] mesh  [V] voxels  [B] re-voxel  [G] growth")
         if self.growth is not None:
             lines.append("[V] flips growth voxels opaque <-> translucent")
-            lines.append("[C] growth voxels on/off  [N] vectors on/off  slider: step")
+            lines.append("[C] voxels on/off  [N] vectors on/off  [H] surface  slider: step")
         lines.append("[ [ / ] ] or Up/Down pitch -/+   [F5] reset view")
         return "\n".join(lines)
 

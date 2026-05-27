@@ -153,11 +153,71 @@ def _accumulate_offsets(
     return count, sum_dir
 
 
+def clamp_to_vertical(vectors: np.ndarray, max_tilt_deg: float) -> np.ndarray:
+    """Clamp every vector's angle from +Z to at most `max_tilt_deg`.
+
+    Models the physical constraint of the print head: the nozzle can only
+    tilt so far from vertical. Any vector pointing further than the limit
+    is rotated in its (v, +Z) plane back toward +Z so its angle to +Z is
+    exactly `max_tilt_deg`. Magnitudes are preserved (the clamp is a pure
+    direction operation, the "nearest distance class" length is kept).
+
+    Args:
+        vectors: shape (..., 3). Mutated copy returned.
+        max_tilt_deg: 0 -> all vectors snap to +Z; 90 -> no horizontal clamp;
+                      180 -> no clamp at all.
+
+    Edge case: a vector pointing exactly along -Z has no defined (v, +Z)
+    plane; we fall back to the +X half-plane for the clamp direction.
+    """
+    if max_tilt_deg >= 180.0:
+        return vectors.copy()
+    max_tilt = float(np.deg2rad(max_tilt_deg))
+    cos_lim = float(np.cos(max_tilt))
+    sin_lim = float(np.sin(max_tilt))
+
+    orig_shape = vectors.shape
+    flat = vectors.reshape(-1, 3).astype(np.float32, copy=True)
+    mag = np.linalg.norm(flat, axis=1)
+
+    # Skip the zero vectors (seeds / outside model).
+    active = mag > 1e-9
+    if not active.any():
+        return flat.reshape(orig_shape)
+
+    unit = np.zeros_like(flat)
+    unit[active] = flat[active] / mag[active, None]
+    needs = active & (unit[:, 2] < cos_lim - 1e-7)
+    if needs.any():
+        h = unit[needs].copy()
+        h[:, 2] = 0.0
+        h_norm = np.linalg.norm(h, axis=1)
+        # Vectors pointing straight down (-Z) have no horizontal component —
+        # pick a canonical +X half-plane for the clamp direction.
+        degenerate = h_norm < 1e-9
+        if degenerate.any():
+            h[degenerate] = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+            h_norm[degenerate] = 1.0
+        h_unit = h / h_norm[:, None]
+        clamped_unit = sin_lim * h_unit
+        clamped_unit[:, 2] += cos_lim
+        # Restore magnitude from the original vector.
+        flat[needs] = clamped_unit * mag[needs, None]
+
+    return flat.reshape(orig_shape)
+
+
 def compute_growth(
     vg: VoxelGrid,
     connectivity: Literal[26] = 26,
+    max_tilt_deg: float | None = None,
 ) -> GrowthResult:
-    """26-connectivity BFS from bed seeds. See module docstring for semantics."""
+    """26-connectivity BFS from bed seeds. See module docstring for semantics.
+
+    If `max_tilt_deg` is given, the final vector field is passed through
+    `clamp_to_vertical` so every direction is within that angle of +Z. This
+    models the print head's geometric tilt limit.
+    """
     if connectivity != 26:
         # 6 path still works numerically (always gives length-1 face vectors),
         # but it makes the magnitude info trivial — gate behind explicit ask.
@@ -227,6 +287,9 @@ def compute_growth(
         step[new_mask] = next_step
 
         current = next_step
+
+    if max_tilt_deg is not None:
+        vectors = clamp_to_vertical(vectors, max_tilt_deg)
 
     n_steps = int(step.max()) + 1 if (step >= 0).any() else 0
     return GrowthResult(

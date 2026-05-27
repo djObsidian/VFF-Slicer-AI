@@ -1,7 +1,7 @@
 from .build_volume import BuildVolume
 from .mesh_io import load_and_place
 from .voxelize import voxelize_solid, VoxelGrid
-from .growth import compute_growth, GrowthResult
+from .growth import compute_growth, clamp_to_vertical, GrowthResult
 from .viewer import Viewer
 
 __all__ = [
@@ -10,6 +10,7 @@ __all__ = [
     "voxelize_solid",
     "VoxelGrid",
     "compute_growth",
+    "clamp_to_vertical",
     "GrowthResult",
     "Viewer",
 ]

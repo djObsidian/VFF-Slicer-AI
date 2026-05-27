@@ -38,6 +38,10 @@ def main(argv: list[str] | None = None) -> int:
         help="Build volume as X x Y x Z in mm (default: 250x250x250).",
     )
     parser.add_argument("--pitch", type=float, default=1.0, help="Initial voxel pitch in mm (default: 1.0).")
+    parser.add_argument(
+        "--max-tilt", type=float, default=30.0,
+        help="Max nozzle tilt from vertical in degrees (default 30). Set at startup, not changed dynamically.",
+    )
     args = parser.parse_args(argv)
 
     from .build_volume import BuildVolume
@@ -64,13 +68,13 @@ def main(argv: list[str] | None = None) -> int:
         flush=True,
     )
 
-    viewer = Viewer(mesh, volume, initial_pitch=args.pitch)
+    viewer = Viewer(mesh, volume, initial_pitch=args.pitch, max_tilt_deg=args.max_tilt)
     print(
-        "Viewer ready. Hotkeys: M/V/B  G/C/N  [ / ]  Up/Down  F5",
+        "Viewer ready. Hotkeys: M/V/B  G/C/N/H  [ / ]  Up/Down  F5",
         flush=True,
     )
     print(
-        "  M mesh  V voxel-shell  B re-voxel | G growth  C step-color  N vectors",
+        "  M mesh  V voxel-shell  B re-voxel | G growth  C voxels  N vectors  H surface",
         flush=True,
     )
     viewer.show()
