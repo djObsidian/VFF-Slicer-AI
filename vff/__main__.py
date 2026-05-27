@@ -52,6 +52,15 @@ def main(argv: list[str] | None = None) -> int:
         help="Inside-model depth computation: 'fmm' (Eikonal, C1 smooth, requires scikit-fmm) "
              "or 'dijkstra' (discrete shortest path, C0). Default 'fmm'.",
     )
+    parser.add_argument(
+        "--export", metavar="PATH",
+        help="Save the deformed mesh to PATH right after startup (.stl, .ply, .obj, .glb — any "
+             "format trimesh supports). Computes voxels + growth + deform first.",
+    )
+    parser.add_argument(
+        "--no-viewer", action="store_true",
+        help="Skip the interactive viewer. Useful with --export for batch use.",
+    )
     args = parser.parse_args(argv)
 
     from .build_volume import BuildVolume
@@ -85,12 +94,18 @@ def main(argv: list[str] | None = None) -> int:
         smooth_sigma=args.smooth_sigma,
         depth_method=args.depth_method,
     )
+
+    if args.export:
+        viewer.save_deformed(args.export)
+        if args.no_viewer:
+            return 0
+
     print(
-        "Viewer ready. Hotkeys: M/V/B  G/C/N/H/D  [ / ]  Up/Down  F5",
+        "Viewer ready. Hotkeys: M/V/B  G/C/N/H/D/O  [ / ]  Up/Down  F5",
         flush=True,
     )
     print(
-        "  M mesh  V voxel-shell  B re-voxel | G growth  C voxels  N vectors  H surface  D deformed",
+        "  M mesh  V voxel-shell  B re-voxel | G growth  C voxels  N vectors  H surface  D deformed  O export",
         flush=True,
     )
     viewer.show()

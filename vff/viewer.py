@@ -364,6 +364,7 @@ class Viewer:
             "n": ("toggle_growth_vec", self.toggle_growth_vec),
             "h": ("toggle_growth_surface", self.toggle_growth_surface),
             "d": ("toggle_deformed", self.toggle_deformed),
+            "o": ("export_deformed", self.export_deformed_default),
             "bracketleft": ("decrease_pitch", self.decrease_pitch),
             "bracketright": ("increase_pitch", self.increase_pitch),
             "Up": ("increase_pitch", self.increase_pitch),
@@ -621,32 +622,65 @@ class Viewer:
         self._refresh_hud()
         self.plotter.render()
 
+    def _ensure_deformed_mesh(self) -> bool:
+        """Compute the deformed mesh on demand. Returns True if available."""
+        if self.deformed_mesh is not None:
+            return True
+        if self.growth is None:
+            _log("[vff] _ensure_deformed_mesh: growth not computed; computing now")
+            self.do_compute_growth()
+            if self.growth is None:
+                return False
+        _log("[vff] _ensure_deformed_mesh: deforming")
+        t0 = time.perf_counter()
+        self.deformed_mesh = deform_mesh(
+            self.mesh, self.growth,
+            smooth_sigma=self.smooth_sigma,
+            depth_method=self.depth_method,
+        )
+        _log(
+            f"[vff] deform: Z [{self.deformed_mesh.bounds[0, 2]:.2f}, "
+            f"{self.deformed_mesh.bounds[1, 2]:.2f}] mm  "
+            f"({(time.perf_counter() - t0) * 1000.0:.0f} ms)"
+        )
+        return True
+
+    def save_deformed(self, path: str) -> bool:
+        """Compute (if needed) and export the deformed mesh to `path`. Any
+        format trimesh.export supports works from the extension: .stl, .ply,
+        .obj, .glb, .gltf, .dae, .off. Reports volume vs original for sanity."""
+        if not self._ensure_deformed_mesh():
+            _log(f"[vff] save_deformed: could not build deformed mesh, skipping export to {path}")
+            return False
+        try:
+            self.deformed_mesh.export(path)
+        except Exception as e:
+            _log(f"[vff] save_deformed: export failed: {e!r}")
+            return False
+        v_orig = float(self.mesh.volume)
+        v_def = float(self.deformed_mesh.volume)
+        ratio = (v_def / v_orig) if v_orig > 0 else 0.0
+        _log(
+            f"[vff] saved deformed mesh -> {path}  "
+            f"({len(self.deformed_mesh.faces):,} faces, "
+            f"vol_orig={v_orig:.0f} mm^3, vol_def={v_def:.0f} mm^3, ratio={ratio:.3f})"
+        )
+        return True
+
+    def export_deformed_default(self) -> None:
+        """O hotkey: save deformed mesh to a default name in CWD."""
+        from pathlib import Path
+        default_path = Path.cwd() / "deformed_mesh.stl"
+        self.save_deformed(str(default_path))
+
     def toggle_deformed(self) -> None:
         """D: enter the 'flattened' view — show the deformed mesh whose Z is
         proportional to growth step. Growth iso-surfaces become parallel XY
         planes. Press again to return to the natural-space view."""
-        if self.growth is None:
-            _log("[vff] toggle_deformed: growth not computed; computing now")
-            self.do_compute_growth()
-            if self.growth is None:
-                return
+        if not self._ensure_deformed_mesh():
+            return
 
-        # Lazy: build deformed mesh + its actor on first toggle.
-        if self.deformed_mesh is None:
-            _log("[vff] toggle_deformed: deforming mesh")
-            t0 = time.perf_counter()
-            self.deformed_mesh = deform_mesh(
-                self.mesh, self.growth,
-                smooth_sigma=self.smooth_sigma,
-                depth_method=self.depth_method,
-            )
-            dt = (time.perf_counter() - t0) * 1000.0
-            _log(
-                f"[vff] deform: Z range "
-                f"[{self.deformed_mesh.bounds[0, 2]:.2f}, "
-                f"{self.deformed_mesh.bounds[1, 2]:.2f}] mm  "
-                f"({dt:.0f} ms)"
-            )
+        if self._deformed_actor is None:
             self._deformed_actor = self.plotter.add_mesh(
                 trimesh_to_pv(self.deformed_mesh),
                 color="#d850c0",  # magenta — clearly different from anything else
