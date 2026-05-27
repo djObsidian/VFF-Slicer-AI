@@ -61,6 +61,22 @@ def main(argv: list[str] | None = None) -> int:
         "--no-viewer", action="store_true",
         help="Skip the interactive viewer. Useful with --export for batch use.",
     )
+    parser.add_argument(
+        "--backtransform-in", metavar="PATH",
+        help="Read a G-code file produced by a planar slicer on the deformed mesh and "
+             "inverse-transform every XYZ point back to the original (non-planar) space. "
+             "Writes the result to --backtransform-out (default: input with '.nonplanar.gcode' suffix). "
+             "Skips the viewer.",
+    )
+    parser.add_argument(
+        "--backtransform-out", metavar="PATH",
+        help="Output path for --backtransform-in. Defaults to <input>.nonplanar.gcode.",
+    )
+    parser.add_argument(
+        "--subdiv-mm", type=float, default=0.5,
+        help="Backtransform: split G1 moves longer than this (in deformed-space mm) into "
+             "pieces so the curved original-space path is followed. Default 0.5.",
+    )
     args = parser.parse_args(argv)
 
     from .build_volume import BuildVolume
@@ -99,6 +115,35 @@ def main(argv: list[str] | None = None) -> int:
         viewer.save_deformed(args.export)
         if args.no_viewer:
             return 0
+
+    if args.backtransform_in:
+        from .backtransform import BackTransform, backtransform_gcode_file
+        out_path = args.backtransform_out
+        if not out_path:
+            from pathlib import Path as _P
+            in_p = _P(args.backtransform_in)
+            out_path = str(in_p.with_suffix(".nonplanar.gcode"))
+        print(
+            f"Backtransform: {args.backtransform_in} -> {out_path}\n"
+            f"  STL          : {stl_path}\n"
+            f"  volume       : {x:.0f}x{y:.0f}x{z:.0f} mm\n"
+            f"  pitch        : {args.pitch} mm\n"
+            f"  max-tilt     : {args.max_tilt} deg\n"
+            f"  smooth-sigma : {args.smooth_sigma}\n"
+            f"  depth-method : {args.depth_method}\n"
+            f"  subdiv-mm    : {args.subdiv_mm} mm",
+            flush=True,
+        )
+        bt = BackTransform.from_mesh(
+            str(stl_path),
+            volume_side=max(x, y, z),
+            pitch=args.pitch,
+            max_tilt_deg=args.max_tilt,
+            smooth_sigma=args.smooth_sigma,
+            depth_method=args.depth_method,
+        )
+        backtransform_gcode_file(args.backtransform_in, out_path, bt, subdiv_mm=args.subdiv_mm)
+        return 0
 
     print(
         "Viewer ready. Hotkeys: M/V/B  G/C/N/H/D/O  [ / ]  Up/Down  F5",
