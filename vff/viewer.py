@@ -38,7 +38,7 @@ import vtk
 from vtk.util import numpy_support as vns
 
 from .build_volume import BuildVolume
-from .deform import deform_mesh
+from .deform import deform_mesh, _extended_step_field
 from .growth import GrowthResult, compute_growth
 from .voxelize import VoxelGrid, voxelize_solid
 
@@ -799,37 +799,38 @@ class Viewer:
         )
         _threshold_points_between(threshold, 1, self._growth_current_step)
 
-        # Chunky arrows so individual ones stand out in a dense field.
-        # Vectors now have magnitude in {1, √2, √3} (see growth.py), so we
-        # scale such that a √3-magnitude arrow ~0.95 voxel long.
-        arrow = vtk.vtkArrowSource()
-        arrow.SetTipLength(0.40)
-        arrow.SetTipRadius(0.22)
-        arrow.SetShaftRadius(0.08)
-        arrow.SetTipResolution(10)
-        arrow.SetShaftResolution(10)
+        # 2D-style flat arrow glyphs, like ParaView / Ansys vector overlays.
+        # vtkGlyphSource2D::ThickArrow is a filled 2D arrow in the XY plane;
+        # vtkGlyph3D rotates it to align with each vector. The flat look reads
+        # well in dense fields and doesn't fight the surface for attention.
+        arrow = vtk.vtkGlyphSource2D()
+        arrow.SetGlyphTypeToThickArrow()
+        arrow.SetScale(1.0)
+        arrow.FilledOn()
+        arrow.SetCenter(0.5, 0.0, 0.0)  # base at origin, tip at +X
 
         glyph = vtk.vtkGlyph3D()
         glyph.SetInputConnection(threshold.GetOutputPort())
         glyph.SetSourceConnection(arrow.GetOutputPort())
         glyph.SetVectorModeToUseVector()
         glyph.SetScaleModeToScaleByVector()  # arrow length = |vector| * SetScaleFactor
-        glyph.SetScaleFactor(gr.pitch * 0.55)  # √3 * 0.55 ≈ 0.95 voxel
+        glyph.SetScaleFactor(gr.pitch * 0.85)  # √3 * 0.85 ≈ 1.47 voxel — visible
         glyph.OrientOn()
+        glyph.ScalingOn()
         glyph.SetColorModeToColorByScalar()
 
         lut = _growth_lut(gr.n_steps)
 
         mapper = vtk.vtkPolyDataMapper()
         mapper.SetInputConnection(glyph.GetOutputPort())
-        mapper.SetScalarModeToUsePointFieldData()
-        mapper.SelectColorArray("step")
-        mapper.SetScalarRange(0.0, max(float(gr.n_steps - 1), 1.0))
-        mapper.SetLookupTable(lut)
-        mapper.ScalarVisibilityOn()
+        mapper.ScalarVisibilityOff()  # solid red — user wanted ParaView/Ansys look
 
         actor = vtk.vtkActor()
         actor.SetMapper(mapper)
+        actor.GetProperty().SetColor(0.92, 0.18, 0.18)  # red
+        actor.GetProperty().SetLighting(False)          # uniform colour, no shading
+        actor.GetProperty().SetAmbient(1.0)
+        actor.GetProperty().SetDiffuse(0.0)
         actor.SetVisibility(self.show_growth_vec)
 
         renderer.AddActor(actor)
@@ -861,10 +862,12 @@ class Viewer:
         image.SetSpacing(gr.pitch, gr.pitch, gr.pitch)
         image.SetOrigin(float(gr.origin[0]), float(gr.origin[1]), float(gr.origin[2]))
 
-        # Float cells so marching cubes can interpolate between them.
-        # Outside-model cells stay at -1 — marching cubes won't generate
-        # iso-surfaces in that region because the iso value is always >= 0.
-        step_flat = gr.step.astype(np.float32).flatten(order="F")
+        # Extend the step field into the empty volume around the model so the
+        # iso-surface is defined throughout the model's bounding parallelepiped,
+        # not clipped to the model's voxels. _extended_step_field does an
+        # iterative 26-conn flood-fill that propagates step values outward.
+        extended = _extended_step_field(gr)
+        step_flat = extended.flatten(order="F")
         arr = vns.numpy_to_vtk(step_flat, deep=True, array_type=vtk.VTK_FLOAT)
         arr.SetName("step")
         image.GetCellData().AddArray(arr)
@@ -887,18 +890,37 @@ class Viewer:
         contour.SetValue(0, float(self._growth_current_step) + 0.5)
         contour.ComputeNormalsOn()
 
+        # Smooth the iso-surface — flood-fill creates step-shaped artifacts
+        # near the model boundary; sinc smoothing flattens them without
+        # eroding the geometry the way Laplacian smoothing does.
+        smoother = vtk.vtkWindowedSincPolyDataFilter()
+        smoother.SetInputConnection(contour.GetOutputPort())
+        smoother.SetNumberOfIterations(20)
+        smoother.SetPassBand(0.05)
+        smoother.BoundarySmoothingOn()
+        smoother.FeatureEdgeSmoothingOff()
+        smoother.NonManifoldSmoothingOn()
+        smoother.NormalizeCoordinatesOn()
+
+        normals = vtk.vtkPolyDataNormals()
+        normals.SetInputConnection(smoother.GetOutputPort())
+        normals.SetFeatureAngle(60)
+        normals.ConsistencyOn()
+        normals.SplittingOff()
+
         mapper = vtk.vtkPolyDataMapper()
-        mapper.SetInputConnection(contour.GetOutputPort())
-        mapper.ScalarVisibilityOff()  # single solid colour; vectors carry the step info
+        mapper.SetInputConnection(normals.GetOutputPort())
+        mapper.ScalarVisibilityOff()
 
         actor = vtk.vtkActor()
         actor.SetMapper(mapper)
-        # Lime-green so it stands out from the blue->red voxel/arrow LUT.
-        actor.GetProperty().SetColor(0.65, 0.95, 0.40)
-        actor.GetProperty().SetOpacity(0.85)
-        actor.GetProperty().SetAmbient(0.25)
-        actor.GetProperty().SetDiffuse(0.65)
-        actor.GetProperty().SetSpecular(0.20)
+        # Lime-green so it stands out from anything else; clearly translucent.
+        actor.GetProperty().SetColor(0.55, 0.90, 0.35)
+        actor.GetProperty().SetOpacity(0.45)
+        actor.GetProperty().SetAmbient(0.30)
+        actor.GetProperty().SetDiffuse(0.70)
+        actor.GetProperty().SetSpecular(0.10)
+        actor.GetProperty().SetInterpolationToGouraud()
         actor.SetVisibility(self.show_growth_surface)
 
         renderer.AddActor(actor)

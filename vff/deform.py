@@ -124,22 +124,52 @@ def deform_mesh(
     mesh: trimesh.Trimesh,
     growth: GrowthResult,
     dz_per_layer: float | None = None,
+    bed_z: float = 0.0,
+    bed_blend_height: float | None = None,
 ) -> trimesh.Trimesh:
-    """Return a deformed copy of `mesh` whose Z = step * dz_per_layer.
+    """Return a deformed copy of `mesh` whose Z is driven by the growth step.
 
-    Growth iso-surfaces (the non-planar print layers) become horizontal
-    planes in the result, ready to slice with a vanilla planar slicer.
-    XY is left untouched in this first pass; in-plane distortion may need
-    follow-up work depending on what the slicer needs."""
+    Math:
+        step_c = trilinear sample of growth.step (extended) at vertex
+        z_target = step_c * dz_per_layer + bed_z
+
+        w = clamp((orig_z - bed_z) / bed_blend_height, 0, 1)
+        new_z = (1 - w) * orig_z + w * z_target
+
+    Why the blend: pure step-based mapping `new_z = step_c * dz` lifts
+    bed-touching vertices off the bed when their neighbours-in-XY are
+    outside the model (the extended step field there is non-zero, dragging
+    the trilinear sample up). Empirically observed: at pitch=0.5mm on the
+    propeller, bed-vertices were spreading over 0.75mm in deformed Z.
+
+    The smooth blend pins `new_z = orig_z` exactly at the bed (orig_z =
+    bed_z) and ramps to full step-based mapping over `bed_blend_height`.
+    Default blend height = 2 * pitch (two voxel layers), enough to absorb
+    sampling artifacts without distorting the macro shape.
+
+    XY is left untouched in this pass; in-plane distortion is a follow-up
+    if the downstream slicer needs it (see RotBotSlicer's refinement step
+    or S4_Slicer's per-tet optimization for principled approaches)."""
     if dz_per_layer is None:
         dz_per_layer = growth.pitch
+    if bed_blend_height is None:
+        bed_blend_height = 2.0 * growth.pitch
 
     field = _extended_step_field(growth)
     verts = mesh.vertices.astype(np.float64, copy=False)
-    step_continuous = _sample_trilinear(field, growth.origin, growth.pitch, verts)
+    step_continuous = _sample_trilinear(field, growth.origin, growth.pitch, verts).astype(np.float64)
+
+    z_target = step_continuous * dz_per_layer + bed_z
+    z_orig = verts[:, 2]
+
+    if bed_blend_height > 0:
+        w = np.clip((z_orig - bed_z) / bed_blend_height, 0.0, 1.0)
+    else:
+        w = np.ones_like(z_orig)
+    new_z = (1.0 - w) * z_orig + w * z_target
 
     new_verts = verts.copy()
-    new_verts[:, 2] = step_continuous * dz_per_layer
+    new_verts[:, 2] = new_z
 
     return trimesh.Trimesh(
         vertices=new_verts.astype(np.float64),
