@@ -86,6 +86,19 @@ def main(argv: list[str] | None = None) -> int:
              "pieces so the curved original-space path is followed. Default 0.5.",
     )
     parser.add_argument(
+        "--dz-per-layer", type=float, default=None,
+        help="Map factor: deformed_z = depth(x,y,z) * dz_per_layer + bed (+ bed-blend). "
+             "If unset and --dz-auto-fit is off, falls back to pitch (1 voxel = 1 mm by "
+             "default). Use this to control how much the deformation actually stretches Z.",
+    )
+    parser.add_argument(
+        "--dz-auto-fit", action="store_true",
+        help="Pick dz_per_layer automatically so the FORWARD-deformed Z extent matches the "
+             "input STL's Z extent. I.e. blade tips end up at the same height the slicer "
+             "thought they'd be at, but with non-planar layer paths in between. "
+             "Overrides --dz-per-layer if both given.",
+    )
+    parser.add_argument(
         "--jobs", type=int, default=-1,
         help="Backtransform: parallel worker count for the invert step. "
              "-1 = auto (all cores, but only when point count >5 M; below that the "
@@ -148,6 +161,34 @@ def main(argv: list[str] | None = None) -> int:
             in_p = _P(args.gcode_in)
             suffix = ".nonplanar.gcode" if args.gcode_direction == "forward" else ".planar.gcode"
             out_path = str(in_p.with_suffix(suffix))
+
+        # Auto-fit picks dz so the forward-deformed Z extent matches the STL's
+        # Z extent. Computed by building the depth field once, taking its max
+        # over model voxels, then dz = z_extent / depth_max.
+        chosen_dz = args.dz_per_layer
+        autofit_info = ""
+        if args.dz_auto_fit:
+            import numpy as _np
+            from .deform import smoothed_depth_field
+            from .growth import compute_growth
+            from .voxelize import voxelize_solid
+            from .build_volume import BuildVolume as _BV
+            _vol = _BV.of(x, y, z)
+            _m = load_and_place(str(stl_path), _vol)
+            _vg = voxelize_solid(_m, pitch=args.pitch)
+            _gr = compute_growth(_vg, max_tilt_deg=args.max_tilt)
+            _f = smoothed_depth_field(
+                _gr, sigma=args.smooth_sigma, method=args.depth_method, outside_mode="extend"
+            )
+            _depth_max = float(_np.nanmax(_f[_gr.step >= 0])) if (_gr.step >= 0).any() else 1.0
+            _z_extent = float(_m.bounds[1, 2] - _m.bounds[0, 2])
+            if _depth_max > 1e-9:
+                chosen_dz = _z_extent / _depth_max
+            autofit_info = (
+                f"  auto-fit     : z_extent={_z_extent:.3f}, depth_max={_depth_max:.3f}, "
+                f"dz_per_layer={chosen_dz:.4f}\n"
+            )
+
         print(
             f"G-code transform ({args.gcode_direction}): {args.gcode_in} -> {out_path}\n"
             f"  STL          : {stl_path}\n"
@@ -156,6 +197,8 @@ def main(argv: list[str] | None = None) -> int:
             f"  max-tilt     : {args.max_tilt} deg\n"
             f"  smooth-sigma : {args.smooth_sigma}\n"
             f"  depth-method : {args.depth_method}\n"
+            f"  dz_per_layer : {chosen_dz if chosen_dz is not None else 'pitch ('+str(args.pitch)+')'}\n"
+            f"{autofit_info}"
             f"  subdiv-mm    : {args.subdiv_mm} mm",
             flush=True,
         )
@@ -166,6 +209,7 @@ def main(argv: list[str] | None = None) -> int:
             max_tilt_deg=args.max_tilt,
             smooth_sigma=args.smooth_sigma,
             depth_method=args.depth_method,
+            dz_per_layer=chosen_dz,
         )
         backtransform_gcode_file(
             args.gcode_in, out_path, bt,
