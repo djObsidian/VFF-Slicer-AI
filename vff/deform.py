@@ -23,10 +23,17 @@ distortion-aware deformation is needed downstream.
 from __future__ import annotations
 
 import numpy as np
+import numpy.ma as ma
 import trimesh
 from scipy.ndimage import gaussian_filter
 from scipy.sparse import csr_array
 from scipy.sparse.csgraph import dijkstra
+
+try:
+    import skfmm  # type: ignore
+    _HAVE_SKFMM = True
+except ImportError:
+    _HAVE_SKFMM = False
 
 from .growth import GrowthResult
 
@@ -123,7 +130,48 @@ def geodesic_distance_from_bed(growth: GrowthResult) -> np.ndarray:
     return dist
 
 
-def smoothed_depth_field(growth: GrowthResult, sigma: float = 1.0) -> np.ndarray:
+def fmm_distance_from_bed(growth: GrowthResult) -> np.ndarray:
+    """Fast Marching Method (Eikonal solver) for geodesic distance from the
+    bed-seed surface, restricted to model interior.
+
+    Returns float32 (nx,ny,nz). Cells outside the model and unreachable
+    cells get np.inf.
+
+    FMM solves ||∇d|| = 1 with d=0 at the front (bed seeds). The result is
+    the continuous-equivalent of weighted-Dijkstra geodesic distance, but
+    typically smoother near the wavefront-merge surfaces because FMM
+    propagates a continuous wave instead of a discrete shortest-path
+    relaxation. Requires scikit-fmm.
+    """
+    if not _HAVE_SKFMM:
+        raise RuntimeError("scikit-fmm not installed; pip install scikit-fmm")
+    step = growth.step
+    matrix = step >= 0
+    if not matrix.any():
+        return np.full(matrix.shape, np.inf, dtype=np.float32)
+
+    has_in_z = matrix.any(axis=(0, 1))
+    k_bed = int(np.argmax(has_in_z))
+    bed_mask = np.zeros_like(matrix)
+    bed_mask[:, :, k_bed] = matrix[:, :, k_bed]
+
+    # phi: negative at bed-seed cells (inside the front), positive elsewhere.
+    # Mask non-model cells so the wave can't propagate through air.
+    phi = np.full(matrix.shape, 1.0, dtype=np.float64)
+    phi[bed_mask] = -1.0
+    phi_ma = ma.MaskedArray(phi, mask=~matrix)
+
+    dist = skfmm.distance(phi_ma, dx=growth.pitch)
+    if isinstance(dist, ma.MaskedArray):
+        dist = dist.filled(np.inf)
+    return dist.astype(np.float32)
+
+
+def smoothed_depth_field(
+    growth: GrowthResult,
+    sigma: float = 2.0,
+    method: str = "fmm",
+) -> np.ndarray:
     """Continuous "depth from bed" field used by both surface viz and deform.
 
     Construction:
@@ -156,8 +204,16 @@ def smoothed_depth_field(growth: GrowthResult, sigma: float = 1.0) -> np.ndarray
     has_model_in_z = (step >= 0).any(axis=(0, 1))
     k_bed_layer = int(np.argmax(has_model_in_z))
 
-    # Inside-model: weighted geodesic distance from bed seeds.
-    geo = geodesic_distance_from_bed(growth)  # float32, inf outside model
+    # Inside-model depth.
+    #   "fmm"      — Eikonal solver via scikit-fmm. Smooth (C1) where it
+    #                exists, including across wavefront-merge surfaces.
+    #                Falls back to "dijkstra" if scikit-fmm isn't installed.
+    #   "dijkstra" — discrete shortest path on the 26-conn voxel graph.
+    #                C0 only, can show small kinks at cell boundaries.
+    if method == "fmm" and _HAVE_SKFMM:
+        geo = fmm_distance_from_bed(growth)
+    else:
+        geo = geodesic_distance_from_bed(growth)
     field = geo.astype(np.float32, copy=True)
 
     # Outside-model: vertical depth k - k_bed_layer.
@@ -276,7 +332,8 @@ def deform_mesh(
     dz_per_layer: float | None = None,
     bed_z: float = 0.0,
     bed_blend_height: float | None = None,
-    smooth_sigma: float = 1.0,
+    smooth_sigma: float = 2.0,
+    depth_method: str = "fmm",
 ) -> trimesh.Trimesh:
     """Return a deformed copy of `mesh` whose Z is driven by the growth step.
 
@@ -309,7 +366,7 @@ def deform_mesh(
     # smoothed_depth_field gives a continuous, symmetry-respecting field that
     # agrees with the BFS step inside the model and with vertical depth
     # outside it. See its docstring for why this matters for symmetric parts.
-    field = smoothed_depth_field(growth, sigma=smooth_sigma)
+    field = smoothed_depth_field(growth, sigma=smooth_sigma, method=depth_method)
     verts = mesh.vertices.astype(np.float64, copy=False)
     step_continuous = _sample_trilinear(field, growth.origin, growth.pitch, verts).astype(np.float64)
 

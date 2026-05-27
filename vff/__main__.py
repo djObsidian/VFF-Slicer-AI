@@ -42,6 +42,16 @@ def main(argv: list[str] | None = None) -> int:
         "--max-tilt", type=float, default=30.0,
         help="Max nozzle tilt from vertical in degrees (default 30). Set at startup, not changed dynamically.",
     )
+    parser.add_argument(
+        "--smooth-sigma", type=float, default=2.0,
+        help="Gaussian sigma (in voxels) applied to the depth field before deformation/surfaces "
+             "(default 2.0). Lower = stronger / sharper deformation; higher = smoother but weaker.",
+    )
+    parser.add_argument(
+        "--depth-method", choices=["fmm", "dijkstra"], default="fmm",
+        help="Inside-model depth computation: 'fmm' (Eikonal, C1 smooth, requires scikit-fmm) "
+             "or 'dijkstra' (discrete shortest path, C0). Default 'fmm'.",
+    )
     args = parser.parse_args(argv)
 
     from .build_volume import BuildVolume
@@ -68,7 +78,13 @@ def main(argv: list[str] | None = None) -> int:
         flush=True,
     )
 
-    viewer = Viewer(mesh, volume, initial_pitch=args.pitch, max_tilt_deg=args.max_tilt)
+    viewer = Viewer(
+        mesh, volume,
+        initial_pitch=args.pitch,
+        max_tilt_deg=args.max_tilt,
+        smooth_sigma=args.smooth_sigma,
+        depth_method=args.depth_method,
+    )
     print(
         "Viewer ready. Hotkeys: M/V/B  G/C/N/H/D  [ / ]  Up/Down  F5",
         flush=True,

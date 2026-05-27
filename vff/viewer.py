@@ -163,6 +163,8 @@ class Viewer:
         volume: BuildVolume,
         initial_pitch: float = 1.0,
         max_tilt_deg: float = 30.0,
+        smooth_sigma: float = 2.0,
+        depth_method: str = "fmm",
     ) -> None:
         self.mesh = mesh
         self.volume = volume
@@ -170,6 +172,9 @@ class Viewer:
         # Print-head tilt limit. Set at startup; per the spec, NOT changed
         # dynamically — clamp is part of the underlying growth field.
         self.max_tilt_deg = float(max_tilt_deg)
+        # Depth-field parameters — tunable at startup via CLI.
+        self.smooth_sigma = float(smooth_sigma)
+        self.depth_method = str(depth_method)
 
         self.plotter = pv.Plotter(title="VFF Slicer — Visualizer", window_size=(1280, 800))
         self.plotter.set_background(_BACKGROUND, top=_BACKGROUND_TOP)
@@ -630,7 +635,11 @@ class Viewer:
         if self.deformed_mesh is None:
             _log("[vff] toggle_deformed: deforming mesh")
             t0 = time.perf_counter()
-            self.deformed_mesh = deform_mesh(self.mesh, self.growth)
+            self.deformed_mesh = deform_mesh(
+                self.mesh, self.growth,
+                smooth_sigma=self.smooth_sigma,
+                depth_method=self.depth_method,
+            )
             dt = (time.perf_counter() - t0) * 1000.0
             _log(
                 f"[vff] deform: Z range "
@@ -869,7 +878,7 @@ class Viewer:
         # Outside the model: vertical depth (k - k_bed_layer), so iso-surfaces
         # extend as horizontal planes with vertical normals — no flood-fill
         # perturbations near the model boundary.
-        extended = smoothed_depth_field(gr, sigma=1.0)
+        extended = smoothed_depth_field(gr, sigma=self.smooth_sigma, method=self.depth_method)
         step_flat = extended.flatten(order="F")
         arr = vns.numpy_to_vtk(step_flat, deep=True, array_type=vtk.VTK_FLOAT)
         arr.SetName("step")
@@ -997,6 +1006,7 @@ class Viewer:
             f"Triangles    : {len(self.mesh.faces):,}",
             f"Pitch        : {self.pitch:.3f} mm",
             f"Max tilt     : {self.max_tilt_deg:.1f} deg from +Z",
+            f"Depth field  : {self.depth_method}, sigma={self.smooth_sigma:.2f}",
         ]
         if self.voxel_grid is not None:
             nx, ny, nz = self.voxel_grid.shape
