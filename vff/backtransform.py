@@ -45,29 +45,75 @@ _TOKEN_RE = re.compile(r"([A-Z])\s*(-?(?:\d+\.\d*|\.\d+|\d+))")
 
 
 def quick_gcode_xy_bounds(path: str | Path) -> tuple[np.ndarray, np.ndarray]:
-    """Fast scan of a G-code file for the XY range of G0/G1 moves. Returns
-    (xy_min[2], xy_max[2]). Used to align the depth field with the slicer's
-    actual model placement — PrusaSlicer / Cura / etc. centre the mesh on
-    their own bed, which won't match our build-volume centre."""
+    """Fast scan for the XY range of *extrusion* moves only. Returns
+    (xy_min[2], xy_max[2]).
+
+    Used to align the depth field with the slicer's actual model placement.
+    We deliberately ignore G0 travels and G1 lines without a positive E
+    delta — those go off to corners (X=0 home, Y=0 prime, purge tower at
+    the back, etc.) and would inflate the bbox so its centre no longer
+    matches where the part actually prints. Tracks G92 resets and the
+    M82/M83 (absolute/relative E) state to compute the delta correctly.
+    """
     xy_min = np.array([np.inf, np.inf], dtype=np.float64)
     xy_max = np.array([-np.inf, -np.inf], dtype=np.float64)
     in_path = Path(path)
+    cur_x = cur_y = 0.0
+    cur_e = 0.0
+    e_relative = True
     with in_path.open("r", encoding="utf-8", errors="replace") as fi:
         for raw in fi:
             line = raw.lstrip()
-            if not (line.startswith("G1") or line.startswith("G0")
-                    or line.startswith("G01") or line.startswith("G00")):
+            if not line:
                 continue
             head, _semi, _tail = line.partition(";")
+            tokens = head.split()
+            if not tokens:
+                continue
+            cmd = tokens[0].upper()
+            if cmd == "M82":
+                e_relative = False
+                continue
+            if cmd == "M83":
+                e_relative = True
+                continue
+            if cmd == "G92":
+                for letter, val in _TOKEN_RE.findall(head):
+                    if letter == "X": cur_x = float(val)
+                    elif letter == "Y": cur_y = float(val)
+                    elif letter == "E": cur_e = float(val)
+                continue
+            if cmd not in ("G1", "G01"):
+                # G0/travel ignored — only extrusion-bearing G1 contributes to bbox.
+                # Still need to track XY if it's a G0 with movement, so subsequent
+                # G1 has correct start XY; but for bbox purposes we exclude G0.
+                if cmd in ("G0", "G00"):
+                    for letter, val in _TOKEN_RE.findall(head):
+                        if letter == "X": cur_x = float(val)
+                        elif letter == "Y": cur_y = float(val)
+                continue
+
+            new_x, new_y = cur_x, cur_y
+            e_val = None
             for letter, val in _TOKEN_RE.findall(head):
-                if letter == "X":
-                    v = float(val)
-                    if v < xy_min[0]: xy_min[0] = v
-                    if v > xy_max[0]: xy_max[0] = v
-                elif letter == "Y":
-                    v = float(val)
-                    if v < xy_min[1]: xy_min[1] = v
-                    if v > xy_max[1]: xy_max[1] = v
+                if letter == "X": new_x = float(val)
+                elif letter == "Y": new_y = float(val)
+                elif letter == "E": e_val = float(val)
+            # Compute extrusion delta.
+            de = 0.0
+            if e_val is not None:
+                if e_relative:
+                    de = e_val
+                else:
+                    de = e_val - cur_e
+                    cur_e = e_val
+            # Only contribute to bbox if extrusion actually happened.
+            if de > 1e-9:
+                if new_x < xy_min[0]: xy_min[0] = new_x
+                if new_x > xy_max[0]: xy_max[0] = new_x
+                if new_y < xy_min[1]: xy_min[1] = new_y
+                if new_y > xy_max[1]: xy_max[1] = new_y
+            cur_x, cur_y = new_x, new_y
     return xy_min, xy_max
 
 
@@ -300,50 +346,15 @@ def _format_xyz(x: float, y: float, z: float) -> str:
     return f"X{x:.3f} Y{y:.3f} Z{z:.3f}"
 
 
-def backtransform_gcode_file(
-    input_path: str | Path,
-    output_path: str | Path,
-    bt: BackTransform,
-    subdiv_mm: float = 0.5,
-    n_jobs: int = -1,
-    verbose: bool = True,
-    direction: str = "forward",
-) -> dict:
-    """Two-pass batched G-code transform.
+def _collect_gcode_units(in_path: Path, subdiv_mm: float) -> tuple[list, np.ndarray, dict]:
+    """Pass 1: parse G-code, return (units, xyz_def, stats).
 
-    direction:
-      - "forward"  (default): apply deform_mesh's map to each G-code point.
-        Use case: planar-slicer output for a flat-bottom (or otherwise
-        slicer-friendly) mesh → non-planar G-code that follows the depth
-        field's curved layers when printed.
-      - "inverse" : apply deform_mesh's inverse map. Use case: planar
-        slicer output for a *deformed* mesh (one produced by deform_mesh) →
-        G-code that prints those flat slicer layers as curved layers in
-        the ORIGINAL (un-deformed) mesh's coordinate system.
-
-    Pass 1 — stream through input, parse every line. Each G0/G1 movement
-    expands to N subdivision endpoints, stored as a row in a flat
-    (M, 3) NumPy array (deformed space). All non-move lines and the
-    template strings for move lines are kept in order.
-
-    Pass 2 — vectorised invert (`BackTransform.invert_points_batch`),
-    optionally split across `n_jobs` worker processes. Each row of the
-    big array is converted to (x_orig, y_orig, z_orig) in one NumPy
-    call per chunk. Then a single streamed write produces the output.
-
-    `n_jobs`: -1 (default) uses all CPU cores via multiprocessing.Pool.
-              0 / 1 runs in-process (avoids fork overhead on small files).
+    units: list of either
+      ('raw', "<text without trailing newline>")
+      ('move', cmd, e_val_or_None, f_val_or_None, tail_or_None, n_pieces,
+       start_idx_in_xyz_def, e_relative)
+    xyz_def: (M, 3) float64 array of subdivided move endpoints (input-space).
     """
-    in_path = Path(input_path)
-    out_path = Path(output_path)
-    import time as _time
-    t0 = _time.perf_counter()
-
-    # --- pass 1: parse and collect ---------------------------------------
-    # Each output 'unit' is one of:
-    #   ('raw', "<text without trailing newline>")
-    #   ('move', cmd_str, e_val_or_None, f_val_or_None, tail_or_None, n_pieces, start_index_in_xyz_def)
-    #     -> emits n_pieces lines, reading endpoints from xyz_def[start:start+n_pieces]
     units: list = []
     xyz_def_chunks: list[list[tuple[float, float, float]]] = []
     chunk_buf: list[tuple[float, float, float]] = []
@@ -393,7 +404,6 @@ def backtransform_gcode_file(
                 f_val = params.get("F", None)
                 stats["moves_in"] += 1
 
-                # F-only / E-only with no XYZ change: echo as-is.
                 if new_x == cur_x and new_y == cur_y and new_z == cur_z and e_val is None:
                     units.append(("raw", line))
                     continue
@@ -437,14 +447,245 @@ def backtransform_gcode_file(
 
     _flush_chunk()
 
-    t1 = _time.perf_counter()
-
-    # --- pass 2: batched invert ------------------------------------------
     if not xyz_def_chunks:
         xyz_def = np.zeros((0, 3), dtype=np.float64)
     else:
         xyz_def = np.concatenate([np.asarray(c, dtype=np.float64) for c in xyz_def_chunks], axis=0)
-    del xyz_def_chunks
+
+    return units, xyz_def, stats
+
+
+def _write_clipped_gcode(
+    out_path: Path,
+    units: list,
+    xyz_out: np.ndarray,
+    inside_mask: np.ndarray,
+    header: str,
+) -> tuple[int, int, int, float, float]:
+    """Pass 3 (clip variant): per-piece, emit G1+E if `inside_mask[piece]` is
+    true, else G0 with no E (path kept, extrusion dropped).
+
+    For absolute-E (M82) moves: PrusaSlicer's gcode is usually relative (M83),
+    but if we encounter absolute, we still emit the final absolute E only when
+    the LAST piece is inside — otherwise the printer's E position would
+    desync. We compensate by emitting the last-inside-piece's E instead.
+
+    Returns (lines_written, n_kept, n_dropped, e_kept_mm, e_dropped_mm).
+    """
+    lines_out = 0
+    n_kept = 0
+    n_dropped = 0
+    e_kept = 0.0
+    e_dropped = 0.0
+    with out_path.open("w", encoding="utf-8", newline="\n") as fo:
+        fo.write(header)
+        lines_out += 1
+        for u in units:
+            if u[0] == "raw":
+                fo.write(u[1] + "\n")
+                lines_out += 1
+                continue
+            _, out_cmd, e_val, f_val, tail, n_pieces, start_idx, e_rel = u
+            # For absolute E: find the last inside-piece so we can emit the
+            # cumulative E there. If no piece is inside, the move skips E.
+            last_inside_piece = -1
+            if out_cmd == "G1" and e_val is not None and not e_rel:
+                for piece in range(n_pieces - 1, -1, -1):
+                    if inside_mask[start_idx + piece]:
+                        last_inside_piece = piece
+                        break
+            for piece in range(n_pieces):
+                pi = start_idx + piece
+                ox, oy, oz = xyz_out[pi]
+                piece_inside = bool(inside_mask[pi])
+                e_str = None
+                if out_cmd == "G0":
+                    cmd = "G0"
+                elif piece_inside:
+                    cmd = "G1"
+                    if e_val is not None:
+                        if e_rel:
+                            piece_e = e_val / n_pieces
+                            e_str = f"E{piece_e:.5f}"
+                            e_kept += piece_e
+                        elif piece == last_inside_piece:
+                            e_str = f"E{e_val:.5f}"
+                    n_kept += 1
+                else:
+                    cmd = "G0"
+                    n_dropped += 1
+                    if e_val is not None and e_rel:
+                        e_dropped += e_val / n_pieces
+                parts = [cmd, f"X{ox:.3f} Y{oy:.3f} Z{oz:.3f}"]
+                if e_str:
+                    parts.append(e_str)
+                if f_val is not None and piece == 0:
+                    parts.append(f"F{f_val:g}")
+                fo.write(" ".join(parts))
+                if tail is not None:
+                    fo.write(" ;" + tail)
+                fo.write("\n")
+                lines_out += 1
+    return lines_out, n_kept, n_dropped, e_kept, e_dropped
+
+
+def clip_gcode_file(
+    input_path: str | Path,
+    output_path: str | Path,
+    clip_stl_path: str | Path,
+    *,
+    xy_center: tuple[float, float] | None = None,
+    subdiv_mm: float = 0.5,
+    verbose: bool = True,
+) -> dict:
+    """Clip G-code extrusion to a target STL's interior.
+
+    For each subdivided gcode piece, test whether the piece's endpoint lies
+    inside `clip_stl_path` (Z-normalised to Z_min=0, XY-translated so its XY
+    bbox centre matches `xy_center`). Pieces inside → emit as G1 with their
+    share of E. Pieces outside → emit as G0 (no extrusion). Travel-only moves
+    (G0) pass through.
+
+    Use case: 'gcode was sliced for a flat-bottom variant (target + filled
+    base/slab); I want only the extrusions that fall inside the real
+    curved-bottom target to make it to the printer.' Material that PrusaSlicer
+    deposited into the filled-base region is dropped. The printer's head path
+    is preserved (still moves through the dropped region as travel), so XYZ
+    sequencing is unchanged — only E is removed for outside pieces.
+
+    Caveats:
+      - Mesh must be closed/manifold for `.contains()` to be reliable.
+      - For real printing this can leave material unsupported (e.g. blade
+        tips at high Z without lower layers under them). This mode is
+        primarily for VISUAL VERIFICATION that the deformation pipeline
+        produces the right shape — for actual prints you still need
+        supports/transitions.
+    """
+    in_path = Path(input_path)
+    out_path = Path(output_path)
+    import time as _time
+    t0 = _time.perf_counter()
+
+    target = _build_target_mesh(clip_stl_path, xy_center)
+    tgt_bounds = target.bounds.tolist()
+
+    units, xyz_def, stats = _collect_gcode_units(in_path, subdiv_mm)
+    t1 = _time.perf_counter()
+
+    if xyz_def.shape[0] == 0:
+        inside = np.zeros(0, dtype=bool)
+    else:
+        inside = np.asarray(target.contains(xyz_def), dtype=bool)
+    t2 = _time.perf_counter()
+
+    header = (
+        "; clip-to-mesh by vff/backtransform.py — "
+        f"extrusion dropped where outside {Path(clip_stl_path).name}\n"
+    )
+    lines_out, n_kept, n_dropped, e_kept, e_dropped = _write_clipped_gcode(
+        out_path, units, xyz_def, inside, header,
+    )
+    t3 = _time.perf_counter()
+
+    stats["lines_out"] = lines_out
+    stats["n_pts"] = int(xyz_def.shape[0])
+    stats["n_pieces_kept"] = n_kept
+    stats["n_pieces_dropped"] = n_dropped
+    stats["e_kept_mm"] = e_kept
+    stats["e_dropped_mm"] = e_dropped
+    stats["target_bounds"] = tgt_bounds
+    stats["t_parse_s"] = t1 - t0
+    stats["t_contains_s"] = t2 - t1
+    stats["t_write_s"] = t3 - t2
+
+    if verbose:
+        print(
+            f"[clip] {in_path.name} -> {out_path.name}: "
+            f"{stats['lines_in']:,} -> {stats['lines_out']:,} lines "
+            f"({stats['moves_in']:,} moves -> {stats['moves_out']:,} pieces; "
+            f"subdiv≈{stats['moves_out']/max(1,stats['moves_in']):.1f}x)"
+        )
+        print(
+            f"[clip] target bounds: X[{tgt_bounds[0][0]:.1f},{tgt_bounds[1][0]:.1f}] "
+            f"Y[{tgt_bounds[0][1]:.1f},{tgt_bounds[1][1]:.1f}] "
+            f"Z[{tgt_bounds[0][2]:.2f},{tgt_bounds[1][2]:.2f}] mm"
+        )
+        n_total = max(1, n_kept + n_dropped)
+        print(
+            f"[clip] pieces: kept {n_kept:,} ({100*n_kept/n_total:.1f}%) / "
+            f"dropped {n_dropped:,} ({100*n_dropped/n_total:.1f}%); "
+            f"extrusion kept {e_kept:.0f} mm / dropped {e_dropped:.0f} mm"
+        )
+        print(
+            f"[clip] timing: parse {stats['t_parse_s']:.2f}s "
+            f"contains {stats['t_contains_s']:.2f}s ({stats['n_pts']:,} pts) "
+            f"write {stats['t_write_s']:.2f}s"
+        )
+    return stats
+
+
+def _write_transformed_gcode(out_path: Path, units: list, xyz_out: np.ndarray, header: str) -> int:
+    """Pass 3: stream-write the unit list, reading move endpoints from xyz_out."""
+    lines_out = 0
+    with out_path.open("w", encoding="utf-8", newline="\n") as fo:
+        fo.write(header)
+        lines_out += 1
+        for u in units:
+            if u[0] == "raw":
+                fo.write(u[1] + "\n")
+                lines_out += 1
+                continue
+            _, out_cmd, e_val, f_val, tail, n_pieces, start_idx, e_rel = u
+            for piece in range(n_pieces):
+                ox, oy, oz = xyz_out[start_idx + piece]
+                parts = [out_cmd, f"X{ox:.3f} Y{oy:.3f} Z{oz:.3f}"]
+                if e_val is not None:
+                    if e_rel:
+                        parts.append(f"E{(e_val / n_pieces):.5f}")
+                    elif piece == n_pieces - 1:
+                        parts.append(f"E{e_val:.5f}")
+                if f_val is not None and piece == 0:
+                    parts.append(f"F{f_val:g}")
+                fo.write(" ".join(parts))
+                if tail is not None:
+                    fo.write(" ;" + tail)
+                fo.write("\n")
+                lines_out += 1
+    return lines_out
+
+
+def backtransform_gcode_file(
+    input_path: str | Path,
+    output_path: str | Path,
+    bt: BackTransform,
+    subdiv_mm: float = 0.5,
+    n_jobs: int = -1,
+    verbose: bool = True,
+    direction: str = "forward",
+) -> dict:
+    """Three-pass batched G-code transform using a BackTransform's depth field.
+
+    direction:
+      - "forward"  (default): apply deform_mesh's map to each G-code point.
+        Use case: planar-slicer output for a flat-bottom (or otherwise
+        slicer-friendly) mesh → non-planar G-code that follows the depth
+        field's curved layers when printed.
+      - "inverse" : apply deform_mesh's inverse map. Use case: planar
+        slicer output for a *deformed* mesh (one produced by deform_mesh) →
+        G-code that prints those flat slicer layers as curved layers in
+        the ORIGINAL (un-deformed) mesh's coordinate system.
+
+    `n_jobs`: -1 (default) uses all CPU cores via multiprocessing.Pool.
+              0 / 1 runs in-process (avoids fork overhead on small files).
+    """
+    in_path = Path(input_path)
+    out_path = Path(output_path)
+    import time as _time
+    t0 = _time.perf_counter()
+
+    units, xyz_def, stats = _collect_gcode_units(in_path, subdiv_mm)
+
+    t1 = _time.perf_counter()
 
     n_pts = xyz_def.shape[0]
     if direction not in ("forward", "inverse"):
@@ -482,41 +723,20 @@ def backtransform_gcode_file(
 
     t2 = _time.perf_counter()
 
-    # --- pass 3: stream output -------------------------------------------
     z_orig_min = float("inf")
     z_orig_max = float("-inf")
     if n_pts:
         z_orig_min = float(xyz_orig[:, 2].min())
         z_orig_max = float(xyz_orig[:, 2].max())
 
-    with out_path.open("w", encoding="utf-8", newline="\n") as fo:
-        fo.write(
-            "; backtransformed by vff/backtransform.py — "
-            "deformed-space XYZ inverted to original (non-planar) space\n"
-        )
-        for u in units:
-            if u[0] == "raw":
-                fo.write(u[1] + "\n")
-                continue
-            _, out_cmd, e_val, f_val, tail, n_pieces, start_idx, e_rel = u
-            for piece in range(n_pieces):
-                ox, oy, oz = xyz_orig[start_idx + piece]
-                parts = [out_cmd, f"X{ox:.3f} Y{oy:.3f} Z{oz:.3f}"]
-                if e_val is not None:
-                    if e_rel:
-                        parts.append(f"E{(e_val / n_pieces):.5f}")
-                    elif piece == n_pieces - 1:
-                        parts.append(f"E{e_val:.5f}")
-                if f_val is not None and piece == 0:
-                    parts.append(f"F{f_val:g}")
-                fo.write(" ".join(parts))
-                if tail is not None:
-                    fo.write(" ;" + tail)
-                fo.write("\n")
+    header = (
+        "; backtransformed by vff/backtransform.py — "
+        "deformed-space XYZ inverted to original (non-planar) space\n"
+    )
+    stats["lines_out"] = _write_transformed_gcode(out_path, units, xyz_orig, header)
 
     t3 = _time.perf_counter()
 
-    stats["lines_out"] = sum(1 for u in units if u[0] == "raw") + stats["moves_out"] + 1
     stats["z_orig_min"] = z_orig_min
     stats["z_orig_max"] = z_orig_max
     stats["t_parse_s"] = t1 - t0
@@ -538,6 +758,146 @@ def backtransform_gcode_file(
         print(
             f"[backtransform] timing: parse {stats['t_parse_s']:.2f}s  "
             f"invert {stats['t_invert_s']:.2f}s ({stats['n_invert_pts']:,} pts)  "
+            f"write {stats['t_write_s']:.2f}s"
+        )
+    return stats
+
+
+def _build_target_mesh(
+    target_stl_path: str | Path,
+    xy_center: tuple[float, float] | None = None,
+) -> trimesh.Trimesh:
+    """Load target STL, Z-normalise so Z_min = 0, optionally XY-translate so
+    its XY bbox centre matches xy_center."""
+    target = trimesh.load(str(target_stl_path), force="mesh")
+    if not isinstance(target, trimesh.Trimesh):
+        raise ValueError(f"Not a single mesh: {type(target).__name__}")
+    target.apply_translation([0.0, 0.0, -float(target.bounds[0, 2])])
+    if xy_center is not None:
+        mxy = 0.5 * (target.bounds[0, :2] + target.bounds[1, :2])
+        target.apply_translation([
+            float(xy_center[0]) - float(mxy[0]),
+            float(xy_center[1]) - float(mxy[1]),
+            0.0,
+        ])
+    return target
+
+
+def _surface_heights_bottom(target: trimesh.Trimesh, xy_points: np.ndarray) -> np.ndarray:
+    """Ray-cast from below into `target` at each (X, Y); return per-point Z of
+    the lowest surface hit (the target's bottom face at that column).
+    Returns 0 for (X, Y) outside the target's XY footprint (ray misses)."""
+    xy_points = np.asarray(xy_points, dtype=np.float64)
+    N = xy_points.shape[0]
+    if N == 0:
+        return np.zeros(0, dtype=np.float64)
+    z_start = float(target.bounds[0, 2]) - 1.0
+    origins = np.column_stack([
+        xy_points[:, 0], xy_points[:, 1], np.full(N, z_start, dtype=np.float64),
+    ])
+    directions = np.tile([0.0, 0.0, 1.0], (N, 1))
+    locations, ray_indices, _ = target.ray.intersects_location(
+        origins, directions, multiple_hits=False,
+    )
+    H = np.zeros(N, dtype=np.float64)
+    if len(ray_indices) > 0:
+        H[np.asarray(ray_indices, dtype=np.int64)] = locations[:, 2]
+    return H
+
+
+def surface_offset_gcode_file(
+    input_path: str | Path,
+    output_path: str | Path,
+    target_stl_path: str | Path,
+    *,
+    xy_center: tuple[float, float] | None = None,
+    subdiv_mm: float = 0.5,
+    verbose: bool = True,
+) -> dict:
+    """Conform G-code Z to a target STL's bottom surface.
+
+    For each gcode point (X, Y, Z_planar), find H(X, Y) — the Z of
+    `target_stl_path`'s lowest surface at that XY column (ray-cast from
+    below) — and output (X, Y, Z_planar + H). The target STL is
+    Z-normalised so its Z_min = 0 (bed), and XY-translated so its XY-bbox
+    centre matches `xy_center` (typically the gcode's extrusion-XY centre).
+
+    Use case: 'print target_stl shape using gcode that was sliced from a
+    flat-bottomed variant (target + flat slab base)'. Unlike the
+    depth-field forward map (which compresses Z by depth/depth_max),
+    this preserves slab thickness, blade thickness and hub height
+    everywhere — every column is rigidly Z-shifted by H(X, Y), nothing
+    is squashed.
+
+    For XY points that fall outside the target's footprint, H = 0
+    (point passes through unchanged)."""
+    in_path = Path(input_path)
+    out_path = Path(output_path)
+    import time as _time
+    t0 = _time.perf_counter()
+
+    target = _build_target_mesh(target_stl_path, xy_center)
+    tgt_bounds = target.bounds.tolist()
+
+    units, xyz_def, stats = _collect_gcode_units(in_path, subdiv_mm)
+    t1 = _time.perf_counter()
+
+    if xyz_def.shape[0] == 0:
+        xyz_out = xyz_def.copy()
+        H = np.zeros(0, dtype=np.float64)
+    else:
+        H = _surface_heights_bottom(target, xyz_def[:, :2])
+        xyz_out = xyz_def.copy()
+        xyz_out[:, 2] = xyz_def[:, 2] + H
+    t2 = _time.perf_counter()
+
+    header = (
+        "; conform-to-surface by vff/backtransform.py — "
+        f"Z lifted by bottom surface of {Path(target_stl_path).name}\n"
+    )
+    stats["lines_out"] = _write_transformed_gcode(out_path, units, xyz_out, header)
+    t3 = _time.perf_counter()
+
+    z_orig_min = float(xyz_out[:, 2].min()) if xyz_out.shape[0] else float("inf")
+    z_orig_max = float(xyz_out[:, 2].max()) if xyz_out.shape[0] else float("-inf")
+    n_pts = int(xyz_def.shape[0])
+    n_hit = int((H > 1e-9).sum())
+
+    stats["z_orig_min"] = z_orig_min
+    stats["z_orig_max"] = z_orig_max
+    stats["t_parse_s"] = t1 - t0
+    stats["t_transform_s"] = t2 - t1
+    stats["t_write_s"] = t3 - t2
+    stats["n_pts"] = n_pts
+    stats["n_pts_in_footprint"] = n_hit
+    stats["target_bounds"] = tgt_bounds
+    stats["H_max"] = float(H.max()) if H.size else 0.0
+    stats["H_mean_in_footprint"] = float(H[H > 1e-9].mean()) if n_hit else 0.0
+
+    if verbose:
+        print(
+            f"[conform] {in_path.name} -> {out_path.name}: "
+            f"{stats['lines_in']:,} -> {stats['lines_out']:,} lines "
+            f"({stats['moves_in']:,} moves -> {stats['moves_out']:,}; "
+            f"subdiv≈{stats['moves_out']/max(1,stats['moves_in']):.1f}x)"
+        )
+        print(
+            f"[conform] target STL bounds: X[{tgt_bounds[0][0]:.1f},{tgt_bounds[1][0]:.1f}] "
+            f"Y[{tgt_bounds[0][1]:.1f},{tgt_bounds[1][1]:.1f}] "
+            f"Z[{tgt_bounds[0][2]:.2f},{tgt_bounds[1][2]:.2f}] mm"
+        )
+        print(
+            f"[conform] H per gcode pt: max {stats['H_max']:.3f} mm, "
+            f"{n_hit:,}/{n_pts:,} pts in footprint "
+            f"(mean offset {stats['H_mean_in_footprint']:.3f} mm)"
+        )
+        print(
+            f"[conform] planar Z: [{stats['z_min']:.3f}, {stats['z_max']:.3f}] mm "
+            f"→ conformed Z: [{z_orig_min:.3f}, {z_orig_max:.3f}] mm"
+        )
+        print(
+            f"[conform] timing: parse {stats['t_parse_s']:.2f}s "
+            f"transform {stats['t_transform_s']:.2f}s ({n_pts:,} pts) "
             f"write {stats['t_write_s']:.2f}s"
         )
     return stats

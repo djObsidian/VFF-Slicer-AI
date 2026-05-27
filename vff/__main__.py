@@ -101,6 +101,27 @@ def main(argv: list[str] | None = None) -> int:
              "Overrides --dz-per-layer if both given.",
     )
     parser.add_argument(
+        "--clip-to", metavar="STL_PATH",
+        help="G-code transform mode: drop extrusion outside the given STL's "
+             "interior. Each subdivided G1 piece is tested with mesh.contains(); "
+             "inside-pieces keep their E, outside-pieces become G0 (no E). "
+             "Use to print a curved-bottom target from gcode that was sliced "
+             "for a flat-bottomed variant — material in the filled-base region "
+             "is removed. Visual verification only — leaves unsupported "
+             "geometry; real prints need supports/transitions.",
+    )
+    parser.add_argument(
+        "--conform-to", metavar="STL_PATH",
+        help="G-code transform mode: skip the depth-field deformation and "
+             "instead lift each gcode point's Z by the bottom-surface height "
+             "of the given target STL at that (X, Y), via ray-cast from below. "
+             "Use case: 'print this curved-bottom mesh from gcode that was "
+             "sliced for a flat-bottomed variant (target + added flat slab)'. "
+             "Preserves slab thickness, blade thickness and hub height — only "
+             "Z-shifts each column rigidly. Ignores --dz-per-layer, "
+             "--dz-auto-fit, --max-tilt, --smooth-sigma, --depth-method.",
+    )
+    parser.add_argument(
         "--no-gcode-align", action="store_true",
         help="Disable XY auto-alignment of the depth field to the gcode's XY bounds. "
              "By default the gcode-transform path quick-scans the G-code XY range and "
@@ -123,6 +144,62 @@ def main(argv: list[str] | None = None) -> int:
              "this one will.",
     )
     args = parser.parse_args(argv)
+
+    # Fast path: --gcode-in + (--conform-to | --clip-to) needs neither a build
+    # volume nor the positional STL (depth field is bypassed). Skip the
+    # expensive voxelize/Viewer setup entirely.
+    if args.gcode_in and (args.conform_to or args.clip_to):
+        from .backtransform import (
+            clip_gcode_file, quick_gcode_xy_bounds, surface_offset_gcode_file,
+        )
+        mode = "clip" if args.clip_to else "conform"
+        target_arg = args.clip_to if args.clip_to else args.conform_to
+        target_path = Path(target_arg)
+        if not target_path.exists():
+            print(f"--{mode}-to STL not found: {target_path}", file=sys.stderr)
+            return 1
+        out_path = args.gcode_out
+        if not out_path:
+            default_suffix = ".clipped.gcode" if mode == "clip" else ".conformed.gcode"
+            out_path = str(Path(args.gcode_in).with_suffix(default_suffix))
+        xy_center = None
+        align_info = ""
+        if not args.no_gcode_align:
+            xy_min, xy_max = quick_gcode_xy_bounds(args.gcode_in)
+            if np.isfinite(xy_min).all() and np.isfinite(xy_max).all():
+                xy_center = (
+                    0.5 * (xy_min[0] + xy_max[0]),
+                    0.5 * (xy_min[1] + xy_max[1]),
+                )
+                align_info = (
+                    f"  align→gcode  : XY range [{xy_min[0]:.1f}, {xy_max[0]:.1f}] x "
+                    f"[{xy_min[1]:.1f}, {xy_max[1]:.1f}], centre "
+                    f"({xy_center[0]:.1f}, {xy_center[1]:.1f})\n"
+                )
+        banner_title = (
+            "G-code clip to mesh interior" if mode == "clip"
+            else "G-code surface-offset conform"
+        )
+        print(
+            f"{banner_title}: {args.gcode_in} -> {out_path}\n"
+            f"  target STL    : {target_path}\n"
+            f"  subdiv-mm     : {args.subdiv_mm} mm\n"
+            f"{align_info}",
+            end="",
+            flush=True,
+        )
+        print(flush=True)
+        if mode == "clip":
+            clip_gcode_file(
+                args.gcode_in, out_path, str(target_path),
+                xy_center=xy_center, subdiv_mm=args.subdiv_mm,
+            )
+        else:
+            surface_offset_gcode_file(
+                args.gcode_in, out_path, str(target_path),
+                xy_center=xy_center, subdiv_mm=args.subdiv_mm,
+            )
+        return 0
 
     from .build_volume import BuildVolume
     from .mesh_io import load_and_place
