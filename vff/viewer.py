@@ -869,7 +869,7 @@ class Viewer:
         # Outside the model: vertical depth (k - k_bed_layer), so iso-surfaces
         # extend as horizontal planes with vertical normals — no flood-fill
         # perturbations near the model boundary.
-        extended = smoothed_depth_field(gr, sigma=1.5)
+        extended = smoothed_depth_field(gr, sigma=1.0)
         step_flat = extended.flatten(order="F")
         arr = vns.numpy_to_vtk(step_flat, deep=True, array_type=vtk.VTK_FLOAT)
         arr.SetName("step")

@@ -25,38 +25,127 @@ from __future__ import annotations
 import numpy as np
 import trimesh
 from scipy.ndimage import gaussian_filter
+from scipy.sparse import csr_array
+from scipy.sparse.csgraph import dijkstra
 
 from .growth import GrowthResult
 
 
-def smoothed_depth_field(growth: GrowthResult, sigma: float = 1.5) -> np.ndarray:
+_NBR_OFFSETS_WEIGHTED = np.array(
+    [(dx, dy, dz, float(np.sqrt(dx * dx + dy * dy + dz * dz)))
+     for dx in (-1, 0, 1) for dy in (-1, 0, 1) for dz in (-1, 0, 1)
+     if (dx, dy, dz) != (0, 0, 0)],
+    dtype=np.float64,
+)
+
+
+def geodesic_distance_from_bed(growth: GrowthResult) -> np.ndarray:
+    """Multi-source weighted Dijkstra shortest-path distance from bed seeds
+    through model voxels using 26-connectivity, edge weight = Euclidean
+    voxel distance (1, √2, √3 for face/edge/vertex neighbours).
+
+    Returns a float32 grid of geodesic distances (in voxel units) for
+    model voxels, np.inf for everything outside the model. Compared to
+    the integer BFS step:
+      - continuous (no quantization)
+      - reflects actual path length (corner-cutting via diagonals is
+        properly more expensive than going around the face)
+      - typically gives larger max values than BFS step for parts with
+        diagonal-dominated chains (stronger deformation downstream)
+    """
+    # Model voxels = those with assigned step (>= 0). Outside is -1.
+    matrix = growth.step >= 0
+    nx, ny, nz = matrix.shape
+
+    # Compact model-voxel indexing: model voxels get 0..M-1, others -1.
+    n_voxels = int(matrix.sum())
+    if n_voxels == 0:
+        return np.full(matrix.shape, np.inf, dtype=np.float32)
+    flat_idx = np.full(matrix.shape, -1, dtype=np.int64)
+    flat_idx[matrix] = np.arange(n_voxels)
+
+    model_indices = np.argwhere(matrix).astype(np.int64)  # (M, 3)
+
+    # Build adjacency in COO form.
+    rows_all = []
+    cols_all = []
+    wts_all = []
+    for dx, dy, dz, w in _NBR_OFFSETS_WEIGHTED:
+        d = np.array([dx, dy, dz], dtype=np.int64)
+        nbr = model_indices + d
+        inb = (
+            (nbr[:, 0] >= 0) & (nbr[:, 0] < nx)
+            & (nbr[:, 1] >= 0) & (nbr[:, 1] < ny)
+            & (nbr[:, 2] >= 0) & (nbr[:, 2] < nz)
+        )
+        if not inb.any():
+            continue
+        in_pos = np.where(inb)[0]
+        nbr_in = nbr[in_pos]
+        nbr_flat = flat_idx[nbr_in[:, 0], nbr_in[:, 1], nbr_in[:, 2]]
+        valid = nbr_flat >= 0
+        if not valid.any():
+            continue
+        from_idx = in_pos[valid]
+        to_idx = nbr_flat[valid]
+        rows_all.append(from_idx)
+        cols_all.append(to_idx)
+        wts_all.append(np.full(len(from_idx), w, dtype=np.float64))
+
+    rows = np.concatenate(rows_all)
+    cols = np.concatenate(cols_all)
+    wts = np.concatenate(wts_all)
+    graph = csr_array((wts, (rows, cols)), shape=(n_voxels, n_voxels))
+
+    # Seeds: lowest non-empty Z layer's filled voxels (same convention as growth).
+    has_in_z = matrix.any(axis=(0, 1))
+    if not has_in_z.any():
+        return np.full(matrix.shape, np.inf, dtype=np.float32)
+    k_seed = int(np.argmax(has_in_z))
+    seed_mask = np.zeros(matrix.shape, dtype=bool)
+    seed_mask[:, :, k_seed] = matrix[:, :, k_seed]
+    seed_flat = flat_idx[seed_mask]
+
+    # Multi-source Dijkstra: scipy's min_only=True does this in a SINGLE
+    # Dijkstra run (treats all seeds as zero-cost starting points), instead
+    # of running one Dijkstra per source. Two orders of magnitude faster
+    # when there are many seeds (propeller has ~1.8k bed seeds @ pitch=1).
+    dist_flat = dijkstra(
+        graph,
+        directed=False,
+        indices=seed_flat,
+        return_predecessors=False,
+        min_only=True,
+    )
+
+    dist = np.full(matrix.shape, np.inf, dtype=np.float32)
+    dist[matrix] = dist_flat.astype(np.float32)
+    return dist
+
+
+def smoothed_depth_field(growth: GrowthResult, sigma: float = 1.0) -> np.ndarray:
     """Continuous "depth from bed" field used by both surface viz and deform.
 
-    Combines two ideas:
+    Construction:
 
-      1. Outside the model the field is VERTICAL: `field = k - k_bed_layer`.
-         So iso-surfaces in empty space are exact horizontal planes — the
-         normals there point straight up, matching the print head's default
-         orientation. No more radial flood-fill perturbations near the model.
+      1. Inside the model: **weighted-Dijkstra geodesic distance from bed**
+         (face/edge/vertex edges with weights 1/√2/√3). Continuous,
+         direction-symmetric, and naturally larger than the integer BFS
+         step for chains that go through diagonals — so the downstream
+         deformation actually stretches.
 
-      2. Inside the model the field starts as the integer BFS step, which is
-         anisotropic — it depends on how the model's features happen to line
-         up with the voxel grid axes. Two geometrically-identical features
-         at different angles (e.g. propeller blades) end up with slightly
-         different step distributions, which makes their deformations look
-         different. A Gaussian smoothing of the whole field (interior +
-         vertical exterior, jointly) averages this anisotropy out and gives
-         a continuous "depth" that respects the model's symmetry.
+      2. Outside the model: vertical depth `field = k - k_bed_layer`.
+         Iso-surfaces in empty space are exact horizontal planes →
+         normals point straight up. No flood-fill perturbations.
 
-    Key boundary property: inside the model at the bed (k = k_bed_layer)
-    step is 0; the vertical extension at the same k is also 0 (=
-    k - k_bed_layer). They agree on the bed surface, so Gaussian smoothing
-    doesn't introduce a gradient across the bed boundary — bed contact is
-    preserved.
+      3. Light Gaussian smoothing (default sigma=0.6 voxels) to take the
+         edge off the residual BFS-axis flavour in the geodesic field.
+         Less aggressive than before — the geodesic field is already much
+         smoother than the integer step it replaces.
 
-    `sigma` is in voxel units. Default 1.5 = light smoothing that visibly
-    symmetrizes the field without erasing real growth geometry. Heavier
-    sigma symmetrizes more but starts to round off real overhangs.
+    Boundary continuity: at the bed (k=k_bed_layer) the geodesic distance
+    is 0 (seed voxels) and the vertical extension is 0 (k - k_bed_layer).
+    They agree, so smoothing doesn't drag bed-touching values up.
     """
     step = growth.step
     if step.size == 0 or not (step >= 0).any():
@@ -64,21 +153,25 @@ def smoothed_depth_field(growth: GrowthResult, sigma: float = 1.5) -> np.ndarray
 
     nx, ny, nz = step.shape
 
-    # k_bed_layer = lowest Z-layer that contains any model voxel.
-    # Matches _seed_bed_mask convention (step=0 voxels live here).
     has_model_in_z = (step >= 0).any(axis=(0, 1))
     k_bed_layer = int(np.argmax(has_model_in_z))
 
-    # Initialize with BFS step inside the model.
-    field = step.astype(np.float32).copy()
+    # Inside-model: weighted geodesic distance from bed seeds.
+    geo = geodesic_distance_from_bed(growth)  # float32, inf outside model
+    field = geo.astype(np.float32, copy=True)
 
-    # Vertical extension outside the model: step = k - k_bed_layer.
+    # Outside-model: vertical depth k - k_bed_layer.
     k_axis = np.arange(nz, dtype=np.float32) - float(k_bed_layer)
     k_grid = np.broadcast_to(k_axis[None, None, :], step.shape)
-    empty = step < 0
-    field[empty] = k_grid[empty]
+    outside = step < 0
+    field[outside] = k_grid[outside]
 
-    # Joint Gaussian smoothing across interior + vertical exterior.
+    # Replace any residual inf (e.g. disconnected model components that bed
+    # never reaches) with the vertical extension value at that cell.
+    bad = ~np.isfinite(field)
+    if bad.any():
+        field[bad] = k_grid[bad]
+
     if sigma > 0:
         field = gaussian_filter(field, sigma=sigma, mode="nearest")
 
@@ -183,7 +276,7 @@ def deform_mesh(
     dz_per_layer: float | None = None,
     bed_z: float = 0.0,
     bed_blend_height: float | None = None,
-    smooth_sigma: float = 1.5,
+    smooth_sigma: float = 1.0,
 ) -> trimesh.Trimesh:
     """Return a deformed copy of `mesh` whose Z is driven by the growth step.
 
