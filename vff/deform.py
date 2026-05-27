@@ -25,7 +25,7 @@ from __future__ import annotations
 import numpy as np
 import numpy.ma as ma
 import trimesh
-from scipy.ndimage import gaussian_filter
+from scipy.ndimage import distance_transform_edt, gaussian_filter
 from scipy.sparse import csr_array
 from scipy.sparse.csgraph import dijkstra
 
@@ -171,6 +171,7 @@ def smoothed_depth_field(
     growth: GrowthResult,
     sigma: float = 2.0,
     method: str = "fmm",
+    outside_mode: str = "extend",
 ) -> np.ndarray:
     """Continuous "depth from bed" field used by both surface viz and deform.
 
@@ -216,14 +217,42 @@ def smoothed_depth_field(
         geo = geodesic_distance_from_bed(growth)
     field = geo.astype(np.float32, copy=True)
 
-    # Outside-model: vertical depth k - k_bed_layer.
+    outside = step < 0
     k_axis = np.arange(nz, dtype=np.float32) - float(k_bed_layer)
     k_grid = np.broadcast_to(k_axis[None, None, :], step.shape)
-    outside = step < 0
-    field[outside] = k_grid[outside]
 
-    # Replace any residual inf (e.g. disconnected model components that bed
-    # never reaches) with the vertical extension value at that cell.
+    # Outside-model handling — picked to match the consumer:
+    #
+    #   "extend"   — each outside cell inherits the depth of its nearest
+    #                MODEL cell (Euclidean nearest via distance_transform_edt).
+    #                The field is CONTINUOUS across the model boundary, so a
+    #                mesh vertex sitting on the model surface gets the same
+    #                depth from inside cells and from adjacent air cells
+    #                via trilinear. Default — required by the deformation
+    #                path; without it, blade-tip vertices bridge a sudden
+    #                inside↔outside depth gap and the mesh spikes outward.
+    #
+    #   "vertical" — outside cells get k - k_bed_layer (linear in z). Iso-
+    #                surfaces in air become exact horizontal planes with
+    #                vertical normals. Use this for SURFACE VISUALISATION,
+    #                where the user wants the air part of each iso-surface
+    #                to look flat. NOT for deformation.
+    if outside.any():
+        if outside_mode == "extend":
+            idx = distance_transform_edt(
+                outside, return_distances=False, return_indices=True
+            )
+            field[outside] = field[idx[0], idx[1], idx[2]][outside]
+        elif outside_mode == "vertical":
+            field[outside] = k_grid[outside]
+        else:
+            raise ValueError(
+                f"outside_mode must be 'extend' or 'vertical', got {outside_mode!r}"
+            )
+
+    # Disconnected components — bed Dijkstra/FMM never reaches them, so
+    # they stay at inf. Backfill with the vertical default so they at
+    # least get a sane value (rare but happens with split models).
     bad = ~np.isfinite(field)
     if bad.any():
         field[bad] = k_grid[bad]
