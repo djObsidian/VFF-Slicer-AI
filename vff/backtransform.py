@@ -44,6 +44,33 @@ from .voxelize import voxelize_solid
 _TOKEN_RE = re.compile(r"([A-Z])\s*(-?(?:\d+\.\d*|\.\d+|\d+))")
 
 
+def quick_gcode_xy_bounds(path: str | Path) -> tuple[np.ndarray, np.ndarray]:
+    """Fast scan of a G-code file for the XY range of G0/G1 moves. Returns
+    (xy_min[2], xy_max[2]). Used to align the depth field with the slicer's
+    actual model placement — PrusaSlicer / Cura / etc. centre the mesh on
+    their own bed, which won't match our build-volume centre."""
+    xy_min = np.array([np.inf, np.inf], dtype=np.float64)
+    xy_max = np.array([-np.inf, -np.inf], dtype=np.float64)
+    in_path = Path(path)
+    with in_path.open("r", encoding="utf-8", errors="replace") as fi:
+        for raw in fi:
+            line = raw.lstrip()
+            if not (line.startswith("G1") or line.startswith("G0")
+                    or line.startswith("G01") or line.startswith("G00")):
+                continue
+            head, _semi, _tail = line.partition(";")
+            for letter, val in _TOKEN_RE.findall(head):
+                if letter == "X":
+                    v = float(val)
+                    if v < xy_min[0]: xy_min[0] = v
+                    if v > xy_max[0]: xy_max[0] = v
+                elif letter == "Y":
+                    v = float(val)
+                    if v < xy_min[1]: xy_min[1] = v
+                    if v > xy_max[1]: xy_max[1] = v
+    return xy_min, xy_max
+
+
 class BackTransform:
     """Holds the depth field and parameters needed to invert deform_mesh."""
 
@@ -80,13 +107,33 @@ class BackTransform:
         depth_method: str = "fmm",
         dz_per_layer: float | None = None,
         bed_blend_height: float | None = None,
+        xy_center: tuple[float, float] | None = None,
     ) -> "BackTransform":
         """Build the same depth field that was used for the forward deform.
 
-        The args must match what was passed to deform_mesh / Viewer when
-        the deformed STL was exported, otherwise the inverse won't line up."""
-        vol = BuildVolume.cube(volume_side)
-        mesh = load_and_place(stl_path, vol)
+        If `xy_center` is given, the mesh is translated so its XY bbox is
+        centred on that point (instead of the build-volume centre that
+        load_and_place would pick). This is essential for the G-code
+        transform path: the slicer (PrusaSlicer, Cura, etc.) places the
+        model at its own bed centre, which won't match our build_volume
+        centre unless they happen to be the same. Pass the gcode-derived
+        XY centre here so the depth field lines up with gcode coords.
+        Z is always normalised so the mesh's Z_min sits at 0 (bed)."""
+        import trimesh
+        mesh = trimesh.load(stl_path, force="mesh")
+        if not isinstance(mesh, trimesh.Trimesh):
+            raise ValueError(f"Not a single mesh: {type(mesh).__name__}")
+
+        if xy_center is not None:
+            mesh_xy_c = 0.5 * (mesh.bounds[0, :2] + mesh.bounds[1, :2])
+            dx = float(xy_center[0]) - float(mesh_xy_c[0])
+            dy = float(xy_center[1]) - float(mesh_xy_c[1])
+            dz = -float(mesh.bounds[0, 2])  # bed-align
+            mesh.apply_translation([dx, dy, dz])
+        else:
+            vol = BuildVolume.cube(volume_side)
+            mesh = load_and_place(stl_path, vol)
+
         vg = voxelize_solid(mesh, pitch=pitch)
         gr = compute_growth(vg, max_tilt_deg=max_tilt_deg)
         # outside_mode='extend' matches deform_mesh's default — that's the

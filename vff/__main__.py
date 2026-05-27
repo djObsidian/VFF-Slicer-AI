@@ -4,6 +4,8 @@ import sys
 import traceback
 from pathlib import Path
 
+import numpy as np
+
 # --- Surface every kind of failure to the console BEFORE we import VTK ---
 # 1. Unbuffered stdio so prints survive a hard crash.
 try:
@@ -99,6 +101,15 @@ def main(argv: list[str] | None = None) -> int:
              "Overrides --dz-per-layer if both given.",
     )
     parser.add_argument(
+        "--no-gcode-align", action="store_true",
+        help="Disable XY auto-alignment of the depth field to the gcode's XY bounds. "
+             "By default the gcode-transform path quick-scans the G-code XY range and "
+             "translates the STL so its XY bbox centre matches the gcode's — necessary "
+             "because slicers position the model on their own bed (e.g. PrusaSlicer 220x220) "
+             "which won't match our --volume centre by default. Disable only if you know "
+             "the STL is already in slicer-coords.",
+    )
+    parser.add_argument(
         "--jobs", type=int, default=-1,
         help="Backtransform: parallel worker count for the invert step. "
              "-1 = auto (all cores, but only when point count >5 M; below that the "
@@ -154,13 +165,27 @@ def main(argv: list[str] | None = None) -> int:
         viewer.load_gcode_preview(args.preview_gcode)
 
     if args.gcode_in:
-        from .backtransform import BackTransform, backtransform_gcode_file
+        from .backtransform import BackTransform, backtransform_gcode_file, quick_gcode_xy_bounds
         out_path = args.gcode_out
         if not out_path:
             from pathlib import Path as _P
             in_p = _P(args.gcode_in)
             suffix = ".nonplanar.gcode" if args.gcode_direction == "forward" else ".planar.gcode"
             out_path = str(in_p.with_suffix(suffix))
+
+        # First: quick-scan the gcode for its XY range so we can align the
+        # depth field to the slicer's model placement. PrusaSlicer / Cura
+        # don't use our --volume centre.
+        xy_center = None
+        align_info = ""
+        if not args.no_gcode_align:
+            xy_min, xy_max = quick_gcode_xy_bounds(args.gcode_in)
+            if np.isfinite(xy_min).all() and np.isfinite(xy_max).all():
+                xy_center = (0.5 * (xy_min[0] + xy_max[0]), 0.5 * (xy_min[1] + xy_max[1]))
+                align_info = (
+                    f"  align→gcode  : XY range [{xy_min[0]:.1f}, {xy_max[0]:.1f}] x "
+                    f"[{xy_min[1]:.1f}, {xy_max[1]:.1f}], centre ({xy_center[0]:.1f}, {xy_center[1]:.1f})\n"
+                )
 
         # Auto-fit picks dz so the forward-deformed Z extent matches the STL's
         # Z extent. Computed by building the depth field once, taking its max
@@ -169,12 +194,23 @@ def main(argv: list[str] | None = None) -> int:
         autofit_info = ""
         if args.dz_auto_fit:
             import numpy as _np
+            import trimesh as _trimesh
             from .deform import smoothed_depth_field
             from .growth import compute_growth
             from .voxelize import voxelize_solid
-            from .build_volume import BuildVolume as _BV
-            _vol = _BV.of(x, y, z)
-            _m = load_and_place(str(stl_path), _vol)
+
+            _m = _trimesh.load(str(stl_path), force="mesh")
+            if xy_center is not None:
+                _mxy = 0.5 * (_m.bounds[0, :2] + _m.bounds[1, :2])
+                _m.apply_translation([
+                    xy_center[0] - float(_mxy[0]),
+                    xy_center[1] - float(_mxy[1]),
+                    -float(_m.bounds[0, 2]),
+                ])
+            else:
+                from .build_volume import BuildVolume as _BV
+                _vol = _BV.of(x, y, z)
+                _m = load_and_place(str(stl_path), _vol)
             _vg = voxelize_solid(_m, pitch=args.pitch)
             _gr = compute_growth(_vg, max_tilt_deg=args.max_tilt)
             _f = smoothed_depth_field(
@@ -198,6 +234,7 @@ def main(argv: list[str] | None = None) -> int:
             f"  smooth-sigma : {args.smooth_sigma}\n"
             f"  depth-method : {args.depth_method}\n"
             f"  dz_per_layer : {chosen_dz if chosen_dz is not None else 'pitch ('+str(args.pitch)+')'}\n"
+            f"{align_info}"
             f"{autofit_info}"
             f"  subdiv-mm    : {args.subdiv_mm} mm",
             flush=True,
@@ -210,6 +247,7 @@ def main(argv: list[str] | None = None) -> int:
             smooth_sigma=args.smooth_sigma,
             depth_method=args.depth_method,
             dz_per_layer=chosen_dz,
+            xy_center=xy_center,
         )
         backtransform_gcode_file(
             args.gcode_in, out_path, bt,
