@@ -25,6 +25,7 @@ The growth step slider appears at the bottom of the viewport after G.
 
 from __future__ import annotations
 
+import os
 import sys
 import time
 import traceback
@@ -42,8 +43,18 @@ from .voxelize import VoxelGrid, voxelize_solid
 
 
 def _log(msg: str) -> None:
-    """Force-flushed stderr write so messages survive a hard VTK crash."""
-    print(msg, file=sys.stderr, flush=True)
+    """Bulletproof stderr write — uses os.write so a C++ access violation
+    cannot strand the message in Python's BufferedWriter. The standard
+    print/flush path can leave the last lines unwritten when VTK SIGSEGVs."""
+    try:
+        os.write(2, (msg + "\n").encode("utf-8", errors="replace"))
+    except OSError:
+        # fd 2 unavailable (very unusual); fall back to whatever stderr is now.
+        try:
+            sys.__stderr__.write(msg + "\n")
+            sys.__stderr__.flush()
+        except Exception:
+            pass
 
 
 def _safe(label: str, fn: Callable[[], None]) -> Callable[[], None]:
@@ -329,6 +340,31 @@ class Viewer:
         for key, (label, fn) in bindings.items():
             self.plotter.add_key_event(key, _safe(label, fn))
 
+        # Diagnostic: log every key VTK actually sees, regardless of binding.
+        # Lets us see e.g. "user pressed F1, got no callback" or "keysym
+        # was Cyrillic_..." on a non-US layout.
+        iren = self.plotter.iren.interactor
+
+        def _on_key(_obj, _evt):
+            try:
+                ks = iren.GetKeySym()
+                kc = iren.GetKeyCode()
+                _log(f"[vff] keypress: keysym={ks!r}  code={kc!r}")
+            except Exception:
+                _log("[vff] keypress: failed to read keysym")
+                _log(traceback.format_exc())
+
+        def _on_click(_obj, _evt):
+            _log("[vff] mouse: left button down")
+
+        # Default priority; observers run AFTER VTK's own dispatch so they
+        # don't disturb event handling.
+        self._diag_observer_tags = [
+            iren.AddObserver("KeyPressEvent", _on_key),
+            iren.AddObserver("LeftButtonPressEvent", _on_click),
+        ]
+        _log("[vff] diagnostic observers installed")
+
     def _reset_view(self) -> None:
         self._set_default_view()
         self.plotter.render()
@@ -371,12 +407,15 @@ class Viewer:
     # ----- growth -----
 
     def do_compute_growth(self) -> None:
+        _log("[vff] do_compute_growth: entering")
         if self.voxel_grid is None:
+            _log("[vff] do_compute_growth: rebuilding voxels first")
             self.rebuild_voxels()
         if self.voxel_grid is None:
-            _log("[vff] growth: no voxel grid available, aborting")
+            _log("[vff] do_compute_growth: no voxel grid, aborting")
             return
 
+        _log("[vff] do_compute_growth: running BFS")
         t0 = time.perf_counter()
         self.growth = compute_growth(self.voxel_grid, connectivity=6)
         self._last_growth_ms = (time.perf_counter() - t0) * 1000.0
@@ -397,11 +436,16 @@ class Viewer:
             self.show_voxels = False
             self.voxel_actor.SetVisibility(False)
 
+        _log("[vff] do_compute_growth: building step actor")
         self._build_growth_step_actor()
+        _log("[vff] do_compute_growth: building vector actor")
         self._build_growth_vec_actor()
+        _log("[vff] do_compute_growth: adding slider")
         self._add_growth_slider()
+        _log("[vff] do_compute_growth: refresh hud + render")
         self._refresh_hud()
         self.plotter.render()
+        _log("[vff] do_compute_growth: done")
 
     def toggle_growth_step(self) -> None:
         if self._growth_step_actor is None:
