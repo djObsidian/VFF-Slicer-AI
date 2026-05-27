@@ -229,6 +229,11 @@ class Viewer:
         self._deformed_actor = None
         self.show_deformed = False
 
+        # G-code preview state (overlay of extrusion + travel polylines).
+        self._gcode_ext_actor = None
+        self._gcode_trv_actor = None
+        self.show_gcode = False
+
         self.show_mesh = True
         self.show_voxels = False
 
@@ -365,6 +370,7 @@ class Viewer:
             "h": ("toggle_growth_surface", self.toggle_growth_surface),
             "d": ("toggle_deformed", self.toggle_deformed),
             "o": ("export_deformed", self.export_deformed_default),
+            "p": ("toggle_gcode", self.toggle_gcode_preview),
             "bracketleft": ("decrease_pitch", self.decrease_pitch),
             "bracketright": ("increase_pitch", self.increase_pitch),
             "Up": ("increase_pitch", self.increase_pitch),
@@ -672,6 +678,75 @@ class Viewer:
         from pathlib import Path
         default_path = Path.cwd() / "deformed_mesh.stl"
         self.save_deformed(str(default_path))
+
+    def load_gcode_preview(self, path: str) -> bool:
+        """Parse a G-code file and overlay its extrusion + travel polylines
+        in the viewer. PrusaSlicer's own preview tops out at planar layers;
+        ours just draws whatever lines the file specifies."""
+        from .gcode_preview import parse_gcode
+        import time as _time
+        t0 = _time.perf_counter()
+        try:
+            data = parse_gcode(path)
+        except Exception as e:
+            _log(f"[vff] load_gcode_preview: parse failed: {e!r}")
+            return False
+        dt = (_time.perf_counter() - t0) * 1000.0
+        _log(
+            f"[vff] gcode '{path}': {data['n_extrusion_moves']:,} extrusion + "
+            f"{data['n_travel_moves']:,} travel moves  ({dt:.0f} ms parse)"
+        )
+        renderer = self.plotter.renderer
+
+        # Remove old actors if any.
+        for attr in ("_gcode_ext_actor", "_gcode_trv_actor"):
+            actor = getattr(self, attr, None)
+            if actor is not None:
+                renderer.RemoveActor(actor)
+                setattr(self, attr, None)
+
+        if data["extrusion_points"].shape[0] > 0:
+            pd = pv.PolyData(data["extrusion_points"], lines=data["extrusion_lines"])
+            # One scalar per VTK cell (line segment) — Z of segment midpoint.
+            pd.cell_data["z_mid"] = data["extrusion_step"]
+            self._gcode_ext_actor = self.plotter.add_mesh(
+                pd, scalars="z_mid", cmap="plasma",
+                line_width=2, show_scalar_bar=False, lighting=False,
+                name="gcode_extrusion",
+            )
+        if data["travel_points"].shape[0] > 0:
+            pd_t = pv.PolyData(data["travel_points"], lines=data["travel_lines"])
+            self._gcode_trv_actor = self.plotter.add_mesh(
+                pd_t, color="#666666",
+                line_width=1, lighting=False, opacity=0.4,
+                name="gcode_travel",
+            )
+            if self._gcode_trv_actor is not None:
+                # Hidden by default — travels clutter the picture.
+                self._gcode_trv_actor.SetVisibility(False)
+
+        # Start visible.
+        self.show_gcode = True
+        if self._gcode_ext_actor is not None:
+            self._gcode_ext_actor.SetVisibility(True)
+        self._refresh_hud()
+        self.plotter.render()
+        return True
+
+    def toggle_gcode_preview(self) -> None:
+        """P hotkey: toggle the G-code overlay actors on/off."""
+        if self._gcode_ext_actor is None:
+            _log("[vff] toggle_gcode_preview: no G-code loaded yet (use --preview-gcode at startup)")
+            return
+        self.show_gcode = not self.show_gcode
+        if self._gcode_ext_actor is not None:
+            self._gcode_ext_actor.SetVisibility(self.show_gcode)
+        if self._gcode_trv_actor is not None:
+            # Travels follow the master toggle but stay hidden when overall is on
+            # (user can use a separate toggle if they want travels).
+            self._gcode_trv_actor.SetVisibility(False)
+        self._refresh_hud()
+        self.plotter.render()
 
     def toggle_deformed(self) -> None:
         """D: enter the 'flattened' view — show the deformed mesh whose Z is

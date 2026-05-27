@@ -62,20 +62,41 @@ def main(argv: list[str] | None = None) -> int:
         help="Skip the interactive viewer. Useful with --export for batch use.",
     )
     parser.add_argument(
-        "--backtransform-in", metavar="PATH",
-        help="Read a G-code file produced by a planar slicer on the deformed mesh and "
-             "inverse-transform every XYZ point back to the original (non-planar) space. "
-             "Writes the result to --backtransform-out (default: input with '.nonplanar.gcode' suffix). "
-             "Skips the viewer.",
+        "--gcode-in", metavar="PATH",
+        help="Read a G-code file and transform every XYZ point through the depth-field "
+             "deformation (see --gcode-direction). Skips the viewer; for batch slicer feed.",
     )
     parser.add_argument(
-        "--backtransform-out", metavar="PATH",
-        help="Output path for --backtransform-in. Defaults to <input>.nonplanar.gcode.",
+        "--gcode-out", metavar="PATH",
+        help="Output path for --gcode-in. Defaults to <input>.transformed.gcode.",
     )
+    parser.add_argument(
+        "--gcode-direction", choices=["forward", "inverse"], default="forward",
+        help="forward (default): apply deform_mesh's map to G-code — planar slicer output "
+             "on a flat/slicer-friendly mesh -> non-planar G-code following the depth-field "
+             "layers. inverse: apply deform_mesh's inverse — planar slicer output on a "
+             "pre-deformed mesh -> G-code in the original mesh's coord system.",
+    )
+    # Back-compat aliases for the previous flag names.
+    parser.add_argument("--backtransform-in", dest="gcode_in", help=argparse.SUPPRESS)
+    parser.add_argument("--backtransform-out", dest="gcode_out", help=argparse.SUPPRESS)
     parser.add_argument(
         "--subdiv-mm", type=float, default=0.5,
         help="Backtransform: split G1 moves longer than this (in deformed-space mm) into "
              "pieces so the curved original-space path is followed. Default 0.5.",
+    )
+    parser.add_argument(
+        "--jobs", type=int, default=-1,
+        help="Backtransform: parallel worker count for the invert step. "
+             "-1 = auto (all cores, but only when point count >5 M; below that the "
+             "vectorised NumPy single-pass beats the multiprocessing spawn overhead). "
+             "0 / 1 = force single-process. N>1 = force N workers.",
+    )
+    parser.add_argument(
+        "--preview-gcode", metavar="PATH",
+        help="Load a G-code file into the viewer overlay (extrusion polylines, coloured by Z). "
+             "Toggle in viewer with P. PrusaSlicer's own preview won't show non-planar layers; "
+             "this one will.",
     )
     args = parser.parse_args(argv)
 
@@ -116,15 +137,19 @@ def main(argv: list[str] | None = None) -> int:
         if args.no_viewer:
             return 0
 
-    if args.backtransform_in:
+    if args.preview_gcode:
+        viewer.load_gcode_preview(args.preview_gcode)
+
+    if args.gcode_in:
         from .backtransform import BackTransform, backtransform_gcode_file
-        out_path = args.backtransform_out
+        out_path = args.gcode_out
         if not out_path:
             from pathlib import Path as _P
-            in_p = _P(args.backtransform_in)
-            out_path = str(in_p.with_suffix(".nonplanar.gcode"))
+            in_p = _P(args.gcode_in)
+            suffix = ".nonplanar.gcode" if args.gcode_direction == "forward" else ".planar.gcode"
+            out_path = str(in_p.with_suffix(suffix))
         print(
-            f"Backtransform: {args.backtransform_in} -> {out_path}\n"
+            f"G-code transform ({args.gcode_direction}): {args.gcode_in} -> {out_path}\n"
             f"  STL          : {stl_path}\n"
             f"  volume       : {x:.0f}x{y:.0f}x{z:.0f} mm\n"
             f"  pitch        : {args.pitch} mm\n"
@@ -142,7 +167,11 @@ def main(argv: list[str] | None = None) -> int:
             smooth_sigma=args.smooth_sigma,
             depth_method=args.depth_method,
         )
-        backtransform_gcode_file(args.backtransform_in, out_path, bt, subdiv_mm=args.subdiv_mm)
+        backtransform_gcode_file(
+            args.gcode_in, out_path, bt,
+            subdiv_mm=args.subdiv_mm, n_jobs=args.jobs,
+            direction=args.gcode_direction,
+        )
         return 0
 
     print(

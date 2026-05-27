@@ -41,7 +41,7 @@ from .mesh_io import load_and_place
 from .voxelize import voxelize_solid
 
 
-_TOKEN_RE = re.compile(r"([A-Z])\s*(-?\d+(?:\.\d+)?)")
+_TOKEN_RE = re.compile(r"([A-Z])\s*(-?(?:\d+\.\d*|\.\d+|\d+))")
 
 
 class BackTransform:
@@ -125,19 +125,82 @@ class BackTransform:
         return col
 
     def invert_point(self, x_def: float, y_def: float, z_def: float) -> tuple[float, float, float]:
-        """Find (x_orig, y_orig, z_orig) such that the forward deform maps it to
-        (x_def, y_def, z_def). XY are identity (deform preserves XY)."""
-        # Below the bed: deform is identity (w=0).
-        if z_def <= self.bed_z:
-            return (x_def, y_def, z_def)
+        """Single-point convenience wrapper around invert_points_batch."""
+        out = self.invert_points_batch(np.array([[x_def, y_def, z_def]], dtype=np.float64))
+        return (float(out[0, 0]), float(out[0, 1]), float(out[0, 2]))
 
-        # World->cell column at (x_def, y_def). The forward map at fixed (x, y) is
-        # f(z) = (1 - w(z)) * z + w(z) * (depth_at_z * dz_per_layer + bed_z).
-        # f is monotone in z for our use cases (curved layers are not folded back).
-        col = self._sample_depth_column(x_def, y_def)
-        k_world_z = self.k_world_z  # original z at each cell center
+    def forward_points_batch(self, xyz_orig: np.ndarray) -> np.ndarray:
+        """Vectorised forward deform: (N, 3) ORIGINAL-space → (N, 3) DEFORMED.
 
-        # Forward at each cell-center z.
+        This is the actual deform_mesh map (extend mode on the depth field):
+
+            new_xy = orig_xy
+            w      = clip((z - bed_z) / blend, 0, 1)
+            new_z  = (1 - w) * z + w * (depth(x, y, z) * dz_per_layer + bed_z)
+
+        Used to convert a planar slicer's G-code (flat layers in the
+        deformed-space mesh that was sliced) into non-planar G-code that
+        follows the depth field's curved layers in the original mesh."""
+        from .deform import _sample_trilinear
+        xyz = np.asarray(xyz_orig, dtype=np.float64)
+        if xyz.ndim != 2 or xyz.shape[1] != 3:
+            raise ValueError("xyz_orig must be (N, 3)")
+        if xyz.shape[0] == 0:
+            return xyz.copy()
+        depth = _sample_trilinear(self.depth_field, self.origin, self.pitch, xyz).astype(np.float64)
+        z = xyz[:, 2]
+        blend = self.bed_blend_height
+        bed = self.bed_z
+        if blend > 0:
+            w = np.clip((z - bed) / blend, 0.0, 1.0)
+        else:
+            w = np.ones_like(z)
+        z_target = depth * self.dz_per_layer + bed
+        z_new = (1.0 - w) * z + w * z_target
+        out = xyz.copy()
+        out[:, 2] = z_new
+        return out
+
+    def invert_points_batch(self, xyz_def: np.ndarray) -> np.ndarray:
+        """Vectorised inverse: takes (N, 3) deformed-space points, returns
+        (N, 3) original-space points. ~100× faster than calling invert_point
+        in a Python loop on big G-code files."""
+        xyz_def = np.asarray(xyz_def, dtype=np.float64)
+        if xyz_def.ndim != 2 or xyz_def.shape[1] != 3:
+            raise ValueError("xyz_def must be (N, 3)")
+        N = xyz_def.shape[0]
+        if N == 0:
+            return xyz_def.copy()
+        nx, ny, nz = self.shape
+
+        x = xyz_def[:, 0]
+        y = xyz_def[:, 1]
+        z_def = xyz_def[:, 2]
+
+        # Bilinear sample column at (x, y).
+        u = (x - self.origin[0]) / self.pitch - 0.5
+        v = (y - self.origin[1]) / self.pitch - 0.5
+        u = np.clip(u, 0.0, nx - 1.0001)
+        v = np.clip(v, 0.0, ny - 1.0001)
+        i0 = np.floor(u).astype(np.int64)
+        j0 = np.floor(v).astype(np.int64)
+        fu = (u - i0).astype(np.float32)
+        fv = (v - j0).astype(np.float32)
+
+        # Column samples at each of the 4 surrounding (i, j) cells, full nz.
+        c00 = self.depth_field[i0,     j0,     :]
+        c10 = self.depth_field[i0 + 1, j0,     :]
+        c01 = self.depth_field[i0,     j0 + 1, :]
+        c11 = self.depth_field[i0 + 1, j0 + 1, :]
+        col = (
+            c00 * ((1 - fu) * (1 - fv))[:, None]
+            + c10 * (fu       * (1 - fv))[:, None]
+            + c01 * ((1 - fu) * fv      )[:, None]
+            + c11 * (fu       * fv      )[:, None]
+        )  # (N, nz)
+
+        # Forward f(z) at each cell-center z, per row.
+        k_world_z = self.k_world_z.astype(np.float32)  # (nz,)
         blend = self.bed_blend_height
         bed = self.bed_z
         if blend > 0:
@@ -145,25 +208,35 @@ class BackTransform:
         else:
             w = np.ones_like(k_world_z)
         z_target = col * self.dz_per_layer + bed
-        f = (1.0 - w) * k_world_z + w * z_target  # deformed Z for each cell-center original Z
+        f = (1.0 - w)[None, :] * k_world_z[None, :] + w[None, :] * z_target  # (N, nz)
 
-        # Binary search for z_def in (sorted-ish) f. f should be monotone-increasing.
-        if z_def <= f[0]:
-            return (x_def, y_def, float(k_world_z[0]))
-        if z_def >= f[-1]:
-            return (x_def, y_def, float(k_world_z[-1]))
+        z_def_f = z_def.astype(np.float32)
+        above = f > z_def_f[:, None]
+        any_above = above.any(axis=1)
+        # k = first index where f exceeds z_def (per row). 0 means below grid.
+        k_first = np.argmax(above, axis=1)  # (N,)
 
-        # Find first index where f[k] >= z_def.
-        k = int(np.searchsorted(f, z_def))
-        # Linear interp between (f[k-1], k_world_z[k-1]) and (f[k], k_world_z[k]).
-        f0, f1 = float(f[k - 1]), float(f[k])
-        z0, z1 = float(k_world_z[k - 1]), float(k_world_z[k])
-        if f1 == f0:
-            z_orig = 0.5 * (z0 + z1)
-        else:
-            t = (z_def - f0) / (f1 - f0)
-            z_orig = z0 + t * (z1 - z0)
-        return (x_def, y_def, float(z_orig))
+        # Defaults — for points above the grid take the top.
+        z_orig = np.full(N, k_world_z[-1], dtype=np.float64)
+
+        # Below f[0]: identity (bed-blend region, w≈0).
+        below = z_def_f <= f[:, 0]
+        z_orig[below] = z_def[below]
+
+        # Linear interp between f[k-1] and f[k] for the rest.
+        interp_mask = any_above & ~below & (k_first > 0)
+        if interp_mask.any():
+            k_use = k_first[interp_mask]
+            f0 = np.take_along_axis(f[interp_mask], (k_use - 1)[:, None], axis=1)[:, 0]
+            f1 = np.take_along_axis(f[interp_mask],  k_use[:, None],      axis=1)[:, 0]
+            z0 = k_world_z[k_use - 1]
+            z1 = k_world_z[k_use]
+            df = f1 - f0
+            df_safe = np.where(df > 1e-9, df, 1.0)
+            t = (z_def_f[interp_mask] - f0) / df_safe
+            z_orig[interp_mask] = z0 + t * (z1 - z0)
+
+        return np.column_stack([x, y, z_orig.astype(np.float64)])
 
 
 def _parse_xyzef(rest: str) -> dict[str, float]:
@@ -185,73 +258,84 @@ def backtransform_gcode_file(
     output_path: str | Path,
     bt: BackTransform,
     subdiv_mm: float = 0.5,
+    n_jobs: int = -1,
     verbose: bool = True,
+    direction: str = "forward",
 ) -> dict:
-    """Process a G-code file end-to-end. Returns stats dict.
+    """Two-pass batched G-code transform.
 
-    Move handling:
-      - G0 / G1 with XYZ → endpoint inverted; if the deformed-space move is
-        longer than `subdiv_mm`, the segment is split into pieces of about
-        that length so the curved original-space path is followed.
-      - E (assumed relative, M83) is distributed across subdivided pieces
-        proportionally by deformed-space arc length.
-      - F (feed) is kept on the first emitted line of a multi-piece move.
-      - Other commands (M, G92, comments, etc.) pass through unchanged.
+    direction:
+      - "forward"  (default): apply deform_mesh's map to each G-code point.
+        Use case: planar-slicer output for a flat-bottom (or otherwise
+        slicer-friendly) mesh → non-planar G-code that follows the depth
+        field's curved layers when printed.
+      - "inverse" : apply deform_mesh's inverse map. Use case: planar
+        slicer output for a *deformed* mesh (one produced by deform_mesh) →
+        G-code that prints those flat slicer layers as curved layers in
+        the ORIGINAL (un-deformed) mesh's coordinate system.
 
-    State carried across lines: current absolute X, Y, Z; current feed; the
-    'extrusion relative' flag is parsed (M82/M83) and logged but the writer
-    assumes relative (M83) — PrusaSlicer's default mode."""
+    Pass 1 — stream through input, parse every line. Each G0/G1 movement
+    expands to N subdivision endpoints, stored as a row in a flat
+    (M, 3) NumPy array (deformed space). All non-move lines and the
+    template strings for move lines are kept in order.
+
+    Pass 2 — vectorised invert (`BackTransform.invert_points_batch`),
+    optionally split across `n_jobs` worker processes. Each row of the
+    big array is converted to (x_orig, y_orig, z_orig) in one NumPy
+    call per chunk. Then a single streamed write produces the output.
+
+    `n_jobs`: -1 (default) uses all CPU cores via multiprocessing.Pool.
+              0 / 1 runs in-process (avoids fork overhead on small files).
+    """
     in_path = Path(input_path)
     out_path = Path(output_path)
+    import time as _time
+    t0 = _time.perf_counter()
+
+    # --- pass 1: parse and collect ---------------------------------------
+    # Each output 'unit' is one of:
+    #   ('raw', "<text without trailing newline>")
+    #   ('move', cmd_str, e_val_or_None, f_val_or_None, tail_or_None, n_pieces, start_index_in_xyz_def)
+    #     -> emits n_pieces lines, reading endpoints from xyz_def[start:start+n_pieces]
+    units: list = []
+    xyz_def_chunks: list[list[tuple[float, float, float]]] = []
+    chunk_buf: list[tuple[float, float, float]] = []
+
+    def _flush_chunk():
+        if chunk_buf:
+            xyz_def_chunks.append(chunk_buf.copy())
+            chunk_buf.clear()
+
+    cur_x = cur_y = cur_z = 0.0
+    e_relative = True
     stats = {
         "lines_in": 0,
-        "lines_out": 0,
         "moves_in": 0,
         "moves_out": 0,
         "z_min": float("inf"),
         "z_max": float("-inf"),
-        "z_orig_min": float("inf"),
-        "z_orig_max": float("-inf"),
     }
 
-    cur_x = cur_y = cur_z = 0.0
-    cur_f: float | None = None
-    e_relative = True
-    seen_first_move = False
-
-    with in_path.open("r", encoding="utf-8", errors="replace") as fi, \
-         out_path.open("w", encoding="utf-8", newline="\n") as fo:
-
-        fo.write(
-            "; backtransformed by vff/backtransform.py — "
-            "deformed-space XYZ inverted to original (non-planar) space\n"
-        )
-
+    with in_path.open("r", encoding="utf-8", errors="replace") as fi:
         for raw in fi:
             stats["lines_in"] += 1
             line = raw.rstrip("\r\n")
             stripped = line.lstrip()
             if not stripped or stripped.startswith(";"):
-                fo.write(line + "\n"); stats["lines_out"] += 1
+                units.append(("raw", line))
                 continue
 
-            # Cheap leading-token grab (G1, M104, etc.). Comments after the
-            # command are preserved by appending tail.
-            head, _, tail = line.partition(";")
+            head, _semi, tail = line.partition(";")
             head_tokens = head.split()
             if not head_tokens:
-                fo.write(line + "\n"); stats["lines_out"] += 1
+                units.append(("raw", line))
                 continue
             cmd = head_tokens[0].upper()
 
-            if cmd in ("M82",):
-                e_relative = False
-                fo.write(line + "\n"); stats["lines_out"] += 1
-                continue
-            if cmd in ("M83",):
-                e_relative = True
-                fo.write(line + "\n"); stats["lines_out"] += 1
-                continue
+            if cmd == "M82":
+                e_relative = False; units.append(("raw", line)); continue
+            if cmd == "M83":
+                e_relative = True;  units.append(("raw", line)); continue
 
             if cmd in ("G0", "G1", "G00", "G01"):
                 params = _parse_xyzef(" ".join(head_tokens[1:]))
@@ -262,92 +346,136 @@ def backtransform_gcode_file(
                 f_val = params.get("F", None)
                 stats["moves_in"] += 1
 
-                # If only F changed and no XYZ/E move, just echo.
-                if (
-                    new_x == cur_x and new_y == cur_y and new_z == cur_z
-                    and e_val is None
-                ):
-                    fo.write(line + "\n"); stats["lines_out"] += 1
-                    if f_val is not None:
-                        cur_f = f_val
+                # F-only / E-only with no XYZ change: echo as-is.
+                if new_x == cur_x and new_y == cur_y and new_z == cur_z and e_val is None:
+                    units.append(("raw", line))
                     continue
 
-                # Track deformed-space Z range we saw (for the stats line).
-                if seen_first_move:
-                    stats["z_min"] = min(stats["z_min"], new_z)
-                    stats["z_max"] = max(stats["z_max"], new_z)
+                if stats["z_min"] == float("inf"):
+                    stats["z_min"] = stats["z_max"] = new_z
                 else:
-                    stats["z_min"] = new_z
-                    stats["z_max"] = new_z
-                    seen_first_move = True
+                    if new_z < stats["z_min"]: stats["z_min"] = new_z
+                    if new_z > stats["z_max"]: stats["z_max"] = new_z
 
-                # Decide subdivision count.
                 seg_len = float(np.hypot(np.hypot(new_x - cur_x, new_y - cur_y), new_z - cur_z))
-                if subdiv_mm > 0 and seg_len > subdiv_mm:
-                    n_pieces = max(1, int(np.ceil(seg_len / subdiv_mm)))
-                else:
-                    n_pieces = 1
+                n_pieces = max(1, int(np.ceil(seg_len / subdiv_mm))) if (subdiv_mm > 0 and seg_len > subdiv_mm) else 1
 
-                # Walk along the segment in deformed space, invert each
-                # piece's endpoint, distribute E (assumed relative).
-                if cmd in ("G0", "G00"):
-                    out_cmd = "G0"
-                else:
-                    out_cmd = "G1"
-
-                first_piece = True
+                out_cmd = "G0" if cmd in ("G0", "G00") else "G1"
+                start_idx = sum(len(c) for c in xyz_def_chunks) + len(chunk_buf)
                 for piece in range(1, n_pieces + 1):
                     t = piece / n_pieces
-                    px = cur_x + (new_x - cur_x) * t
-                    py = cur_y + (new_y - cur_y) * t
-                    pz = cur_z + (new_z - cur_z) * t
-                    ox, oy, oz = bt.invert_point(px, py, pz)
+                    chunk_buf.append((
+                        cur_x + (new_x - cur_x) * t,
+                        cur_y + (new_y - cur_y) * t,
+                        cur_z + (new_z - cur_z) * t,
+                    ))
+                    if len(chunk_buf) >= 65536:
+                        _flush_chunk()
 
-                    parts = [out_cmd, _format_xyz(ox, oy, oz)]
-                    if e_val is not None:
-                        # Relative E: split proportionally.
-                        if e_relative:
-                            de = e_val / n_pieces
-                            parts.append(f"E{de:.5f}")
-                        else:
-                            # Absolute E: linear interp from previous cumulative
-                            # E... we don't track previous absolute E here, so
-                            # emit the final value on the LAST piece only and
-                            # skip E on intermediates. Not common with PrusaSlicer.
-                            if piece == n_pieces:
-                                parts.append(f"E{e_val:.5f}")
-                    if f_val is not None and first_piece:
-                        parts.append(f"F{f_val:g}")
-                        cur_f = f_val
-
-                    fo.write(" ".join(parts))
-                    if tail:
-                        fo.write(" ;" + tail)
-                    fo.write("\n")
-                    stats["lines_out"] += 1
-                    stats["moves_out"] += 1
-                    first_piece = False
-
-                    stats["z_orig_min"] = min(stats["z_orig_min"], oz)
-                    stats["z_orig_max"] = max(stats["z_orig_max"], oz)
-
-                cur_x = new_x
-                cur_y = new_y
-                cur_z = new_z
+                units.append(("move", out_cmd, e_val, f_val, tail if _semi else None,
+                              n_pieces, start_idx, e_relative))
+                stats["moves_out"] += n_pieces
+                cur_x, cur_y, cur_z = new_x, new_y, new_z
                 continue
 
             if cmd == "G92":
-                # Set position. Parse X/Y/Z/E and update our tracked state so
-                # subsequent moves are relative to the right origin.
                 params = _parse_xyzef(" ".join(head_tokens[1:]))
                 if "X" in params: cur_x = params["X"]
                 if "Y" in params: cur_y = params["Y"]
                 if "Z" in params: cur_z = params["Z"]
-                fo.write(line + "\n"); stats["lines_out"] += 1
+                units.append(("raw", line))
                 continue
 
-            # Everything else: pass through.
-            fo.write(line + "\n"); stats["lines_out"] += 1
+            units.append(("raw", line))
+
+    _flush_chunk()
+
+    t1 = _time.perf_counter()
+
+    # --- pass 2: batched invert ------------------------------------------
+    if not xyz_def_chunks:
+        xyz_def = np.zeros((0, 3), dtype=np.float64)
+    else:
+        xyz_def = np.concatenate([np.asarray(c, dtype=np.float64) for c in xyz_def_chunks], axis=0)
+    del xyz_def_chunks
+
+    n_pts = xyz_def.shape[0]
+    if direction not in ("forward", "inverse"):
+        raise ValueError(f"direction must be 'forward' or 'inverse', got {direction!r}")
+    if n_pts == 0:
+        xyz_orig = xyz_def.copy()
+    else:
+        # Multiprocessing only pays off above a few million points — on Windows
+        # the spawn-context startup (re-import scipy / vff / pickle the depth
+        # field for every worker) costs several seconds, which a vectorised
+        # NumPy single-pass beats below ~5 M pts. Override with --jobs N to
+        # force the parallel path anyway.
+        _MP_AUTO_THRESHOLD = 5_000_000
+        if n_jobs in (0, 1) or (n_jobs == -1 and n_pts < _MP_AUTO_THRESHOLD):
+            if direction == "forward":
+                xyz_orig = bt.forward_points_batch(xyz_def)
+            else:
+                xyz_orig = bt.invert_points_batch(xyz_def)
+        else:
+            import multiprocessing as _mp
+            try:
+                n_workers = _mp.cpu_count() if n_jobs == -1 else int(n_jobs)
+            except NotImplementedError:
+                n_workers = 4
+            n_workers = max(1, min(n_workers, 64, max(1, n_pts // 4000)))
+            chunk_size = (n_pts + n_workers - 1) // n_workers
+            args = [
+                (direction, xyz_def[i:i + chunk_size], bt.depth_field, bt.origin, bt.pitch,
+                 bt.dz_per_layer, bt.bed_z, bt.bed_blend_height)
+                for i in range(0, n_pts, chunk_size)
+            ]
+            with _mp.get_context("spawn").Pool(n_workers) as pool:
+                results = pool.starmap(_transform_chunk_worker, args)
+            xyz_orig = np.concatenate(results, axis=0)
+
+    t2 = _time.perf_counter()
+
+    # --- pass 3: stream output -------------------------------------------
+    z_orig_min = float("inf")
+    z_orig_max = float("-inf")
+    if n_pts:
+        z_orig_min = float(xyz_orig[:, 2].min())
+        z_orig_max = float(xyz_orig[:, 2].max())
+
+    with out_path.open("w", encoding="utf-8", newline="\n") as fo:
+        fo.write(
+            "; backtransformed by vff/backtransform.py — "
+            "deformed-space XYZ inverted to original (non-planar) space\n"
+        )
+        for u in units:
+            if u[0] == "raw":
+                fo.write(u[1] + "\n")
+                continue
+            _, out_cmd, e_val, f_val, tail, n_pieces, start_idx, e_rel = u
+            for piece in range(n_pieces):
+                ox, oy, oz = xyz_orig[start_idx + piece]
+                parts = [out_cmd, f"X{ox:.3f} Y{oy:.3f} Z{oz:.3f}"]
+                if e_val is not None:
+                    if e_rel:
+                        parts.append(f"E{(e_val / n_pieces):.5f}")
+                    elif piece == n_pieces - 1:
+                        parts.append(f"E{e_val:.5f}")
+                if f_val is not None and piece == 0:
+                    parts.append(f"F{f_val:g}")
+                fo.write(" ".join(parts))
+                if tail is not None:
+                    fo.write(" ;" + tail)
+                fo.write("\n")
+
+    t3 = _time.perf_counter()
+
+    stats["lines_out"] = sum(1 for u in units if u[0] == "raw") + stats["moves_out"] + 1
+    stats["z_orig_min"] = z_orig_min
+    stats["z_orig_max"] = z_orig_max
+    stats["t_parse_s"] = t1 - t0
+    stats["t_invert_s"] = t2 - t1
+    stats["t_write_s"] = t3 - t2
+    stats["n_invert_pts"] = int(n_pts)
 
     if verbose:
         print(
@@ -360,4 +488,33 @@ def backtransform_gcode_file(
             f"[backtransform] deformed Z: [{stats['z_min']:.3f}, {stats['z_max']:.3f}] mm  "
             f"→ original Z: [{stats['z_orig_min']:.3f}, {stats['z_orig_max']:.3f}] mm"
         )
+        print(
+            f"[backtransform] timing: parse {stats['t_parse_s']:.2f}s  "
+            f"invert {stats['t_invert_s']:.2f}s ({stats['n_invert_pts']:,} pts)  "
+            f"write {stats['t_write_s']:.2f}s"
+        )
     return stats
+
+
+def _transform_chunk_worker(
+    direction: str,
+    xyz_chunk: np.ndarray,
+    depth_field: np.ndarray,
+    origin: np.ndarray,
+    pitch: float,
+    dz_per_layer: float,
+    bed_z: float,
+    bed_blend_height: float,
+) -> np.ndarray:
+    """Multiprocessing worker for backtransform_gcode_file's parallel path."""
+    bt = BackTransform(
+        depth_field=depth_field,
+        origin=origin,
+        pitch=pitch,
+        dz_per_layer=dz_per_layer,
+        bed_z=bed_z,
+        bed_blend_height=bed_blend_height,
+    )
+    if direction == "forward":
+        return bt.forward_points_batch(xyz_chunk)
+    return bt.invert_points_batch(xyz_chunk)
