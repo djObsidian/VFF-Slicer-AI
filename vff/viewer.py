@@ -38,6 +38,7 @@ import vtk
 from vtk.util import numpy_support as vns
 
 from .build_volume import BuildVolume
+from .deform import deform_mesh
 from .growth import GrowthResult, compute_growth
 from .voxelize import VoxelGrid, voxelize_solid
 
@@ -218,6 +219,11 @@ class Viewer:
         self._growth_step_opaque = True
         self._growth_translucent_alpha = 0.25
 
+        # Deformed (flattened) mesh state. Computed lazily on first D press.
+        self.deformed_mesh: trimesh.Trimesh | None = None
+        self._deformed_actor = None
+        self.show_deformed = False
+
         self.show_mesh = True
         self.show_voxels = False
 
@@ -352,6 +358,7 @@ class Viewer:
             "c": ("toggle_growth_step", self.toggle_growth_step),
             "n": ("toggle_growth_vec", self.toggle_growth_vec),
             "h": ("toggle_growth_surface", self.toggle_growth_surface),
+            "d": ("toggle_deformed", self.toggle_deformed),
             "bracketleft": ("decrease_pitch", self.decrease_pitch),
             "bracketright": ("increase_pitch", self.increase_pitch),
             "Up": ("increase_pitch", self.increase_pitch),
@@ -507,6 +514,72 @@ class Viewer:
             return
         self.show_growth_surface = not self.show_growth_surface
         self._growth_surface_actor.SetVisibility(self.show_growth_surface)
+        self._refresh_hud()
+        self.plotter.render()
+
+    def toggle_deformed(self) -> None:
+        """D: enter the 'flattened' view — show the deformed mesh whose Z is
+        proportional to growth step. Growth iso-surfaces become parallel XY
+        planes. Press again to return to the natural-space view."""
+        if self.growth is None:
+            _log("[vff] toggle_deformed: growth not computed; computing now")
+            self.do_compute_growth()
+            if self.growth is None:
+                return
+
+        # Lazy: build deformed mesh + its actor on first toggle.
+        if self.deformed_mesh is None:
+            _log("[vff] toggle_deformed: deforming mesh")
+            t0 = time.perf_counter()
+            self.deformed_mesh = deform_mesh(self.mesh, self.growth)
+            dt = (time.perf_counter() - t0) * 1000.0
+            _log(
+                f"[vff] deform: Z range "
+                f"[{self.deformed_mesh.bounds[0, 2]:.2f}, "
+                f"{self.deformed_mesh.bounds[1, 2]:.2f}] mm  "
+                f"({dt:.0f} ms)"
+            )
+            self._deformed_actor = self.plotter.add_mesh(
+                trimesh_to_pv(self.deformed_mesh),
+                color="#d850c0",  # magenta — clearly different from anything else
+                smooth_shading=True,
+                specular=0.3,
+                specular_power=12,
+                opacity=0.95,
+                name="deformed_mesh",
+            )
+            if self._deformed_actor is not None:
+                self._deformed_actor.SetVisibility(False)
+
+        self.show_deformed = not self.show_deformed
+        # In flattened view, hide the natural-space stuff so it's not confusing.
+        actors_to_dim = [
+            self.mesh_actor,
+            self.voxel_actor,
+            self._growth_step_actor,
+            self._growth_vec_actor,
+            self._growth_surface_actor,
+        ]
+        if self.show_deformed:
+            for a in actors_to_dim:
+                if a is not None:
+                    a.SetVisibility(False)
+            if self._deformed_actor is not None:
+                self._deformed_actor.SetVisibility(True)
+        else:
+            # Restore last visibility states.
+            if self.mesh_actor is not None:
+                self.mesh_actor.SetVisibility(self.show_mesh)
+            if self.voxel_actor is not None:
+                self.voxel_actor.SetVisibility(self.show_voxels)
+            if self._growth_step_actor is not None:
+                self._growth_step_actor.SetVisibility(self.show_growth_step)
+            if self._growth_vec_actor is not None:
+                self._growth_vec_actor.SetVisibility(self.show_growth_vec)
+            if self._growth_surface_actor is not None:
+                self._growth_surface_actor.SetVisibility(self.show_growth_surface)
+            if self._deformed_actor is not None:
+                self._deformed_actor.SetVisibility(False)
         self._refresh_hud()
         self.plotter.render()
 
@@ -834,6 +907,7 @@ class Viewer:
         if self.growth is not None:
             lines.append("[V] flips growth voxels opaque <-> translucent")
             lines.append("[C] voxels on/off  [N] vectors on/off  [H] surface  slider: step")
+            lines.append(f"[D] toggle deformed (flattened) mesh: {'on' if self.show_deformed else 'off'}")
         lines.append("[ [ / ] ] or Up/Down pitch -/+   [F5] reset view")
         return "\n".join(lines)
 

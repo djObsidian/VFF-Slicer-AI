@@ -70,11 +70,11 @@ def main(argv: list[str] | None = None) -> int:
 
     viewer = Viewer(mesh, volume, initial_pitch=args.pitch, max_tilt_deg=args.max_tilt)
     print(
-        "Viewer ready. Hotkeys: M/V/B  G/C/N/H  [ / ]  Up/Down  F5",
+        "Viewer ready. Hotkeys: M/V/B  G/C/N/H/D  [ / ]  Up/Down  F5",
         flush=True,
     )
     print(
-        "  M mesh  V voxel-shell  B re-voxel | G growth  C voxels  N vectors  H surface",
+        "  M mesh  V voxel-shell  B re-voxel | G growth  C voxels  N vectors  H surface  D deformed",
         flush=True,
     )
     viewer.show()
