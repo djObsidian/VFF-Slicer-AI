@@ -176,6 +176,14 @@ class Viewer:
             pv.set_new_attribute(self.plotter, "pickpoint", None)
         except Exception:
             pass
+        # Depth peeling: correct alpha blending when arrows are seen *through*
+        # translucent voxel cubes. Without it the back faces of the voxels
+        # punch through the arrows. Wrapped because it can fail on some
+        # drivers / older OpenGL contexts.
+        try:
+            self.plotter.enable_depth_peeling(number_of_peels=8, occlusion_ratio=0.0)
+        except Exception:
+            pass
 
         self.pv_mesh = trimesh_to_pv(mesh)
 
@@ -197,6 +205,11 @@ class Viewer:
         self._last_growth_ms: float | None = None
         self.show_growth_step = True
         self.show_growth_vec = True
+        # When True, growth-step voxels render fully opaque; when False, they
+        # render translucent so the vector field underneath is visible.
+        # V hotkey toggles this in growth mode.
+        self._growth_step_opaque = True
+        self._growth_translucent_alpha = 0.25
 
         self.show_mesh = True
         self.show_voxels = False
@@ -377,6 +390,18 @@ class Viewer:
         self.plotter.render()
 
     def toggle_voxels(self) -> None:
+        # In growth view, the orange voxel shell is hidden and V is repurposed
+        # to toggle the step-coloured voxels between opaque and translucent —
+        # the arrow field lives "inside" the voxels, so translucency is the
+        # only way to inspect both at once.
+        if self._growth_step_actor is not None and self.show_growth_step:
+            self._growth_step_opaque = not self._growth_step_opaque
+            opacity = 1.0 if self._growth_step_opaque else self._growth_translucent_alpha
+            self._growth_step_actor.GetProperty().SetOpacity(opacity)
+            self._refresh_hud()
+            self.plotter.render()
+            return
+
         if self.voxel_grid is None:
             self.show_voxels = True
             self.rebuild_voxels()
@@ -580,17 +605,22 @@ class Viewer:
         )
         _threshold_points_between(threshold, 1, self._growth_current_step)
 
+        # Chunky arrows ~80% of a voxel length so they're visible at a glance
+        # in the field; thicker shaft + tip so individual arrows stand out
+        # when the field is dense.
         arrow = vtk.vtkArrowSource()
-        arrow.SetTipLength(0.32)
-        arrow.SetTipRadius(0.13)
-        arrow.SetShaftRadius(0.04)
+        arrow.SetTipLength(0.40)
+        arrow.SetTipRadius(0.22)
+        arrow.SetShaftRadius(0.08)
+        arrow.SetTipResolution(10)
+        arrow.SetShaftResolution(10)
 
         glyph = vtk.vtkGlyph3D()
         glyph.SetInputConnection(threshold.GetOutputPort())
         glyph.SetSourceConnection(arrow.GetOutputPort())
         glyph.SetVectorModeToUseVector()
-        glyph.SetScaleModeToScaleByVector()
-        glyph.SetScaleFactor(gr.pitch * 0.7)
+        glyph.SetScaleModeToScaleByVector()  # our vectors are unit -> factor below sets full length
+        glyph.SetScaleFactor(gr.pitch * 0.85)
         glyph.OrientOn()
         glyph.SetColorModeToColorByScalar()
 
@@ -696,15 +726,17 @@ class Viewer:
             f"voxels: {'on' if self.show_voxels else 'off'}"
         )
         if self.growth is not None:
+            opacity_tag = "opaque" if self._growth_step_opaque else "translucent"
             layers += (
-                f"   growth: {'on' if self.show_growth_step else 'off'}"
+                f"   growth: {'on' if self.show_growth_step else 'off'} ({opacity_tag})"
                 f"   vectors: {'on' if self.show_growth_vec else 'off'}"
             )
         lines.append(layers)
         lines.append("")
         lines.append("[M] mesh  [V] voxels  [B] re-voxel  [G] growth")
         if self.growth is not None:
-            lines.append("[C] growth voxels  [N] growth vectors  slider: step")
+            lines.append("[V] flips growth voxels opaque <-> translucent")
+            lines.append("[C] growth voxels on/off  [N] vectors on/off  slider: step")
         lines.append("[ [ / ] ] or Up/Down pitch -/+   [F5] reset view")
         return "\n".join(lines)
 
