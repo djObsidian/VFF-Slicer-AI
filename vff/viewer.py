@@ -442,7 +442,7 @@ class Viewer:
 
         _log("[vff] do_compute_growth: running BFS")
         t0 = time.perf_counter()
-        self.growth = compute_growth(self.voxel_grid, connectivity=6)
+        self.growth = compute_growth(self.voxel_grid, connectivity=26)
         self._last_growth_ms = (time.perf_counter() - t0) * 1000.0
         _log(
             f"[vff] growth: {self.growth.n_steps} steps, "
@@ -605,9 +605,9 @@ class Viewer:
         )
         _threshold_points_between(threshold, 1, self._growth_current_step)
 
-        # Chunky arrows ~80% of a voxel length so they're visible at a glance
-        # in the field; thicker shaft + tip so individual arrows stand out
-        # when the field is dense.
+        # Chunky arrows so individual ones stand out in a dense field.
+        # Vectors now have magnitude in {1, √2, √3} (see growth.py), so we
+        # scale such that a √3-magnitude arrow ~0.95 voxel long.
         arrow = vtk.vtkArrowSource()
         arrow.SetTipLength(0.40)
         arrow.SetTipRadius(0.22)
@@ -619,8 +619,8 @@ class Viewer:
         glyph.SetInputConnection(threshold.GetOutputPort())
         glyph.SetSourceConnection(arrow.GetOutputPort())
         glyph.SetVectorModeToUseVector()
-        glyph.SetScaleModeToScaleByVector()  # our vectors are unit -> factor below sets full length
-        glyph.SetScaleFactor(gr.pitch * 0.85)
+        glyph.SetScaleModeToScaleByVector()  # arrow length = |vector| * SetScaleFactor
+        glyph.SetScaleFactor(gr.pitch * 0.55)  # √3 * 0.55 ≈ 0.95 voxel
         glyph.OrientOn()
         glyph.SetColorModeToColorByScalar()
 
