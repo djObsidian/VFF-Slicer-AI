@@ -50,9 +50,12 @@ def main(argv: list[str] | None = None) -> int:
              "(default 2.0). Lower = stronger / sharper deformation; higher = smoother but weaker.",
     )
     parser.add_argument(
-        "--depth-method", choices=["fmm", "dijkstra"], default="fmm",
-        help="Inside-model depth computation: 'fmm' (Eikonal, C1 smooth, requires scikit-fmm) "
-             "or 'dijkstra' (discrete shortest path, C0). Default 'fmm'.",
+        "--depth-method", choices=["vectors", "fmm", "dijkstra"], default="vectors",
+        help="Inside-model depth computation. 'vectors' (default): integrate the CLAMPED "
+             "growth vector field into a potential whose level sets are the layer surfaces "
+             "(surfaces perpendicular to the growth direction; tilt clamp shapes them). "
+             "'fmm' (Eikonal, C1 smooth, requires scikit-fmm) or 'dijkstra' (discrete "
+             "shortest path, C0) — both ignore the clamp and follow raw geodesic depth.",
     )
     parser.add_argument(
         "--export", metavar="PATH",
@@ -62,6 +65,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--no-viewer", action="store_true",
         help="Skip the interactive viewer. Useful with --export for batch use.",
+    )
+    parser.add_argument(
+        "--section-xz", metavar="PATH",
+        help="Render an XZ-plane cross-section (normal +Y) of the growth layer "
+             "surfaces and save it to PATH (.png). Only the surfaces' cut curves "
+             "are drawn, orthographic, looking down Y. Headless/off-screen. "
+             "Combine with --no-viewer for a pure batch figure.",
+    )
+    parser.add_argument(
+        "--section-y", type=float, default=None,
+        help="Y coordinate (mm) of the --section-xz cutting plane. "
+             "Default: the model's Y centre.",
     )
     parser.add_argument(
         "--gcode-in", metavar="PATH",
@@ -235,6 +250,27 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.export:
         viewer.save_deformed(args.export)
+        if args.no_viewer and not args.section_xz:
+            return 0
+
+    if args.section_xz:
+        from .section import save_xz_section
+        print(f"Rendering XZ growth-surface section -> {args.section_xz} ...", flush=True)
+        n_pts = save_xz_section(
+            mesh, args.section_xz,
+            pitch=args.pitch,
+            max_tilt_deg=args.max_tilt,
+            smooth_sigma=args.smooth_sigma,
+            depth_method=args.depth_method,
+            section_y=args.section_y,
+        )
+        if n_pts == 0:
+            print(
+                "  WARNING: section plane hit no surfaces — check --section-y.",
+                flush=True,
+            )
+        else:
+            print(f"  saved ({n_pts:,} section points).", flush=True)
         if args.no_viewer:
             return 0
 

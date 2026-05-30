@@ -40,6 +40,7 @@ from vtk.util import numpy_support as vns
 from .build_volume import BuildVolume
 from .deform import deform_mesh, smoothed_depth_field
 from .growth import GrowthResult, compute_growth
+from .section import build_growth_surfaces
 from .voxelize import VoxelGrid, voxelize_solid
 
 
@@ -164,7 +165,7 @@ class Viewer:
         initial_pitch: float = 1.0,
         max_tilt_deg: float = 30.0,
         smooth_sigma: float = 2.0,
-        depth_method: str = "fmm",
+        depth_method: str = "vectors",
     ) -> None:
         self.mesh = mesh
         self.volume = volume
@@ -233,6 +234,23 @@ class Viewer:
         self._gcode_ext_actor = None
         self._gcode_trv_actor = None
         self.show_gcode = False
+
+        # Interactive vertical (∥Z) cross-section state. Built lazily on X.
+        self._section_actor = None        # vtkActor for the cut lines
+        self._section_overlay_renderer = None  # layer-1 renderer: draw lines on top
+        self._section_plane = None        # vtkPlane (vertical: normal in XY)
+        self._section_cutter = None       # vtkCutter (slider updates plane)
+        self._section_src = None          # in-model-only growth surfaces to cut
+        self._section_angle_slider = None
+        self._section_pos_slider = None
+        self._section_angle_deg = 0.0     # plane normal angle in XY, from +X
+        self._section_pos = 0.0           # signed offset along the normal (mm)
+        self._section_cx = 0.0
+        self._section_cy = 0.0
+        self._section_cz = 0.0
+        self._section_R = 1.0             # half XY-diagonal — position slider range
+        self.show_section = False
+        self._screenshot_idx = 0
 
         self.show_mesh = True
         self.show_voxels = False
@@ -371,6 +389,9 @@ class Viewer:
             "d": ("toggle_deformed", self.toggle_deformed),
             "o": ("export_deformed", self.export_deformed_default),
             "p": ("toggle_gcode", self.toggle_gcode_preview),
+            "x": ("toggle_section", self.toggle_section),
+            "i": ("save_section_screenshot", self.save_section_screenshot),
+            "j": ("view_section_face_on", self.view_section_face_on),
             "bracketleft": ("decrease_pitch", self.decrease_pitch),
             "bracketright": ("increase_pitch", self.increase_pitch),
             "Up": ("increase_pitch", self.increase_pitch),
@@ -579,6 +600,7 @@ class Viewer:
             "_growth_vec_actor",
             "_growth_surface_actor",
             "_deformed_actor",
+            "_section_actor",
         ):
             actor = getattr(self, attr, None)
             if actor is not None:
@@ -593,6 +615,20 @@ class Viewer:
             except Exception:
                 pass
             self._growth_slider = None
+        # clear_slider_widgets() above also drops the section sliders.
+        self._section_plane = None
+        self._section_cutter = None
+        self._section_src = None
+        self._section_angle_slider = None
+        self._section_pos_slider = None
+        self.show_section = False
+        if self._section_overlay_renderer is not None:
+            try:
+                rw = getattr(self.plotter, "render_window", None) or self.plotter.ren_win
+                rw.RemoveRenderer(self._section_overlay_renderer)
+            except Exception:
+                pass
+            self._section_overlay_renderer = None
         self.growth = None
         self.deformed_mesh = None
         self.show_growth_step = False
@@ -956,13 +992,20 @@ class Viewer:
         self._growth_vec_threshold = threshold
 
     def _build_growth_surface_actor(self) -> None:
-        """Iso-surface of the step field at iso = current_step + 0.5.
+        """Growth (layer) surfaces: iso-surfaces of the depth field, ONE per
+        growth step, all of them from 0 up to the current slider step.
 
-        Marching cubes on the (cell -> point converted) step scalar gives the
-        boundary between voxels painted by step N and step > N. Per the
-        spec, those boundaries are the "target surfaces" of the non-planar
-        slicer; the growth vector field is the (clamped) normal field on
-        them. Pipeline is persistent — only the iso-value changes on slider.
+        With depth_method='vectors' the depth field is the potential whose
+        gradient is the clamped growth vector field, so each iso-surface is
+        perpendicular to the growth direction — these ARE the non-planar
+        slicer's target layer surfaces. Coloured blue(bed)->red(top) on the
+        same LUT as the voxels. Pipeline is persistent; the slider only
+        changes how many contours are active.
+
+        The depth field is rescaled so its in-model max equals n_steps-1,
+        i.e. it lines up with the BFS-step scale the slider is numbered in.
+        Uniform scaling doesn't move the level sets, only relabels them, so
+        the perpendicular-to-vectors property is preserved.
         """
         gr = self.growth
         assert gr is not None
@@ -994,6 +1037,16 @@ class Viewer:
             gr, sigma=self.smooth_sigma, method=self.depth_method,
             outside_mode="vertical",
         )
+        # Rescale so the in-model max matches the BFS-step scale (slider range
+        # is 0..n_steps-1). The 'vectors' potential has its own units (it
+        # integrates vector magnitudes, not integer steps), so without this
+        # the top of the model would sit beyond the last slider position and
+        # never get a surface. Geometry of the level sets is unchanged.
+        inside = gr.step >= 0
+        if inside.any() and gr.n_steps > 1:
+            fmax = float(np.nanmax(extended[inside]))
+            if fmax > 1e-6:
+                extended = extended * (float(gr.n_steps - 1) / fmax)
         step_flat = extended.flatten(order="F")
         arr = vns.numpy_to_vtk(step_flat, deep=True, array_type=vtk.VTK_FLOAT)
         arr.SetName("step")
@@ -1013,8 +1066,10 @@ class Viewer:
             vtk.vtkDataObject.FIELD_ASSOCIATION_POINTS,
             "step",
         )
-        contour.SetNumberOfContours(1)
-        contour.SetValue(0, float(self._growth_current_step) + 0.5)
+        _n_surf = self._growth_current_step + 1
+        contour.SetNumberOfContours(_n_surf)
+        for _i in range(_n_surf):
+            contour.SetValue(_i, float(_i) + 0.5)
         contour.ComputeNormalsOn()
 
         # Smooth the iso-surface — flood-fill creates step-shaped artifacts
@@ -1035,15 +1090,17 @@ class Viewer:
         normals.ConsistencyOn()
         normals.SplittingOff()
 
+        lut = _growth_lut(gr.n_steps)
+
         mapper = vtk.vtkPolyDataMapper()
         mapper.SetInputConnection(normals.GetOutputPort())
-        mapper.ScalarVisibilityOff()
+        mapper.ScalarVisibilityOn()
+        mapper.SetScalarRange(0.0, max(float(gr.n_steps - 1), 1.0))
+        mapper.SetLookupTable(lut)
 
         actor = vtk.vtkActor()
         actor.SetMapper(mapper)
-        # Lime-green so it stands out from anything else; clearly translucent.
-        actor.GetProperty().SetColor(0.55, 0.90, 0.35)
-        actor.GetProperty().SetOpacity(0.45)
+        actor.GetProperty().SetOpacity(0.18)
         actor.GetProperty().SetAmbient(0.30)
         actor.GetProperty().SetDiffuse(0.70)
         actor.GetProperty().SetSpecular(0.10)
@@ -1077,9 +1134,12 @@ class Viewer:
                     _threshold_points_between(self._growth_vec_threshold, 1, step)
                     self._growth_vec_threshold.Modified()
                 if self._growth_surface_contour is not None:
-                    # Iso-value sits between step N and N+1 -> N + 0.5.
-                    self._growth_surface_contour.SetValue(0, float(step) + 0.5)
-                    self._growth_surface_contour.Modified()
+                    _c = self._growth_surface_contour
+                    _n = step + 1
+                    _c.SetNumberOfContours(_n)
+                    for _i in range(_n):
+                        _c.SetValue(_i, float(_i) + 0.5)
+                    _c.Modified()
                 self._refresh_hud()
                 self.plotter.render()
             except BaseException:
@@ -1096,6 +1156,232 @@ class Viewer:
             style="modern",
             fmt="%.0f",
         )
+
+    # ----- interactive Z-parallel cross-section -----
+
+    def _ensure_section_built(self) -> bool:
+        """Build the cross-section pipeline once: in-model-only growth surfaces
+        (all steps) + a vertical cutting plane + cutter + line actor. Returns
+        True if ready. Requires growth — computes it on demand."""
+        if self._section_actor is not None:
+            return True
+        if self.growth is None:
+            _log("[vff] _ensure_section_built: computing growth first")
+            self.do_compute_growth()
+            if self.growth is None:
+                return False
+        _log("[vff] _ensure_section_built: building in-model surfaces to cut")
+        surf = build_growth_surfaces(
+            self.growth, smooth_sigma=self.smooth_sigma, depth_method=self.depth_method,
+        )
+        self._section_src = surf
+
+        b = self.mesh.bounds
+        self._section_cx = 0.5 * float(b[0, 0] + b[1, 0])
+        self._section_cy = 0.5 * float(b[0, 1] + b[1, 1])
+        self._section_cz = 0.5 * float(b[0, 2] + b[1, 2])
+        self._section_R = 0.5 * float(np.hypot(b[1, 0] - b[0, 0], b[1, 1] - b[0, 1]))
+
+        # Vertical plane: normal lies in XY (z-component 0), so the plane always
+        # contains the Z direction. The cutter slices the layer surfaces along it.
+        plane = vtk.vtkPlane()
+        cutter = vtk.vtkCutter()
+        cutter.SetCutFunction(plane)
+        cutter.SetInputData(surf)
+
+        lut = _growth_lut(self.growth.n_steps)
+        mapper = vtk.vtkPolyDataMapper()
+        mapper.SetInputConnection(cutter.GetOutputPort())
+        mapper.SetScalarModeToUsePointData()
+        mapper.SelectColorArray("step")
+        mapper.SetScalarRange(0.0, max(float(self.growth.n_steps - 1), 1.0))
+        mapper.SetLookupTable(lut)
+        mapper.ScalarVisibilityOn()
+
+        actor = vtk.vtkActor()
+        actor.SetMapper(mapper)
+        actor.GetProperty().SetLineWidth(3)
+        actor.GetProperty().SetLighting(False)
+        actor.SetVisibility(False)
+
+        # Draw the section lines ON TOP of everything. They live INSIDE the
+        # model volume, so in the main renderer the ghosted mesh/voxels in
+        # front occlude them — only the near/centre part shows ("только в
+        # центре"). A layer-1 renderer that shares the camera and clears the
+        # depth buffer makes them overlay the whole scene at any angle/pos.
+        rw = getattr(self.plotter, "render_window", None) or self.plotter.ren_win
+        overlay = None
+        try:
+            if rw.GetNumberOfLayers() < 2:
+                rw.SetNumberOfLayers(2)
+            overlay = vtk.vtkRenderer()
+            overlay.SetLayer(1)
+            overlay.InteractiveOff()
+            overlay.SetPreserveColorBuffer(1)   # keep the base image underneath
+            # PreserveDepthBuffer stays 0 -> depth cleared -> lines always on top.
+            overlay.SetActiveCamera(self.plotter.renderer.GetActiveCamera())
+            overlay.AddActor(actor)
+            rw.AddRenderer(overlay)
+        except Exception:
+            _log("[vff] section overlay renderer failed; using main renderer")
+            _log(traceback.format_exc())
+            overlay = None
+            self.plotter.renderer.AddActor(actor)
+        self._section_overlay_renderer = overlay
+
+        self._section_plane = plane
+        self._section_cutter = cutter
+        self._section_actor = actor
+        self._update_section_plane()
+        self._add_section_sliders()
+        return True
+
+    def _update_section_plane(self) -> None:
+        if self._section_plane is None or self._section_cutter is None:
+            return
+        th = float(np.deg2rad(self._section_angle_deg))
+        nx_, ny_ = float(np.cos(th)), float(np.sin(th))
+        d = self._section_pos
+        self._section_plane.SetNormal(nx_, ny_, 0.0)
+        self._section_plane.SetOrigin(
+            self._section_cx + d * nx_, self._section_cy + d * ny_, self._section_cz
+        )
+        self._section_cutter.Modified()
+
+    def _add_section_sliders(self) -> None:
+        R = self._section_R
+
+        def on_angle(value: float) -> None:
+            try:
+                self._section_angle_deg = float(value)
+                self._update_section_plane()
+                self._view_section_face_on(reset=False)  # keep facing the plane
+                self._refresh_hud()
+                self.plotter.render()
+            except BaseException:
+                _log("[vff] ERROR in section angle slider:")
+                _log(traceback.format_exc())
+
+        def on_pos(value: float) -> None:
+            try:
+                self._section_pos = float(value)
+                self._update_section_plane()
+                self._refresh_hud()
+                self.plotter.render()
+            except BaseException:
+                _log("[vff] ERROR in section pos slider:")
+                _log(traceback.format_exc())
+
+        self._section_angle_slider = self.plotter.add_slider_widget(
+            callback=on_angle, rng=[0.0, 180.0], value=self._section_angle_deg,
+            title="section angle", pointa=(0.04, 0.30), pointb=(0.30, 0.30),
+            style="modern", fmt="%.0f",
+        )
+        self._section_pos_slider = self.plotter.add_slider_widget(
+            callback=on_pos, rng=[-R, R], value=self._section_pos,
+            title="section pos", pointa=(0.04, 0.22), pointb=(0.30, 0.22),
+            style="modern", fmt="%.1f",
+        )
+
+    def _section_set_sliders_enabled(self, on: bool) -> None:
+        for w in (self._section_angle_slider, self._section_pos_slider):
+            if w is not None:
+                try:
+                    w.SetEnabled(1 if on else 0)
+                except Exception:
+                    pass
+
+    def _apply_section_dim(self, on: bool) -> None:
+        """Section on -> ghost everything else so the crisp section lines pop.
+        Section off -> restore each actor's normal opacity."""
+        dim = 0.07
+        step_normal = 1.0 if self._growth_step_opaque else self._growth_translucent_alpha
+        pairs = [
+            (self.mesh_actor, 1.0),
+            (self.voxel_actor, 1.0),
+            (self._growth_step_actor, step_normal),
+            (self._growth_vec_actor, 1.0),
+            (self._growth_surface_actor, 0.18),
+            (self._deformed_actor, 0.95),
+        ]
+        for actor, normal in pairs:
+            if actor is not None:
+                actor.GetProperty().SetOpacity(dim if on else normal)
+
+    def toggle_section(self) -> None:
+        """X: toggle the interactive vertical (∥Z) cross-section. Angle and
+        position are driven by the two sliders; everything else is ghosted
+        while it's on. Press I to save a screenshot of the result."""
+        if not self.show_section:
+            if not self._ensure_section_built():
+                _log("[vff] toggle_section: no growth, cannot build section")
+                return
+            self.show_section = True
+            if self._section_actor is not None:
+                self._section_actor.SetVisibility(True)
+            self._apply_section_dim(True)
+            self._section_set_sliders_enabled(True)
+            # Face the cut straight-on (orthographic) so it fills the view —
+            # an oblique view shows only a thin slanted slice in the centre.
+            self._view_section_face_on(reset=True)
+        else:
+            self.show_section = False
+            if self._section_actor is not None:
+                self._section_actor.SetVisibility(False)
+            self._apply_section_dim(False)
+            self._section_set_sliders_enabled(False)
+            try:
+                self.plotter.disable_parallel_projection()
+            except Exception:
+                pass
+        self._refresh_hud()
+        self.plotter.render()
+
+    def save_section_screenshot(self) -> None:
+        """I: save the current viewer image (ghosted scene + section lines)."""
+        from pathlib import Path
+        self._screenshot_idx += 1
+        path = Path.cwd() / f"section_view_{self._screenshot_idx:03d}.png"
+        try:
+            self.plotter.screenshot(str(path))
+            _log(f"[vff] saved screenshot -> {path}")
+        except Exception as e:
+            _log(f"[vff] screenshot failed: {e!r}")
+
+    def _view_section_face_on(self, reset: bool = True) -> None:
+        """Point the camera straight down the section-plane normal, orthographic,
+        so the whole cut fills the view. Without this an oblique camera shows
+        only a thin slanted slice — which reads as 'not the whole surface'.
+
+        reset=True refits the zoom (used on enter / J); reset=False just
+        re-aims (used while dragging the angle slider, so it doesn't jump)."""
+        if not self.show_section or self._section_plane is None:
+            return
+        th = float(np.deg2rad(self._section_angle_deg))
+        nx_, ny_ = float(np.cos(th)), float(np.sin(th))
+        focal = (self._section_cx, self._section_cy, self._section_cz)
+        dist = 2.5 * max(self._section_R, 1.0)
+        pos = (focal[0] + nx_ * dist, focal[1] + ny_ * dist, focal[2])
+        try:
+            self.plotter.enable_parallel_projection()
+        except Exception:
+            pass
+        self.plotter.camera_position = [pos, focal, (0.0, 0.0, 1.0)]
+        if reset:
+            try:
+                self.plotter.reset_camera()
+                # reset_camera frames the whole 250 mm build volume; tighten in
+                # to frame the section (which extends ~2x the model footprint).
+                self.plotter.camera.zoom(1.3)
+            except Exception:
+                pass
+
+    def view_section_face_on(self) -> None:
+        """J: re-aim the camera face-on to the current section plane."""
+        if not self.show_section:
+            return
+        self._view_section_face_on(reset=True)
+        self.plotter.render()
 
     # ----- HUD -----
 
@@ -1157,6 +1443,11 @@ class Viewer:
             lines.append("[V] flips growth voxels opaque <-> translucent")
             lines.append("[C] voxels on/off  [N] vectors on/off  [H] surface  slider: step")
             lines.append(f"[D] toggle deformed (flattened) mesh: {'on' if self.show_deformed else 'off'}")
+            sec = f"[X] section ∥Z: {'on' if self.show_section else 'off'}"
+            if self.show_section:
+                sec += f"  angle={self._section_angle_deg:.0f}deg  pos={self._section_pos:.1f}mm  (sliders)"
+            sec += "   [I] save  [J] face-on"
+            lines.append(sec)
         lines.append("[ [ / ] ] or Up/Down pitch -/+   [F5] reset view")
         return "\n".join(lines)
 

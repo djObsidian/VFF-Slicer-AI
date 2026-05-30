@@ -26,8 +26,9 @@ import numpy as np
 import numpy.ma as ma
 import trimesh
 from scipy.ndimage import distance_transform_edt, gaussian_filter
-from scipy.sparse import csr_array
+from scipy.sparse import coo_array, csr_array
 from scipy.sparse.csgraph import dijkstra
+from scipy.sparse.linalg import cg
 
 try:
     import skfmm  # type: ignore
@@ -167,6 +168,125 @@ def fmm_distance_from_bed(growth: GrowthResult) -> np.ndarray:
     return dist.astype(np.float32)
 
 
+def integrate_vectors_to_potential(growth: GrowthResult, eps: float = 1e-6) -> np.ndarray:
+    """Least-squares scalar potential φ whose gradient best matches the
+    (clamped) growth vector field. The level sets of φ then have the growth
+    vectors as their normals — i.e. each layer surface is perpendicular to
+    the local growth direction, as closely as a single globally-consistent
+    surface family allows.
+
+    This is the "integrate the vectors into a surface" route: instead of
+    deriving the depth from geodesic distance (FMM/Dijkstra) and clamping
+    only the *display* arrows, we build the depth field FROM the clamped
+    vectors. The nozzle-tilt clamp therefore actually shapes the layers.
+
+    Method (discrete Poisson / "surface from gradients"):
+
+      For every 26-connectivity edge (i, j) between model voxels we want the
+      potential difference to equal the growth vector projected on the edge:
+
+          φ_j − φ_i  ≈  v̄_ij · (x_j − x_i)        v̄_ij = ½(v_i + v_j)
+
+      Least-squares over all edges gives the normal equations  L φ = b  with
+      L the (weighted) graph Laplacian and b the discrete divergence of the
+      target field. Bed-seed voxels are pinned to φ = 0 (Dirichlet, via a
+      large diagonal penalty) so numbering starts at the plate and grows
+      upward; a tiny Tikhonov term `eps` keeps disconnected components
+      solvable. Solved with conjugate gradient (SPD system).
+
+    Exactness caveat: a clamped field is generally NOT a gradient field, so
+    no surface has these vectors as *exact* normals everywhere. φ is the
+    closest consistent compromise — the residual ‖∇φ − v‖ is where the tilt
+    clamp fought global consistency.
+
+    Returns: float32 grid (nx, ny, nz), values in voxel-step units inside
+    the model, +inf outside (filled in later by smoothed_depth_field).
+    """
+    matrix = growth.step >= 0
+    nx, ny, nz = matrix.shape
+    n_model = int(matrix.sum())
+    if n_model == 0:
+        return np.full(matrix.shape, np.inf, dtype=np.float32)
+
+    # Compact model-voxel indexing 0..M-1 in C order (matches boolean masking).
+    order = np.argwhere(matrix).astype(np.int64)          # (M, 3) voxel coords
+    flat_idx = np.full(matrix.shape, -1, dtype=np.int64)
+    flat_idx[matrix] = np.arange(n_model)
+    vecs = growth.vectors[matrix].astype(np.float64)      # (M, 3) clamped growth dirs
+
+    # 13 canonical offsets — one from each ±pair, so every edge is built once.
+    canon = [
+        (dx, dy, dz)
+        for dx in (-1, 0, 1) for dy in (-1, 0, 1) for dz in (-1, 0, 1)
+        if (dx, dy, dz) > (0, 0, 0)
+    ]
+
+    rows_l, cols_l, vals_l = [], [], []
+    b = np.zeros(n_model, dtype=np.float64)
+    for off in canon:
+        d = np.asarray(off, dtype=np.float64)
+        nbr = order + np.asarray(off, dtype=np.int64)
+        inb = (
+            (nbr[:, 0] >= 0) & (nbr[:, 0] < nx)
+            & (nbr[:, 1] >= 0) & (nbr[:, 1] < ny)
+            & (nbr[:, 2] >= 0) & (nbr[:, 2] < nz)
+        )
+        src = np.where(inb)[0]
+        if src.size == 0:
+            continue
+        nb = nbr[src]
+        jj = flat_idx[nb[:, 0], nb[:, 1], nb[:, 2]]
+        valid = jj >= 0
+        if not valid.any():
+            continue
+        i_arr = src[valid]                                # model index of voxel i
+        j_arr = jj[valid]                                 # model index of voxel j
+        vbar = 0.5 * (vecs[i_arr] + vecs[j_arr])
+        t = vbar @ d                                      # target φ_j − φ_i
+        ones = np.ones(i_arr.size, dtype=np.float64)
+        # Laplacian contribution of edge (i,j): +1 on diagonals, −1 off.
+        rows_l += [i_arr, j_arr, i_arr, j_arr]
+        cols_l += [i_arr, j_arr, j_arr, i_arr]
+        vals_l += [ones, ones, -ones, -ones]
+        # Divergence RHS: equation (φ_j − φ_i = t) pushes b[i]-=t, b[j]+=t.
+        np.add.at(b, i_arr, -t)
+        np.add.at(b, j_arr, t)
+
+    rows = np.concatenate(rows_l)
+    cols = np.concatenate(cols_l)
+    vals = np.concatenate(vals_l)
+    lap = coo_array((vals, (rows, cols)), shape=(n_model, n_model)).tocsr()
+
+    # Pin bed seeds to φ = 0 (lowest non-empty Z layer — same convention as
+    # growth/geodesic). Large diagonal penalty ≈ Dirichlet; eps elsewhere
+    # regularizes the (otherwise singular, constant-nullspace) Laplacian.
+    has_in_z = matrix.any(axis=(0, 1))
+    k_bed = int(np.argmax(has_in_z))
+    seed_grid = np.zeros_like(matrix)
+    seed_grid[:, :, k_bed] = matrix[:, :, k_bed]
+    seed_local = flat_idx[seed_grid]
+    diag_mean = float(lap.diagonal().mean())
+    big = 1.0e6 * (diag_mean if diag_mean > 0 else 1.0)
+    pen = np.full(n_model, eps, dtype=np.float64)
+    pen[seed_local] = big
+    rng = np.arange(n_model)
+    a_mat = (lap + coo_array((pen, (rng, rng)), shape=(n_model, n_model))).tocsr()
+    # Seed target is 0, so b stays 0 there; the penalty drags φ_seed → 0.
+
+    try:
+        phi, info = cg(a_mat, b, rtol=1e-7, maxiter=5000)
+    except TypeError:  # SciPy < 1.12 used `tol` instead of `rtol`.
+        phi, info = cg(a_mat, b, tol=1e-7, maxiter=5000)
+    if info != 0:
+        # CG didn't converge (rare at our sizes) — fall back to a direct solve.
+        from scipy.sparse.linalg import spsolve
+        phi = spsolve(a_mat, b)
+
+    out = np.full(matrix.shape, np.inf, dtype=np.float32)
+    out[matrix] = phi.astype(np.float32)
+    return out
+
+
 def smoothed_depth_field(
     growth: GrowthResult,
     sigma: float = 2.0,
@@ -206,12 +326,20 @@ def smoothed_depth_field(
     k_bed_layer = int(np.argmax(has_model_in_z))
 
     # Inside-model depth.
+    #   "vectors"  — least-squares scalar potential whose gradient matches the
+    #                CLAMPED growth vectors (integrate_vectors_to_potential).
+    #                Layer surfaces (its level sets) are perpendicular to the
+    #                growth direction, so the nozzle-tilt clamp actually shapes
+    #                them. This is the DEFAULT.
     #   "fmm"      — Eikonal solver via scikit-fmm. Smooth (C1) where it
     #                exists, including across wavefront-merge surfaces.
     #                Falls back to "dijkstra" if scikit-fmm isn't installed.
+    #                Ignores the clamp — surfaces follow raw geodesic depth.
     #   "dijkstra" — discrete shortest path on the 26-conn voxel graph.
     #                C0 only, can show small kinks at cell boundaries.
-    if method == "fmm" and _HAVE_SKFMM:
+    if method == "vectors":
+        geo = integrate_vectors_to_potential(growth)
+    elif method == "fmm" and _HAVE_SKFMM:
         geo = fmm_distance_from_bed(growth)
     else:
         geo = geodesic_distance_from_bed(growth)

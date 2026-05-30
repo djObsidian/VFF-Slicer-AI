@@ -9,6 +9,10 @@ _*.png
 _*.txt
 _*.log
 
+# Cross-section figures (regenerated: viewer 'I' hotkey + --section-xz)
+section_view_*.png
+section_xz.png
+
 # Locally generated artefacts (regenerated from the pipeline)
 deformed.stl
 deformed.gcode
