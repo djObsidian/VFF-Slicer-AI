@@ -224,7 +224,7 @@ corners ignored) and the depth field / 3D map is translated to that centre.
 ## CLI reference
 
 ```
-positional: STL                 path to STL (default ./propeller.stl)
+positional: STL                 path to STL (default ./propeller_fixed_flat.stl)
 
   --volume X x Y x Z            build volume in mm (default 250x250x250)
   --pitch FLOAT                 voxel pitch in mm (default 1.0)

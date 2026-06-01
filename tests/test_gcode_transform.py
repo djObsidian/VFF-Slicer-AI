@@ -222,9 +222,9 @@ def test_overhang_cooling_injects_and_restores_fan():
 def test_propeller_forward_inverse_roundtrip():
     """forward then inverse on the real mesh should recover XYZ within a
     fraction of the voxel pitch (interpolation error only)."""
-    stl = Path(__file__).resolve().parent.parent / "propeller.stl"
+    stl = Path(__file__).resolve().parent.parent / "propeller_fixed_flat.stl"
     if not stl.exists():
-        print("  SKIP roundtrip (propeller.stl not found)")
+        print("  SKIP roundtrip (propeller_fixed_flat.stl not found)")
         return
     bt = BackTransform.from_mesh(
         str(stl), volume_side=250.0, pitch=1.0, max_tilt_deg=30.0,

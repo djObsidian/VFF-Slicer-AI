@@ -51,9 +51,9 @@ def test_flat_box_maps_to_identity():
 
 
 def test_propeller_less_distortion_than_zonly():
-    stl = Path(__file__).resolve().parent.parent / "propeller.stl"
+    stl = Path(__file__).resolve().parent.parent / "propeller_fixed_flat.stl"
     if not stl.exists():
-        print("  SKIP propeller distortion (propeller.stl not found)")
+        print("  SKIP propeller distortion (propeller_fixed_flat.stl not found)")
         return
     m = load_and_place(str(stl), BuildVolume.of(250, 250, 250))
     vg = voxelize_solid(m, pitch=1.0)
@@ -71,9 +71,9 @@ def test_propeller_less_distortion_than_zonly():
 
 
 def test_inverse_roundtrip_converged_is_exact():
-    stl = Path(__file__).resolve().parent.parent / "propeller.stl"
+    stl = Path(__file__).resolve().parent.parent / "propeller_fixed_flat.stl"
     if not stl.exists():
-        print("  SKIP inverse roundtrip (propeller.stl not found)")
+        print("  SKIP inverse roundtrip (propeller_fixed_flat.stl not found)")
         return
     m = load_and_place(str(stl), BuildVolume.of(250, 250, 250))
     vg = voxelize_solid(m, pitch=1.0)
@@ -108,7 +108,7 @@ def test_extrusion_comp_matches_volume_ratio():
     detb = dmb.jacobian_det(Pb)
     assert np.allclose(detb, 1.0, atol=1e-3), f"box det should be ~1, got [{detb.min():.3f},{detb.max():.3f}]"
 
-    stl = Path(__file__).resolve().parent.parent / "propeller.stl"
+    stl = Path(__file__).resolve().parent.parent / "propeller_fixed_flat.stl"
     if not stl.exists():
         print("  PASS extrusion comp (box det~1; propeller skipped — no STL)")
         return
@@ -225,6 +225,47 @@ def test_default_smoothing_keeps_a_bore_dome():
     print(f"  PASS deformation keeps a bore dome ({dome:.2f} mm at default sigma)")
 
 
+def test_inverse_keeps_first_layer_z_and_never_digs_bed():
+    """The gcode INVERSE must leave the first layer's Z unchanged and never map
+    a near-bed point below the plate (which would drive the nozzle into the
+    bed). Bed-blend ramps the displacement to zero at the plate, so Φ is
+    identity for the first ~half-pitch above it — and the first layer sits there.
+    Forward side: test_bed_blend_keeps_near_bed_identity; this is the inverse,
+    on the printed (flat-bottom) part. The plate is the mesh Z_min, NOT the
+    lowest voxel centre (the grid pads a voxel below the part)."""
+    stl = Path(__file__).resolve().parent.parent / "propeller_fixed_flat.stl"
+    if not stl.exists():
+        print("  SKIP inverse first-layer (propeller_fixed_flat.stl not found)")
+        return
+    m = load_and_place(str(stl), BuildVolume.of(250, 250, 250))
+    gr = compute_growth(voxelize_solid(m, pitch=1.0), max_tilt_deg=30.0)
+    dmap = solve_deformation_map(gr)
+    plate_z = float(m.bounds[0, 2])            # the bed = mesh Z_min (0 here)
+    P = dmap.origin + (np.argwhere(gr.step >= 0) + 0.5) * dmap.pitch
+    (xlo, ylo), (xhi, yhi) = P[:, :2].min(axis=0), P[:, :2].max(axis=0)
+
+    rng = np.random.default_rng(0)
+    N = 4000
+    xy = np.column_stack([rng.uniform(xlo, xhi, N), rng.uniform(ylo, yhi, N)])
+
+    # First layer: a planar slicer lays it ~one layer height above the plate.
+    # Inverting it must recover the same Z so the nozzle prints it flat.
+    z1 = plate_z + 0.2
+    q0 = np.column_stack([xy[:, 0], xy[:, 1], np.full(N, z1)])
+    p0 = dmap.inverse_points(q0)[0]
+    dz0 = float(np.abs(p0[:, 2] - z1).max())
+    assert dz0 < 0.02, f"first-layer Z must be preserved, max |Δz| {dz0:.4f} mm"
+
+    # No near-bed layer may invert below the plate (nozzle into the bed).
+    worst = 0.0
+    for zl in (0.1, 0.2, 0.3, 0.5, 0.8, 1.2):
+        q = np.column_stack([xy[:, 0], xy[:, 1], np.full(N, plate_z + zl)])
+        worst = min(worst, float(dmap.inverse_points(q)[0][:, 2].min() - plate_z))
+    assert worst > -1e-3, f"inverse dug {worst:.4f} mm below the plate"
+    print(f"  PASS inverse first layer (|Δz| max {dz0:.4f} mm; never below plate, "
+          f"worst {worst:+.4f} mm)")
+
+
 def test_overhang_mask_flags_unsupported_points():
     """The post-inverse cooling detector flags toolpath points with no part
     material straight below (overhang/bridge) and leaves walls / top surfaces /
@@ -259,6 +300,7 @@ def main() -> int:
         test_vertical_extrusion_comp_reduces_e_in_bulk,
         test_subdivision_refines_coarse_faces_watertight,
         test_default_smoothing_keeps_a_bore_dome,
+        test_inverse_keeps_first_layer_z_and_never_digs_bed,
         test_overhang_mask_flags_unsupported_points,
     ]
     failures = 0

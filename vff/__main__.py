@@ -223,7 +223,7 @@ def _run_3d_export(args, stl_path: Path, x: float, y: float, z: float) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="vff", description="VFF Slicer — interactive visualizer")
-    parser.add_argument("stl", nargs="?", help="Path to STL file (defaults to ./propeller.stl).")
+    parser.add_argument("stl", nargs="?", help="Path to STL file (defaults to ./propeller_fixed_flat.stl).")
     parser.add_argument(
         "--volume", default="250x250x250",
         help="Build volume as X x Y x Z in mm (default: 250x250x250).",
@@ -496,7 +496,7 @@ def main(argv: list[str] | None = None) -> int:
     # before importing the GUI stack. (The interactive viewer is z-only, so
     # there's nothing 3D to show there anyway.)
     if args.deform_mode == "3d" and (args.export or args.gcode_in):
-        stl_path = Path(args.stl) if args.stl else Path.cwd() / "propeller.stl"
+        stl_path = Path(args.stl) if args.stl else Path.cwd() / "propeller_fixed_flat.stl"
         if not stl_path.exists():
             print(f"STL not found: {stl_path}", file=sys.stderr)
             return 1
@@ -517,7 +517,7 @@ def main(argv: list[str] | None = None) -> int:
     # with viewer-only flags (--export / --section-xz / --preview-gcode) it falls
     # through to the full path below.
     if args.gcode_in and not (args.export or args.section_xz or args.preview_gcode):
-        stl_path = Path(args.stl) if args.stl else Path.cwd() / "propeller.stl"
+        stl_path = Path(args.stl) if args.stl else Path.cwd() / "propeller_fixed_flat.stl"
         if not stl_path.exists():
             print(f"STL not found: {stl_path}", file=sys.stderr)
             return 1
@@ -532,7 +532,7 @@ def main(argv: list[str] | None = None) -> int:
     from .mesh_io import load_and_place
     from .viewer import Viewer
 
-    stl_path = Path(args.stl) if args.stl else Path.cwd() / "propeller.stl"
+    stl_path = Path(args.stl) if args.stl else Path.cwd() / "propeller_fixed_flat.stl"
     if not stl_path.exists():
         print(f"STL not found: {stl_path}", file=sys.stderr)
         return 1

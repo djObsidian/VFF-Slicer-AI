@@ -40,7 +40,7 @@ def edge_length_stats(orig, deformed):
 
 
 def main() -> int:
-    stl = Path(__file__).resolve().parent.parent / "propeller.stl"
+    stl = Path(__file__).resolve().parent.parent / "propeller_fixed_flat.stl"
     pitch = 1.0
     m = load_and_place(str(stl), BuildVolume.of(250, 250, 250))
     z0, z1 = float(m.bounds[0, 2]), float(m.bounds[1, 2])

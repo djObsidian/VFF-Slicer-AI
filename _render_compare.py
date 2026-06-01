@@ -1,4 +1,4 @@
-"""Quick overlay render: propeller.stl + a gcode polyline."""
+"""Quick overlay render: propeller_fixed_flat.stl + a gcode polyline."""
 from __future__ import annotations
 import sys
 from pathlib import Path
@@ -10,7 +10,7 @@ import trimesh
 from vff.gcode_preview import parse_gcode
 
 
-def main(gcode_path: str, target_path: str = "propeller.stl",
+def main(gcode_path: str, target_path: str = "propeller_fixed_flat.stl",
          xy_center=(110.0, 110.0), out_prefix: str = "_cmp") -> None:
     m = trimesh.load(target_path, force="mesh")
     m.apply_translation([0.0, 0.0, -float(m.bounds[0, 2])])
@@ -61,6 +61,6 @@ def main(gcode_path: str, target_path: str = "propeller.stl",
 
 if __name__ == "__main__":
     gcode = sys.argv[1] if len(sys.argv) > 1 else "propeller_inverse.gcode"
-    target = sys.argv[2] if len(sys.argv) > 2 else "propeller.stl"
+    target = sys.argv[2] if len(sys.argv) > 2 else "propeller_fixed_flat.stl"
     prefix = sys.argv[3] if len(sys.argv) > 3 else "_cmp"
     main(gcode, target, out_prefix=prefix)
