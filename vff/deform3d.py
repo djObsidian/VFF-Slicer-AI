@@ -106,11 +106,23 @@ class DeformationMap:
     # ---- local volume scaling det(JΦ) at original-space points ----
     def jacobian_det(self, pts: np.ndarray) -> np.ndarray:
         """det of the forward Jacobian ∂Φ/∂(world) at each point = dV_def/dV_orig
-        (the local volume stretch of the deformation). Used for extrusion
-        compensation: the slicer's E assumes the deformed road volume, so the
-        true original-space deposit scales by 1/det."""
+        (the local volume stretch of the deformation). VOLUME extrusion comp
+        (4/5-axis, S4-style): the slicer's E assumes the deformed road volume, so
+        the original-space deposit scales by 1/det."""
         J = _sample_jac(self.jac, self.origin, self.pitch, np.asarray(pts, float))
         return np.linalg.det(J)
+
+    def layer_gap_ratio(self, pts: np.ndarray) -> np.ndarray:
+        """∂(original z)/∂(deformed z) = (JΦ⁻¹)[z,z] at each point — how a
+        deformed-space vertical layer step maps to original-space vertical
+        spacing. VERTICAL extrusion comp (3-axis, vertical nozzle, fixed road
+        WIDTH): over/under-extrusion is driven by the layer-height squish, not
+        the full volume. The slicer's E assumes the deformed layer height; the
+        real gap to the layer below is this × that, so E scales by it (ratio < 1
+        where layers compress → reduce E to avoid over-squish). Unlike 1/det
+        this ignores the in-plane width change a 3-axis nozzle can't realize."""
+        J = _sample_jac(self.jac, self.origin, self.pitch, np.asarray(pts, float))
+        return np.linalg.inv(J)[:, 2, 2]
 
     # ---- inverse: deformed → original (vectorised Newton) ----
     def inverse_points(
@@ -190,7 +202,7 @@ def _geodesic_direction_field(growth: GrowthResult, sigma: float, max_tilt_deg: 
 def solve_deformation_map(
     growth: GrowthResult,
     *,
-    displacement_smooth_sigma: float = 0.5,
+    displacement_smooth_sigma: float = 2.0,
     growth_source: str = "bfs",
     max_tilt_deg: float = 30.0,
     eps: float = 1e-6,
@@ -332,14 +344,14 @@ def solve_deformation_map(
         idx = distance_transform_edt(outside, return_distances=False, return_indices=True)
         U[outside] = U[idx[0], idx[1], idx[2]][outside]
 
-    # Light Gaussian smoothing of the displacement field tames the sharp
-    # per-voxel inconsistencies that make the map fold (non-injective tips →
-    # Newton spikes): on the propeller it drops non-convergence ~5%→2% at
-    # sigma=0.5. But it ALSO blurs out real curvature — at sigma=2 a bore
-    # ceiling that should dome +1.5 mm gets crushed to +0.7 mm. So keep sigma
-    # LOW (default 0.5): it preserves the dome the depth field actually has
-    # while still suppressing most folds (the rest are caught by _despike_path).
-    # MUST match between the sliced export and the inverse (it changes Φ).
+    # Gaussian smoothing of the displacement field tames the sharp per-voxel
+    # inconsistencies that fold the map (non-injective tips → Newton spikes) and
+    # the voxel-scale surface facets. Default 2.0 = smoother mesh, fewer folds.
+    # It DOES soften real curvature (a bore-ceiling dome shrinks ~1.5→0.7 mm at
+    # sigma=2); the dome still prints if you also pass --subdivide-error so the
+    # mesh can represent it. Drop sigma toward 0.5 for a sharper/bigger dome at
+    # the cost of more surface texture. MUST match between the sliced export and
+    # the inverse (it changes Φ).
     if displacement_smooth_sigma > 0:
         from scipy.ndimage import gaussian_filter
         for c in range(3):
@@ -439,7 +451,7 @@ class BackTransform3D:
         volume_side: float = 250.0,
         pitch: float = 1.0,
         max_tilt_deg: float = 30.0,
-        smooth_sigma: float = 0.5,
+        smooth_sigma: float = 2.0,
         growth_source: str = "bfs",
         xy_center: tuple[float, float] | None = None,
     ) -> "BackTransform3D":

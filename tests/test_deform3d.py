@@ -145,6 +145,33 @@ def test_subdivision_refines_coarse_faces_watertight():
           f"{len(fine.faces):,} faces, watertight {fine.is_watertight})")
 
 
+def test_vertical_extrusion_comp_reduces_e_in_bulk():
+    """3-axis 'vertical' comp = layer-gap ratio ∂orig_z/∂def_z. A flat box (no
+    deformation) gives ratio 1 (no comp); on the propeller the layers compress
+    so the mean is < 1 (reduces E), opposite to the volume comp's > 1 — that
+    sign flip is the over-extrusion fix."""
+    box = trimesh.creation.box(extents=(40, 40, 20))
+    box.apply_translation([125, 125, 10])
+    grb = compute_growth(voxelize_solid(box, pitch=1.0), max_tilt_deg=30.0)
+    db = solve_deformation_map(grb)
+    Pb = db.origin + (np.argwhere(grb.step >= 0) + 0.5) * db.pitch
+    assert np.allclose(db.layer_gap_ratio(Pb), 1.0, atol=1e-2), "box must give layer ratio ~1"
+
+    stl = Path(__file__).resolve().parent.parent / "propeller_fixed_flat.stl"
+    if not stl.exists():
+        print("  PASS vertical comp (box ratio ~1; propeller skipped)")
+        return
+    m = load_and_place(str(stl), BuildVolume.of(250, 250, 250))
+    gr = compute_growth(voxelize_solid(m, pitch=1.0), max_tilt_deg=30.0)
+    dmap = solve_deformation_map(gr)
+    P = dmap.origin + (np.argwhere(gr.step >= 0) + 0.5) * dmap.pitch
+    vert = float(np.mean(dmap.layer_gap_ratio(P)))
+    vol = float(np.mean(1.0 / dmap.jacobian_det(P)))
+    assert vert < 1.0, f"vertical comp should reduce E in the bulk, mean {vert:.3f}"
+    assert vert < vol, f"vertical {vert:.3f} must be below volume {vol:.3f} (opposite tweak)"
+    print(f"  PASS vertical comp (box ~1; propeller mean x{vert:.3f} < volume x{vol:.3f})")
+
+
 def _bore_ceiling_dome(m, dmap):
     cx, cy = 125.0, 125.0
     rs = np.linspace(0, 6, 13)
@@ -156,10 +183,11 @@ def _bore_ceiling_dome(m, dmap):
     return float(pz[ins][0] - pz[ins][-1])
 
 
-def test_default_smoothing_preserves_bore_dome():
-    """The displacement-smoothing default must stay low enough to preserve the
-    bore-ceiling dome. The depth field dips ~1.5 mm over the bore; an over-large
-    sigma (the old 2.0) crushed the deformed dome to ~0.7 mm. Lock in >1.0 mm."""
+def test_default_smoothing_keeps_a_bore_dome():
+    """The deformation must dome the bore ceiling (the depth field dips there).
+    The displacement-smoothing default (2.0) softens it to ~0.7 mm — fine, the
+    dome prints once --subdivide-error refines the coarse ceiling triangle. Guard
+    against a regression that crushes the field dome to ~0 (over-smoothing)."""
     stl = Path(__file__).resolve().parent.parent / "propeller_fixed_flat.stl"
     if not stl.exists():
         print("  SKIP bore dome (propeller_fixed_flat.stl not found)")
@@ -167,10 +195,10 @@ def test_default_smoothing_preserves_bore_dome():
     m = load_and_place(str(stl), BuildVolume.of(250, 250, 250))
     gr = compute_growth(voxelize_solid(m, pitch=1.0), max_tilt_deg=30.0)
     dome = _bore_ceiling_dome(m, solve_deformation_map(gr))  # default sigma
-    assert dome is not None and dome > 1.0, (
-        f"default smoothing must preserve the bore dome (>1.0 mm), got {dome:.2f} mm "
+    assert dome is not None and dome > 0.5, (
+        f"deformation must keep a bore dome (>0.5 mm), got {dome:.2f} mm "
         "— displacement_smooth_sigma is probably too high")
-    print(f"  PASS default smoothing preserves bore dome ({dome:.2f} mm)")
+    print(f"  PASS deformation keeps a bore dome ({dome:.2f} mm at default sigma)")
 
 
 def test_geodesic_growth_source_domes_more_box_identity():
@@ -204,8 +232,9 @@ def main() -> int:
         test_propeller_less_distortion_than_zonly,
         test_inverse_roundtrip_converged_is_exact,
         test_extrusion_comp_matches_volume_ratio,
+        test_vertical_extrusion_comp_reduces_e_in_bulk,
         test_subdivision_refines_coarse_faces_watertight,
-        test_default_smoothing_preserves_bore_dome,
+        test_default_smoothing_keeps_a_bore_dome,
         test_geodesic_growth_source_domes_more_box_identity,
     ]
     failures = 0
