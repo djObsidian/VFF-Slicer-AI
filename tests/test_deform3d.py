@@ -156,6 +156,23 @@ def _bore_ceiling_dome(m, dmap):
     return float(pz[ins][0] - pz[ins][-1])
 
 
+def test_default_smoothing_preserves_bore_dome():
+    """The displacement-smoothing default must stay low enough to preserve the
+    bore-ceiling dome. The depth field dips ~1.5 mm over the bore; an over-large
+    sigma (the old 2.0) crushed the deformed dome to ~0.7 mm. Lock in >1.0 mm."""
+    stl = Path(__file__).resolve().parent.parent / "propeller_fixed_flat.stl"
+    if not stl.exists():
+        print("  SKIP bore dome (propeller_fixed_flat.stl not found)")
+        return
+    m = load_and_place(str(stl), BuildVolume.of(250, 250, 250))
+    gr = compute_growth(voxelize_solid(m, pitch=1.0), max_tilt_deg=30.0)
+    dome = _bore_ceiling_dome(m, solve_deformation_map(gr))  # default sigma
+    assert dome is not None and dome > 1.0, (
+        f"default smoothing must preserve the bore dome (>1.0 mm), got {dome:.2f} mm "
+        "— displacement_smooth_sigma is probably too high")
+    print(f"  PASS default smoothing preserves bore dome ({dome:.2f} mm)")
+
+
 def test_geodesic_growth_source_domes_more_box_identity():
     """'geodesic' growth source domes a bore ceiling more than 'bfs' (captures
     the detour around the hole) while keeping a flat box at identity."""
@@ -188,6 +205,7 @@ def main() -> int:
         test_inverse_roundtrip_converged_is_exact,
         test_extrusion_comp_matches_volume_ratio,
         test_subdivision_refines_coarse_faces_watertight,
+        test_default_smoothing_preserves_bore_dome,
         test_geodesic_growth_source_domes_more_box_identity,
     ]
     failures = 0

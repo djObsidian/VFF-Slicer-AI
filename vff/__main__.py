@@ -230,9 +230,11 @@ def main(argv: list[str] | None = None) -> int:
         help="Max nozzle tilt from vertical in degrees (default 30). Set at startup, not changed dynamically.",
     )
     parser.add_argument(
-        "--smooth-sigma", type=float, default=2.0,
-        help="Gaussian sigma (in voxels) applied to the depth field before deformation/surfaces "
-             "(default 2.0). Lower = stronger / sharper deformation; higher = smoother but weaker.",
+        "--smooth-sigma", type=float, default=None,
+        help="Gaussian sigma (in voxels). Mode-dependent default: 3d smooths the "
+             "DISPLACEMENT field (default 0.5 — keep low or it crushes real "
+             "curvature like a bore-ceiling dome); z-only smooths the DEPTH field "
+             "(default 2.0). Lower = sharper deformation; higher = smoother but weaker.",
     )
     parser.add_argument(
         "--depth-method", choices=["vectors", "fmm", "dijkstra"], default="vectors",
@@ -384,6 +386,13 @@ def main(argv: list[str] | None = None) -> int:
              "this one will.",
     )
     args = parser.parse_args(argv)
+
+    # --smooth-sigma means different things per mode and wants different
+    # defaults: 3d smooths the DISPLACEMENT field (keep LOW — 0.5 — or the
+    # dome gets crushed); z-only smooths the DEPTH field (2.0). Resolve here so
+    # both --export and the inverse pick the same value.
+    if args.smooth_sigma is None:
+        args.smooth_sigma = 0.5 if args.deform_mode == "3d" else 2.0
 
     # Fast path: --gcode-in + (--conform-to | --clip-to) needs neither a build
     # volume nor the positional STL (depth field is bypassed). Skip the

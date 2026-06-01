@@ -190,7 +190,7 @@ def _geodesic_direction_field(growth: GrowthResult, sigma: float, max_tilt_deg: 
 def solve_deformation_map(
     growth: GrowthResult,
     *,
-    displacement_smooth_sigma: float = 2.0,
+    displacement_smooth_sigma: float = 0.5,
     growth_source: str = "bfs",
     max_tilt_deg: float = 30.0,
     eps: float = 1e-6,
@@ -332,15 +332,14 @@ def solve_deformation_map(
         idx = distance_transform_edt(outside, return_distances=False, return_indices=True)
         U[outside] = U[idx[0], idx[1], idx[2]][outside]
 
-    # Smooth the displacement field. The raw Φ is C0 (trilinear on the voxel
-    # grid), so densely-sampled gcode hits a ~pitch-scale facet on every cell
-    # boundary → visible surface waviness (~0.1 mm at pitch=1), and the sharp
-    # per-voxel inconsistencies make the map fold (non-injective tips → Newton
-    # spikes). Gaussian-smoothing U makes Φ ~C1: at sigma=2 the propeller's
-    # waviness drops 110→13 µm AND non-convergence 5%→0% (the map becomes
-    # globally injective). Trades a little straightening fidelity for a far
-    # smoother, invertible map. MUST match between the sliced export and the
-    # inverse (it changes the deformation).
+    # Light Gaussian smoothing of the displacement field tames the sharp
+    # per-voxel inconsistencies that make the map fold (non-injective tips →
+    # Newton spikes): on the propeller it drops non-convergence ~5%→2% at
+    # sigma=0.5. But it ALSO blurs out real curvature — at sigma=2 a bore
+    # ceiling that should dome +1.5 mm gets crushed to +0.7 mm. So keep sigma
+    # LOW (default 0.5): it preserves the dome the depth field actually has
+    # while still suppressing most folds (the rest are caught by _despike_path).
+    # MUST match between the sliced export and the inverse (it changes Φ).
     if displacement_smooth_sigma > 0:
         from scipy.ndimage import gaussian_filter
         for c in range(3):
@@ -440,7 +439,7 @@ class BackTransform3D:
         volume_side: float = 250.0,
         pitch: float = 1.0,
         max_tilt_deg: float = 30.0,
-        smooth_sigma: float = 2.0,
+        smooth_sigma: float = 0.5,
         growth_source: str = "bfs",
         xy_center: tuple[float, float] | None = None,
     ) -> "BackTransform3D":
