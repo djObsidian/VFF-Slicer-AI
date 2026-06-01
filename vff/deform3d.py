@@ -205,6 +205,7 @@ def solve_deformation_map(
     displacement_smooth_sigma: float = 2.0,
     growth_source: str = "bfs",
     max_tilt_deg: float = 30.0,
+    bed_blend_height: float = 2.0,
     eps: float = 1e-6,
     rtol: float = 1e-7,
     maxiter: int = 5000,
@@ -356,6 +357,17 @@ def solve_deformation_map(
         from scipy.ndimage import gaussian_filter
         for c in range(3):
             U[..., c] = gaussian_filter(U[..., c], displacement_smooth_sigma, mode="nearest")
+
+    # Bed blend: ramp the displacement to ZERO at the plate so the first layers
+    # stay flat at their sliced height. Without it the deformation already tilts
+    # just above the pinned bed seeds (growth tilts under blades), so the
+    # inverse maps the sliced first layer to a varying — partly NEGATIVE —
+    # original Z and the nozzle digs into the bed. Identity at z=bed, full
+    # deformation above bed_blend_height (mirrors the Z-only path's bed_blend).
+    if bed_blend_height and bed_blend_height > 0:
+        bed_z = float(P[matrix][:, 2].min())
+        w = np.clip((P[:, :, :, 2] - bed_z) / bed_blend_height, 0.0, 1.0)
+        U *= w[..., None]
     phi = P + U
 
     # Trilinear-gradient Jacobian fields for the Newton inverse. np.gradient

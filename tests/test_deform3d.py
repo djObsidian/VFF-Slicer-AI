@@ -145,6 +145,28 @@ def test_subdivision_refines_coarse_faces_watertight():
           f"{len(fine.faces):,} faces, watertight {fine.is_watertight})")
 
 
+def test_bed_blend_keeps_near_bed_identity():
+    """Bed blend: the map must be ~identity near the plate, so sliced first
+    layers stay flat and the inverse never pushes them below z=0 (nozzle into
+    the bed). Without it the deformation tilts right above the pinned seeds."""
+    stl = Path(__file__).resolve().parent.parent / "propeller_fixed_flat.stl"
+    if not stl.exists():
+        print("  SKIP bed blend (propeller_fixed_flat.stl not found)")
+        return
+    m = load_and_place(str(stl), BuildVolume.of(250, 250, 250))
+    gr = compute_growth(voxelize_solid(m, pitch=1.0), max_tilt_deg=30.0)
+    dmap = solve_deformation_map(gr)  # default bed_blend_height
+    P = dmap.origin + (np.argwhere(gr.step >= 0) + 0.5) * dmap.pitch
+    bed_z = float(P[:, 2].min())
+    near = P[:, 2] < bed_z + 0.6                        # ~first layers above the plate
+    dz = np.abs(dmap.forward_points(P[near])[:, 2] - P[near, 2])
+    assert dz.max() < 0.2, f"near-bed map must stay ~identity, max |dz| {dz.max():.3f} mm"
+    bed = P[:, 2] < bed_z + 0.1                         # the pinned seed layer
+    bedz = float(np.abs(dmap.forward_points(P[bed])[:, 2] - P[bed, 2]).max())
+    assert bedz < 0.05, f"the plate itself must be pinned, got {bedz:.4f} mm"
+    print(f"  PASS bed blend (near-bed |dz| max {dz.max():.3f} mm, plate {bedz:.4f} mm)")
+
+
 def test_vertical_extrusion_comp_reduces_e_in_bulk():
     """3-axis 'vertical' comp = layer-gap ratio ∂orig_z/∂def_z. A flat box (no
     deformation) gives ratio 1 (no comp); on the propeller the layers compress
@@ -232,6 +254,7 @@ def main() -> int:
         test_propeller_less_distortion_than_zonly,
         test_inverse_roundtrip_converged_is_exact,
         test_extrusion_comp_matches_volume_ratio,
+        test_bed_blend_keeps_near_bed_identity,
         test_vertical_extrusion_comp_reduces_e_in_bulk,
         test_subdivision_refines_coarse_faces_watertight,
         test_default_smoothing_keeps_a_bore_dome,
