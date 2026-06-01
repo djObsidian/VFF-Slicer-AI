@@ -69,13 +69,15 @@ def _run_gcode_transform(args, stl_path: Path, x: float, y: float, z: float) -> 
             f"  volume       : {x:.0f}x{y:.0f}x{z:.0f} mm\n"
             f"  pitch        : {args.pitch} mm\n"
             f"  max-tilt     : {args.max_tilt} deg\n"
+            f"  smooth-sigma : {args.smooth_sigma} (must match the export)\n"
             f"{align_info}"
             f"  subdiv-mm    : {args.subdiv_mm} mm",
             flush=True,
         )
         bt3 = BackTransform3D.from_mesh(
             str(stl_path), volume_side=max(x, y, z), pitch=args.pitch,
-            max_tilt_deg=args.max_tilt, xy_center=xy_center,
+            max_tilt_deg=args.max_tilt, smooth_sigma=args.smooth_sigma,
+            xy_center=xy_center,
         )
         backtransform_gcode_file(
             args.gcode_in, out_path, bt3,
@@ -182,12 +184,12 @@ def _run_3d_export(args, stl_path: Path, x: float, y: float, z: float) -> int:
     print(
         f"Full-3D deform export: {stl_path} -> {args.export}\n"
         f"  volume {x:.0f}x{y:.0f}x{z:.0f} mm, pitch {args.pitch} mm, "
-        f"max-tilt {args.max_tilt} deg",
+        f"max-tilt {args.max_tilt} deg, smooth-sigma {args.smooth_sigma}",
         flush=True,
     )
     vg = voxelize_solid(mesh, pitch=args.pitch)
     gr = compute_growth(vg, max_tilt_deg=args.max_tilt)
-    dmap = solve_deformation_map(gr)
+    dmap = solve_deformation_map(gr, displacement_smooth_sigma=args.smooth_sigma)
     dm = deform_mesh_3d(mesh, dmap)
     dm.export(args.export)
     vr = (dm.volume / mesh.volume) if mesh.volume > 0 else 0.0
@@ -231,8 +233,11 @@ def main(argv: list[str] | None = None) -> int:
              "tilted layers. '3d': full straightening — a Poisson/ARAP map that "
              "rotates the growth direction to vertical, moving ALL axes (preserves "
              "in-plane distances, much better volume; see vff/deform3d.py). 3d "
-             "ignores --dz-per-layer/--dz-auto-fit/--smooth-sigma/--depth-method. "
-             "Note: the interactive viewer is z-only regardless.",
+             "uses --smooth-sigma (Gaussian smoothing of the displacement field "
+             "— removes voxel-scale surface waviness and makes the map injective; "
+             "MUST match between --export and the inverse) but ignores "
+             "--dz-per-layer/--dz-auto-fit/--depth-method. Note: the interactive "
+             "viewer is z-only regardless.",
     )
     parser.add_argument(
         "--export", metavar="PATH",
