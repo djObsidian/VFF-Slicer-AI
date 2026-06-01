@@ -1,585 +1,165 @@
 # VFF Slicer
 
-Препроцессор + постпроцессор для непланарной 3D-печати на 3-осевых FDM-принтерах.
-Берёт STL, строит **векторное поле направлений роста** изнутри модели и
-переводит планарный g-code обычного слайсера (PrusaSlicer, Cura, …) в g-code
-с криволинейными слоями, повторяющими форму поверхности.
+Non‑planar slicing pre/post‑processor for **3‑axis FDM printers**. It takes an
+STL, builds a **growth‑direction field** inside the model, deforms the mesh so
+its natural layers become flat, lets an ordinary planar slicer (PrusaSlicer,
+Cura, …) cut it, and then transforms that planar G‑code back into **curved
+layers that follow the part's shape** — no stair‑stepping on curved tops, and
+overhangs that print without support.
 
-> **Статус: чёрный эксперимент.** Концепция деформации работает для умеренно
-> кривых моделей, но не самовывозящий слайсер. Тонкие лопасти и
-> самопересечения курса требуют ручного подбора параметров. Текущий
-> "пропеллер из коробки" печатается похожим на пропеллер, но с заметными
-> артефактами на кончиках. См. [Ограничения](#ограничения-и-открытые-задачи).
+🇷🇺 [Русская версия — README_ru.md](README_ru.md) ·
+🛠 [Internals & full reference — ARCHITECTURE.md](ARCHITECTURE.md)
 
----
-
-## Зачем
-
-Обычный слайсер режет модель горизонтальными плоскостями. На изогнутых
-верхних поверхностях получается грубый лестничный эффект:
-
-```
-        идеал                       планарная нарезка
-       ╱────╲                          ┌──┬──┐
-      ╱      ╲                       ┌─┘  └  └─┐
-     ╱        ╲                     ┌┘         └┐
-    ╱          ╲                    └───────────┘
-   ╱────────────╲                ╰── ступеньки ──╯
-```
-
-Решение «non-planar slicing»: вместо плоских слоёв печатать
-**слои, повторяющие форму верхней поверхности**. На 5-осевых принтерах сопло
-наклоняется. На 3-осевом сопло вертикально, но Z может меняться по ходу
-G1-движения, и пока угол модели к вертикали не слишком велик, материал
-ложится приемлемо. Допустимый угол и есть `--max-tilt` в этом проекте.
-
-VFF делает это в две стороны:
-
-| Направление | Вход | Выход | Применение |
-|-------------|------|-------|------------|
-| `forward`   | планарный g-code для плоскодонной версии меша | непланарный g-code для оригинала | "напечатать пропеллер с кривым дном из gcode для пропеллера-с-плоским-дном" |
-| `inverse`   | планарный g-code для УЖЕ деформированного меша  | g-code в координатах оригинала | "слайсер срезает наш деформированный STL плоско, мы возвращаем плоские слои в кривые" |
+> **Status: experimental.** The deformation pipeline is validated end‑to‑end on
+> real sliced G‑code (the inverse puts 98.7 % of the toolpath back inside the
+> original shape), and a real print is in progress. It is not a one‑click
+> slicer: thin features and self‑intersecting meshes still need manual tuning.
+> See [Limitations](#limitations--backlog).
 
 ---
 
-## Установка
+## Installation
 
-Python 3.10+, Windows / Linux / macOS. Зависимости объявлены в
-[`pyproject.toml`](pyproject.toml) — ставится одной командой в venv:
+Python 3.10+, Windows / Linux / macOS. Dependencies are declared in
+[`pyproject.toml`](pyproject.toml):
 
 ```bash
 python -m venv .venv
 # Windows:  .venv\Scripts\activate      Linux/macOS:  source .venv/bin/activate
 
-pip install -e .            # ядро: пайплайн деформации + g-code (headless)
-pip install -e .[viewer]    # + интерактивный PyVista-вьювер / preview / section
-pip install -e .[all]       # + вьювер + FMM-метод глубины (scikit-fmm)
+pip install -e .            # core: deformation + G-code pipeline (headless)
+pip install -e .[viewer]    # + interactive PyVista viewer / preview / section
+pip install -e .[all]       # + viewer + FMM depth method (scikit-fmm)
 ```
 
-Editable-установка (`-e`) ещё и регистрирует команду `vff`, так что можно
-`vff propeller.stl ...` вместо `python -m vff propeller.stl ...`.
+The editable install also registers a `vff` command, so you can run
+`vff model.stl …` instead of `python -m vff model.stl …`.
 
-Кто не любит editable — есть [`requirements.txt`](requirements.txt) с ядром:
-`pip install -r requirements.txt`.
-
-Заметки по зависимостям:
-- **Ядро** (`numpy scipy trimesh rtree embreex`) ставится колёсами даже на
-  свежий Python (проверено на 3.14). `embreex` (поддерживаемый форк pyembree)
-  даёт быстрый рейкаст — критично для `mesh.contains` на сотнях тысяч точек.
-- **Вьювер** (`pyvista`+`vtk`) вынесен в extra `[viewer]`, потому что колёса
-  vtk отстают от новых релизов Python. Headless-пути (`--export`,
-  `--gcode-in`, `--deform-mode 3d`) его НЕ требуют.
-- `scikit-fmm` нужен только для `--depth-method fmm`; дефолтные `vectors` и
-  `dijkstra` обходятся одним `scipy`.
+The **core** (`numpy scipy trimesh rtree embreex`) installs from wheels even on
+brand‑new Python (tested on 3.14). The **viewer** (`pyvista`+`vtk`) is optional
+because vtk wheels lag new Python releases — the headless paths (`--export`,
+`--gcode-in`, `--deform-mode 3d`) never import it.
 
 ---
 
-## Быстрый старт
+## Usage
 
-**Интерактивный просмотрщик** (воксели, рост, векторы, depth-поверхность,
-деформированный меш — переключение хоткеями):
-
-```bash
-python -m vff propeller.stl
-```
-
-Хоткеи: `M` mesh · `V` voxel-shell · `B` re-voxel · `G` growth · `C` voxels ·
-`N` vectors · `H` surface · `D` deformed · `O` export · `F5` reset cam ·
-`[`/`]` — pitch.
-
-**Экспорт деформированного STL** (на нём потом слайсит PrusaSlicer):
+The main workflow is the **full‑3D pipeline** (`--deform-mode 3d`). Three steps —
+deform → slice → un‑deform:
 
 ```bash
-python -m vff propeller.stl --export deformed.stl --no-viewer
-```
+# 1. Export the deformed mesh. --subdivide-error refines coarse flat regions
+#    (e.g. a bore ceiling) so they can actually bow with the deformation.
+vff part.stl --deform-mode 3d --max-tilt 30 --subdivide-error 0.1 \
+    --export deformed.stl --no-viewer
 
-**Преобразование g-code** (главный пайплайн): PrusaSlicer срезал
-`deformed.stl` планарно → возвращаем плоские слои в координаты propeller.stl:
+# 2. Slice deformed.stl in PrusaSlicer / Cura.
+#    IMPORTANT: relative extrusion (M83), model centered on the bed.
 
-```bash
-python -m vff propeller.stl --gcode-in deformed.gcode --gcode-out result.gcode \
+# 3. Un-deform the planar G-code back into the original part's coordinates.
+#    Reuse the SAME map flags you exported with (see the warning below).
+vff part.stl --deform-mode 3d --max-tilt 30 \
+    --gcode-in deformed.gcode --gcode-out result.gcode \
     --gcode-direction inverse --subdiv-mm 0.5
+
+# Preview the result (PrusaSlicer's own preview can't show non-planar layers):
+vff.preview result.gcode        #  E = toggle extrusion,  T = toggle travel
 ```
 
-> **Важно про dz в inverse.** `inverse` обязан разворачивать **ту же**
-> деформацию, что сделала `deformed.stl`. Экспорт выше шёл с дефолтным
-> `dz_per_layer = pitch`, поэтому inverse тоже должен идти с дефолтным dz —
-> **не** `--dz-auto-fit` (это forward-приём: он подбирает dz из размеров, и
-> для inverse даст другой dz → слои лягут мимо). Если экспортировал с явным
-> `--dz-per-layer X`, передай тот же `X` и в inverse. `--dz-auto-fit` уместен
-> только для `forward` (когда деформируешь свежий планарный g-code плоской
-> версии).
+> ⚠️ **Every flag that shapes the deformation map must be identical on the
+> export and the inverse:** `--max-tilt`, `--pitch`, `--volume`,
+> `--smooth-sigma`, `--growth-source`. Otherwise the inverse map won't match
+> the mesh that was sliced and the layers land in the wrong place.
 
-**Просмотр получившегося g-code** (превью PrusaSlicer не показывает
-непланарные слои — нужен свой):
+### Key flags
 
-```bash
-python -m vff.preview result.gcode
-```
+| Flag | What it does |
+|---|---|
+| `--max-tilt DEG` | **Main knob.** Max nozzle tilt from vertical the head can print at — depends on your hotend/fan shape. `20` bulky head · `30` default · `45` compact/pointed nozzle (stronger non‑planarity). |
+| `--subdivide-error MM` | (export only) Uniformly refine the mesh until the worst per‑face deformation error drops below this, so flat regions built from few large triangles actually bow. Try `0.1`. Off by default; the export prints a hint when it's needed. |
+| `--extrusion-comp-mode` | `vertical` (default, 3‑axis): rescale E by the layer‑height squish — correct for a fixed‑width vertical nozzle. `volume`: rescale by `1/det` (material‑conservative, for 4/5‑axis like S4). `--no-extrusion-comp` disables. |
+| `--pitch MM` | Voxel size (default 1.0). Smaller = finer field, more RAM. |
+| `--smooth-sigma N` | Displacement smoothing in voxels (default 2.0). Higher = smoother mesh / fewer folds, softer domes; lower = sharper. |
+| `--growth-source` | `bfs` (default) or `geodesic` (domes hole‑ceilings more but distorts thin features globally — not recommended for parts with blades). |
 
-`E` — тогглить экструзии, `T` — travel.
+The interactive viewer (`vff part.stl`, no flags) shows voxels / growth field /
+deformed mesh by hotkey, but currently visualizes the **Z‑only** legacy map.
 
 ---
 
-## Алгоритм деформации
+## How it works & why
 
-Шесть шагов: voxelize → BFS growth → vector field → depth field → smoothing →
-forward/inverse map.
+A normal slicer cuts the model with horizontal planes. On a curved top surface
+that leaves a coarse staircase. Non‑planar slicing instead lays down **layers
+that follow the surface**. On a 5‑axis machine the nozzle tilts; on a 3‑axis
+machine the nozzle stays vertical but Z varies along each move, and as long as
+the surface angle stays under a limit (`--max-tilt`) the bead bonds fine.
 
-### Шаг 1. Воксельная заливка (`vff/voxelize.py`)
-
-Модель кладётся в build volume, нормализуется по Z (`Z_min = 0`, дно
-прилегает к столу) и заливается сплошными вокселями с шагом `pitch`
-(по умолчанию 1 мм). `trimesh.contains` + embree → быстро.
-
-```
-вид сбоку, шаг pitch=1 мм
-
-         ▄▄▄▄▄▄▄
-        ▐  STL  ▌
-        ▐       ▌
-         ▀▀▀▀▀▀▀
-─────────────────────  стол z=0
-
-воксели после заливки:
-
-    Z
-    ▲
-  4 │       ░░░░░          (внутри меша = 1, снаружи = 0)
-  3 │     ░░░░░░░░░
-  2 │    ░░░░░░░░░░░
-  1 │   ░░░░░░░░░░░░░
-  0 │  ░░░░░░░░░░░░░░░   ← bed-seed layer
-    └──────────────────► X
-```
-
-Внутренние воксели на нижнем слое (Z=0) автоматически становятся **bed-seeds**
-для BFS.
-
-### Шаг 2. BFS-рост от стола (`vff/growth.py`)
-
-Из bed-seeds запускается 26-связный BFS по внутренним вокселям. Каждому
-вокселю присваивается **шаг роста** `step` — номер волны BFS, на котором он
-был достигнут.
+VFF gets there by **deform → slice → un‑deform**:
 
 ```
-Z
-▲   step =
-│     5  ░░░░░░░░░░░             (тонкая верхушка)
-│     4  ░░░░░░░░░░░░░
-│     3  ░░░░░░░░░░░░░░░
-│     2  ░░░░░░░░░░░░░░░░░
-│     1  ░░░░░░░░░░░░░░░░░░░
-│     0  ░░░░░░░░░░░░░░░░░░░░░   (bed seeds)
-└──────────────────────────────► X
+ original ──deform──▶ deformed mesh ──planar slice──▶ planar G-code
+   part      (layers              (a normal slicer)        │
+            flattened)                                     │ inverse
+                                                           ▼
+                                          G-code in the ORIGINAL part's
+                                          coordinates — flat layers are now
+                                          the curved "growth" layers.
 ```
 
-Для модели с плоским дном `step ≈ z / pitch` — растёт линейно вверх. Для
-модели с кривым дном (типа лопасти пропеллера, оторванной от стола) BFS
-идёт **в обход**: от хаба под лопасть, потом вверх, и `step` у кончика
-лопасти оказывается больше его геометрического `z` (геодезическое
-расстояние от стола длиннее евклидового).
+1. **Growth field.** Fill the model with voxels and "grow" upward from the bed
+   like sediment. Every point gets a local *build direction* (which way is up
+   for printing here); its level surfaces are the natural layers.
+2. **Deform (the 3D map).** Rotate every little chunk so its build direction
+   points straight up, and stitch them back together (an ARAP / Poisson solve).
+   All three axes move, so in‑plane distances are preserved instead of sheared.
+   The result: the natural layers become flat horizontal planes.
+3. **Slice** the deformed mesh with any planar slicer.
+4. **Un‑deform** the G‑code (a fast vectorised Newton inverse of the map): the
+   flat slicer layers become the original curved layers when printed.
 
-### Шаг 3. Векторное поле направлений + tilt-clamp (`vff/growth.py`)
+Three practical pieces make the result printable on a 3‑axis machine:
 
-Из каждого вокселя смотрим на 26 соседей. Среди тех, чей `step < мой step`
-(то есть "ниже по росту"), выбираем тех, кто на **минимальном** step.
-**Среднее направление от меня к этим соседям, с обратным знаком**, даёт
-направление "куда растёт материал" в этой точке.
+- **Tilt clamp (`--max-tilt`)** keeps the layers within the angle a vertical
+  nozzle can actually print.
+- **Bed blend** holds the first couple of millimetres at identity so the first
+  layers stay flat on the plate (no digging in).
+- **Extrusion compensation** rescales E for the layer‑height change — the
+  vertical nozzle has a fixed road width, so what matters is how the layer
+  *spacing* compresses/stretches, not the full volume (the default `vertical`
+  mode; `volume` is the 4/5‑axis choice).
 
-```
-        ▲ growth_dir (среднее от соседей с min step)
-        │
-        │
-   ┌────┼────┐
-   │ 3  │ 3  │       ← мои соседи на меньшем step
-   ├────┼────┤
-   │ 4 .│me=5│       ← я
-   └────┴────┘
-```
+On the test propeller the 3D map preserves in‑plane distance ~3× better than a
+naive Z‑only shift (edge‑length CoV 0.044 vs 0.148), keeps 96 % of the volume,
+and is invertible to ~0.0001 mm on 97 %+ of points.
 
-После этого направление **зажимается** к вертикали: проекция на горизонтальную
-плоскость делится так, чтобы угол к +Z был не больше `--max-tilt` градусов
-(по умолчанию 30°). Это сопло 3-осевого принтера — больше наклонить нельзя
-без коллизий или отрыва.
-
-```
-   до clamp:           после clamp (max-tilt=30°):
-
-   ↗ 45°                ↗ 30°  (укоротили горизонталь)
-   │                     │
-```
-
-### Шаг 4. Depth field — геодезическое расстояние от стола (`vff/deform.py`)
-
-Поле `step` дискретно. Нам нужно гладкое поле "глубины материала от стола"
-для деформации. Три варианта (`--depth-method`):
-
-- **vectors** (default): интегрирует **зажатое** (tilt-clamp) векторное поле
-  роста в скалярный потенциал φ (МНК-Пуассон, см. `integrate_vectors_to_potential`).
-  Изоповерхности φ перпендикулярны направлению роста, поэтому ограничение
-  наклона сопла **реально формирует слои**. Это и есть основной метод.
-- **FMM** (`scikit-fmm`): решает уравнение Эйконала `|∇φ| = 1` с φ=0 на
-  bed-seeds. C¹-гладко, но игнорирует clamp (идёт по сырой геодезике).
-- **Dijkstra**: дискретный кратчайший путь по графу вокселей. C⁰, дешевле, но
-  с гребешками на изоповерхностях; тоже игнорирует clamp.
-
-Результат — `depth(x, y, z)` ∈ ℝ⁺ для каждого вокселя внутри меша. Для
-вокселей снаружи модели (но в build volume) используется `outside_mode="extend"`
-— ближайшее значение изнутри (через `distance_transform_edt`). Это критично:
-без расширения наружу деформация рвёт меш на границах.
-
-```
-depth-поле, изолинии (как горизонтали на топокарте):
-
-  Z ▲
-    │  ─── 18 ────
-    │ ── 14 ───────
-    │── 10 ─────────
-    │─ 6 ──────────────
-    │ 2 ──────────────────
-    └────────────────────► X
-    стол z=0, depth=0 на bed-seeds
-```
-
-Для модели с плоским дном изолинии параллельны столу: `depth ≈ z`. Для
-пропеллера изолинии **выгибаются вокруг лопастей** — потому что BFS под
-лопастью шёл в обход, depth там больше.
-
-### Шаг 5. Сглаживание
-
-Gaussian blur (`--smooth-sigma`, по умолчанию 2.0 вокселей) для устранения
-ступенек BFS на тонких деталях. Большая sigma → плавнее, но слабее
-деформация; маленькая → острее, но рваные кончики.
-
-### Шаг 6a. Forward map — оригинал → деформированный
-
-Формула (`BackTransform.forward_points_batch`):
-
-```
-w     = clip((z - bed_z) / blend_h, 0, 1)
-new_z = (1 - w) * z  +  w * (depth(x, y, z) * dz_per_layer + bed_z)
-new_x = x
-new_y = y
-```
-
-`w` плавно вводит деформацию выше `bed_blend_height` (по умолчанию 2·pitch),
-чтобы первые слои у стола оставались плоскими (адгезия).
-
-```
-Forward на одной XY-колонке (вид сбоку):
-
-   до             после forward
-   ▲ z            ▲ z
-   │              │  *  ← тонкая лопасть подтянута выше
- 5 │ ●            │  |
- 4 │ ●            │  *  ← хаб ровный (depth≈z)
- 3 │ ●            │ /
- 2 │ ●            │/
- 1 │ ●            *
- 0 │ ●━━━━bed━━━━━●
-   └─────► z      └─────► new_z
-```
-
-Чем больше `dz_per_layer`, тем сильнее растягивает по Z в зонах, где BFS шёл
-в обход (под лопастями, в карманах). `--dz-auto-fit` подбирает его так, чтобы
-максимальное `depth * dz` равнялось Z-размеру меша (кончик лопасти попадает
-ровно на свою натуральную высоту).
-
-### Шаг 6b. Inverse map — деформированный → оригинал
-
-Решаем уравнение forward относительно `z` при фиксированных `new_x, new_y, new_z`.
-Реализация — векторизованный 1D-root-find по колонке depth-поля
-(`BackTransform.invert_points_batch`):
-
-1. Для каждой точки `(x_def, y_def, z_def)` билинейно сэмплируем колонку
-   depth-поля на `(x_def, y_def)`: получаем массив `depth(z)` по всем
-   высотам сетки.
-2. Считаем `f(z) = (1-w(z))·z + w(z)·(depth(z)·dz + bed)` по всем z.
-3. Через `argmax(above_threshold)` находим первый индекс `k`, где
-   `f(z_k) ≥ z_def`, и линейно интерполируем между `(z_{k-1}, f_{k-1})` и
-   `(z_k, f_k)`. Это даёт `z_orig`.
-
-Векторизовано через NumPy, ~700k точек обрабатывает за ~0.5 с в одном
-процессе. Для >5M точек включается multiprocessing (Windows spawn).
+The deeper math (BFS growth, the vector→potential integration, the 3‑coordinate
+Poisson solve, the G‑code passes) lives in
+[ARCHITECTURE.md](ARCHITECTURE.md).
 
 ---
 
-## Полная 3D-деформация (`--deform-mode 3d`)
+## Limitations & backlog
 
-Z-only карта выше **выпрямляет поверхности роста в плоскости, но замораживает
-XY** — на наклонных слоях это сдвигает боковые расстояния (проекция наклонной
-поверхности на горизонталь сжимает её на `cos(tilt)`). Правильнее двигать
-**все три оси**: повернуть локальный кадр так, чтобы направление роста стало
-вертикальным, тогда поверхности роста ложатся в горизонтальные плоскости
-*без* бокового искажения.
+- **Adaptive remeshing.** `--subdivide-error` is uniform → heavy (the propeller
+  goes 35k → 562k faces). A conforming adaptive remesh (Rivara longest‑edge
+  bisection) would reach the same quality at ~15× fewer faces without cracks.
+- **Tip non‑convergence** (~2 %, caught by a despike pass) — the map folds
+  under steep overhangs; mitigate with a smaller `--max-tilt`.
+- **Targeted cavity domes.** The default already domes a bore ceiling well;
+  `--growth-source geodesic` domes more but distorts thin features globally.
+  Doing geodesic *only* around internal cavities (detect "void wrapped by solid
+  on all sides" vs "open to the outside") would give the best of both.
+- **Self‑intersecting / non‑manifold input** needs repair before voxelization.
+- **Real FDM printing** of the output is being validated now; treat results as
+  experimental.
 
-Это реализовано в [`vff/deform3d.py`](vff/deform3d.py) — обобщение
-`integrate_vectors_to_potential` с 1 скаляра на 3 координаты (тот же Лапласиан):
-
-1. На каждый воксель — поворот `R_i`, переводящий (зажатое) направление роста
-   `ĝ_i → +ẑ` (тождество там, где рост уже вертикален).
-2. На каждое 26-связное ребро `(i,j)` — целевой сдвиг `t_ij = R̄_ij·(p_j − p_i)`,
-   `R̄ = ½(R_i+R_j)`.
-3. МНК `‖Φ_j − Φ_i − t_ij‖²` по всем рёбрам → нормальные уравнения `L·Φᶜ = bᶜ`
-   на каждую координату (Лапласиан общий). Решается **через смещение**
-   `U = Φ − P` с пиннингом дна `U=0` (иначе penalty к абсолютным ~125 мм
-   раздувает RHS и CG врёт про сходимость).
-
-**Прямая карта** — трилинейная выборка `Φ`. **Обратная** — векторизованный
-Ньютон по `Φ` с предпосчитанным якобианом (`q → p`, `Φ(p)=q`).
-
-**Сглаживание (`--smooth-sigma`, для 3d по умолчанию 0.5).** Гауссово
-сглаживание поля смещений `U` гасит резкие повоксельные несогласованности,
-из-за которых карта складывается на кончиках (Ньютон расходится → выбросы):
-на пропеллере несходимость падает ~5%→2% при sigma=0.5. **Но оно же размывает
-реальную кривизну** — при sigma=2 купол потолка выреза, который должен быть
-+1.5 мм (ровно просадка глубинного поля), сминается до +0.7 мм. Поэтому держим
-sigma **низким** (дефолт 0.5): купол сохраняется, складки в основном подавлены
-(остаток ловит despike). **Должно совпадать между экспортом и inverse** (как
-`dz` для Z-only).
-
-**Компенсация экструзии (`--extrusion-comp`, вкл по умолчанию).** Деформация
-локально сжимает/растягивает слои, поэтому `E` (посчитанный слайсером для
-деформированной геометрии) масштабируется. Два режима (`--extrusion-comp-mode`):
-- **`vertical`** (дефолт, **3 оси**): множитель = вертикальный зазор слоёв
-  `∂orig_z/∂def_z`. Сопло вертикально, ширина дорожки фиксирована соплом —
-  значит пере/недо-экструзию определяет **сжатие слоёв по высоте**, а не объём.
-  Снижает `E` там, где слои сжаты (на пропеллере в среднем ×0.93). Это и
-  чинит переэкструзию, которую давал объёмный режим.
-- **`volume`** (4/5 осей, как S4): множитель `1/det(JΦ)` — материал-
-  консервативно, верно когда сопло наклоняется и дорожка деформируется по всем
-  осям. На пропеллере в среднем ×1.05 — на ~12% и в другую сторону, чем vertical.
-
-Требует относительной экструзии (M83); абсолютную не трогает.
-
-Результаты на пропеллере (pitch=1, smooth-sigma=0.5) против Z-only:
-
-| | Z-only | 3D |
-|---|---|---|
-| Сохранение объёма (ratio) | 0.71 | **0.96** |
-| Боковое искажение (CoV длин рёбер) | 0.148 | **0.044** (×3 меньше) |
-| Купол потолка выреза | — | **+1.45 мм** (= просадка поля) |
-| Обратимость | 1D root-find | Ньютон, **~97.5%** точно (ост. ловит despike) |
-| Containment (inverse внутри оригинала) | — | **98.7%** на реально нарезанном g-code |
-
-### Использование (headless, без pyvista)
-
-`--max-tilt` — главный параметр под форму головы принтера (макс. наклон сопла
-к вертикали). **Важно: одни и те же `--max-tilt`, `--smooth-sigma`, `--pitch`
-должны стоять и на экспорте, и на inverse** — иначе обратная карта не совпадёт
-с той, что нарезали.
-
-```bash
-# 1) деформированный меш под слайсер (подставь свой --max-tilt)
-python -m vff propeller_fixed_flat.stl --deform-mode 3d --max-tilt 30 \
-    --export deformed_3d.stl --no-viewer
-
-# 2) нарезать deformed_3d.stl в PrusaSlicer/Cura. ВАЖНО: относительная
-#    экструзия (M83), центр модели = центр стола.
-
-# 3) развернуть g-code обратно в координаты оригинала (те же --max-tilt и др.)
-python -m vff propeller_fixed_flat.stl --deform-mode 3d --max-tilt 30 \
-    --gcode-in deformed_3d.gcode --gcode-out result.gcode \
-    --gcode-direction inverse --subdiv-mm 0.5
-```
-
-Примеры `--max-tilt` под голову:
-
-```bash
---max-tilt 20    # массивный хотэнд/обдув: щадящие слои, меньше риск коллизий
---max-tilt 30    # стандартная голова (по умолчанию)
---max-tilt 45    # компактное/острое сопло с зазором: сильнее непланарность
-```
-
-**Разрешение меша (`--subdivide-error`, для `--export`).** `Φ` применяется
-**к вершинам**, поэтому плоская зона из малого числа крупных треугольников
-(например потолок цилиндрического выреза) остаётся плоской вместо того чтобы
-выгнуться — у пропеллера это до 0.52 мм ошибки на рёбрах 7–13 мм. g-code
-плотный и инвертируется верно; кривой именно экспортируемый меш. Флаг
-равномерно подразбивает меш, пока худшая ошибка грани не упадёт ниже допуска
-(watertight сохраняется, без трещин):
-
-```bash
-python -m vff propeller_fixed_flat.stl --deform-mode 3d --subdivide-error 0.1 \
-    --export deformed_3d.stl --no-viewer      # 35k -> 562k граней, потолок гнётся
-```
-
-**Купола над отверстиями.** Глубинное поле над вырезом просаживается на ~1.5 мм
-(обход дырки), и при дефолтном `--smooth-sigma 0.5` деформация это **честно
-выпрямляет в купол +1.45 мм** — потолок выгибается как надо. (Раньше дефолт
-sigma=2 размывал купол вдвое — это была не проблема направлений, а пере-сглаживание.)
-Опция `--growth-source geodesic` строит направление из градиента геодезической
-глубины и даёт купол **ещё сильнее** (+2.6 мм), но это **глобальный размен**:
-поднимает искажение по всей модели и портит тонкие фичи (лопасти). Для деталей
-с тонкими элементами держи дефолт `bfs` — он и так хорошо пучит вырез.
-
-`3d` использует `--max-tilt`, `--smooth-sigma`, `--pitch`, `--growth-source`,
-`--extrusion-comp`, `--subdivide-error`; игнорирует
-`--dz-per-layer`/`--dz-auto-fit`/`--depth-method`. Интерактивный вьювер пока
-показывает только Z-only. **Все влияющие на карту флаги (`--max-tilt`,
-`--smooth-sigma`, `--growth-source`, `--pitch`) обязаны совпадать на экспорте и
-inverse.**
-
-**Статус.** Прямая карта, обратимость, компенсация экструзии и подразбивка
-провалидированы на реально нарезанном g-code (98.7% containment); реальная
-FDM-печать — следующий шаг.
-
-**Backlog / открытые задачи:**
-- **Адаптивный ремешинг.** `--subdivide-error` равномерный → дорогой (562k
-  граней). Конформная адаптивная подразбивка (Rivara longest-edge bisection)
-  даёт то же качество при ~15× меньшем числе граней (38k) без T-стыков/трещин —
-  правильное решение проблемы «миллиардов полигонов».
-- **Несходимость на самых кончиках** (~2%, ловит despike) — глобальная
-  неинъективность под нависаниями; лечится `--max-tilt` поменьше или чуть
-  бо́льшим `--smooth-sigma` (ценой купола).
-- **Точечный купол у полостей.** Дефолт `bfs` уже даёт купол выреза +1.45 мм.
-  `--growth-source geodesic` дал бы ещё больше, но глобально портит лопасти.
-  Сделать геодезику **локально только у внутренних полостей** (детектор
-  «пустота, обёрнутая материалом со всех сторон» vs «открытая наружу») — это
-  дало бы максимальный купол без жертв для лопастей. Открытая задача.
+A legacy **Z‑only** deformation (`--deform-mode z-only`, the default) and two
+G‑code‑only modes (`--conform-to`, `--clip-to`) also exist — see
+[ARCHITECTURE.md](ARCHITECTURE.md).
 
 ---
 
-## G-code пайплайн
+## License
 
-`BackTransform` + `backtransform_gcode_file()` в `vff/backtransform.py`:
-
-```
-g-code ───▶ Pass 1: parse  ──▶ список (units, xyz_def[N,3])
-                                            │
-                                            ▼
-              Pass 2: vectorized transform (forward или inverse)
-                                            │
-                                            ▼
-              Pass 3: stream-write новый g-code (формат сохранён)
-```
-
-**Pass 1 (parsing):**
-- Каждый G0/G1 с движением разбивается на N кусков длиной `<= subdiv_mm` (по
-  умолчанию 0.5 мм) — иначе прямой G1 в деформированном пространстве
-  превратится в кривой полилинию в оригинале, и её надо аппроксимировать
-  отрезками.
-- M82/M83 (absolute/relative E) и G92 отслеживаются.
-- Не-движения (комментарии, M-команды, …) сохраняются как `('raw', text)` и
-  пишутся без изменений.
-
-**Pass 2 (transform):**
-- Векторизованный numpy single-pass для <5M точек.
-- Multiprocessing (spawn pool) для больших файлов.
-
-**Pass 3 (write):**
-- Для каждого `('move', cmd, e_val, f_val, …)` пишет `n_pieces` G-строк,
-  раздавая исходное E пропорционально по длине куска (для M83) или
-  кумулятивно (для M82).
-
-### XY-выравнивание
-
-Слайсеры центрируют модель на свой стол (PrusaSlicer 220×220 → центр 110,110),
-а наш build volume — на 125,125. Если не выровнять, gcode будет на 30 мм мимо.
-
-`quick_gcode_xy_bounds()` делает быстрый предварительный проход, считает
-bbox **только экструзионных** G1 (травелы в углы стола игнорируются), берёт
-центр. Передаётся в `BackTransform.from_mesh(xy_center=...)`.
-
-### Альтернативные режимы (экспериментальные)
-
-Когда g-code для одного меша, а цель — напечатать **другой** меш с тем же
-футпринтом:
-
-- `--conform-to STL` — `new_z = z + H_bottom(x, y)`. Поднимает g-code на
-  величину нижней поверхности целевого STL (рейкаст снизу). Подходит, когда
-  целевой меш — тонкая «плёнка», лежавшая плашмя и поднятая на кривое
-  основание.
-- `--clip-to STL` — удаляет экструзию (G1 → G0) для точек снаружи
-  целевого STL. Подходит, когда g-code был порезан для «залитой» версии
-  (с плоским дном), а нужно напечатать только реальный (с кривым дном)
-  объём. Концы лопастей могут зависать в воздухе — это режим только для
-  визуальной верификации формы, не для реальной печати.
-
-Оба режима **не** используют depth-поле и значительно быстрее основного
-пайплайна.
-
----
-
-## CLI справка
-
-Главные флаги `python -m vff`:
-
-```
-позиционный: STL                  путь к STL (default ./propeller.stl)
-
-  --volume X x Y x Z              размер стола в мм (default 250x250x250)
-  --pitch FLOAT                   шаг вокселя в мм (default 1.0)
-  --max-tilt DEG                  максимальный наклон сопла (default 30°)
-  --smooth-sigma FLOAT            blur глубинного поля (default 2.0 вокс.)
-  --depth-method fmm|dijkstra     способ глубины (default fmm)
-
-  --export PATH                   сохранить деформированный меш
-  --no-viewer                     без интерактивного окна
-
-  --gcode-in PATH                 входной g-code
-  --gcode-out PATH                выходной (default <in>.nonplanar.gcode)
-  --gcode-direction forward|inverse
-                                  (default forward; inverse — если слайсер
-                                  резал уже деформированный меш)
-  --subdiv-mm FLOAT               дробление G1 в gcode (default 0.5 мм)
-  --dz-per-layer FLOAT            масштаб forward-карты (см. шаг 6a)
-  --dz-auto-fit                   подобрать dz так, чтобы Z-extent совпал
-  --no-gcode-align                не выравнивать depth-поле по gcode XY
-  --jobs N                        worker'ы для inverse (-1 = auto)
-
-  --conform-to STL                surface-offset режим (см. альтернативы)
-  --clip-to STL                   inside-mesh clip режим
-  --preview-gcode PATH            наложить gcode в viewer
-```
-
-Отдельный просмотрщик: `python -m vff.preview FILE.gcode [--volume ...]`.
-
----
-
-## Структура проекта
-
-```
-vff/
-├── __main__.py        CLI, оркестрация
-├── build_volume.py    BuildVolume — параметры стола, преобразования индексов
-├── mesh_io.py         load_and_place — загрузка STL + центровка
-├── voxelize.py        солидная воксельная заливка через trimesh.contains
-├── growth.py          BFS-рост + векторное поле + tilt-clamp
-├── deform.py          depth-field (vectors/FMM/Dijkstra), сглаживание, Z-only deform_mesh
-├── deform3d.py        полная 3D-деформация (Poisson/ARAP), Ньютон-инверсия, BackTransform3D
-├── backtransform.py   g-code forward/inverse + conform-to + clip-to
-├── viewer.py          интерактивный PyVista-viewer с хоткеями
-├── preview.py         standalone превью g-code
-└── gcode_preview.py   парсер g-code → (extrusion polylines, travel polylines)
-```
-
----
-
-## Ограничения и открытые задачи
-
-- **Тонкие концы лопастей** "лохматятся" из-за сглаживания depth-поля —
-  большой sigma размывает на границе, маленький оставляет ступеньки BFS.
-  Нужен адаптивный sigma или другая регуляризация.
-- **Tree-режим** (BFS с каноническим родителем + кумулятивные ротации
-  кинематической цепочки) рвёт меш на ветвлениях — фундаментальное
-  ограничение приближения "только Z-сдвиг", оставлен в backlog.
-- **Двойная деформация** при ошибочном `forward` направлении на уже
-  деформированном g-code давит хаб и сжимает толщину лопастей. Сейчас
-  направление надо знать вручную; авто-детект (по бау-эффекту в gcode-метаданных
-  PrusaSlicer-а) — TODO.
-- **pitch ≈ 0.1 мм** на больших volume требует >50³ вокселей, RAM не
-  справляется. Нужно частичная воксельная заливка / окно вокруг меша.
-- **Z-extent в inverse чуть выше натурального** (24.5 мм vs 23.55 мм у
-  пропеллера) — краевой эффект depth-поля на кончиках. Лечится подбором
-  `--smooth-sigma` или явным `--dz-per-layer`.
-- **Native crash** при ru-раскладке клавиатуры в pyvista-окне — VTK
-  reportedly не любит non-ASCII keysym. В backlog.
-- **Реальная FDM-печать** результата не тестировалась. Все скриншоты — превью.
-
----
-
-## Лицензия
-
-Экспериментальный код, ещё не выбрана.
+Experimental code; license not yet chosen.
