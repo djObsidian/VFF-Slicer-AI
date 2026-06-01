@@ -631,17 +631,28 @@ def clip_gcode_file(
 
 def _write_transformed_gcode(
     out_path: Path, units: list, xyz_out: np.ndarray, header: str,
-    escale: np.ndarray | None = None,
-) -> int:
+    escale: np.ndarray | None = None, z_slowdown: float = 1.0,
+) -> dict:
     """Pass 3: stream-write the unit list, reading move endpoints from xyz_out.
 
     `escale` (per-point extrusion multiplier, parallel to xyz_out) applies
-    volume compensation: the deformation stretches/compresses the road, so the
-    slicer's E (computed for the source geometry) is scaled per piece. Only
-    positive (extruding) E is scaled — retractions are a fixed mechanical
-    amount. Absolute E is NOT compensated (it would desync the modal E
-    reference for later moves); callers should use relative E with comp."""
+    extrusion compensation: only positive relative E is scaled.
+
+    `z_slowdown` (factor in (0,1], 1 = off): the slicer's feedrate F is the
+    PLANAR (XY) speed, but after the non-planar transform a move can climb
+    steeply in Z. We do NOT hard-cap to the Z axis max (the firmware planner
+    clamps that); we just **gently slow the steep stretches** so the planner
+    isn't fighting a feedrate aimed straight up. F is scaled smoothly from ×1 on
+    flat moves to ×z_slowdown at a 30°-tilted move (slope 0.5) and beyond; the
+    slicer's intended F is tracked and restored on flat moves. e.g. 0.5 = halve
+    F on the steepest parts."""
+    _REF_SLOPE = 0.5   # |dz|/len at ~30° (the default --max-tilt); full slowdown here
     lines_out = 0
+    cur = None         # last written position (cx, cy, cz)
+    modal_f = None     # slicer's intended feedrate (mm/min), un-scaled
+    emitted_f = None   # F value last actually written
+    n_slowed = 0
+    do_slow = z_slowdown < 1.0
     with out_path.open("w", encoding="utf-8", newline="\n") as fo:
         fo.write(header)
         lines_out += 1
@@ -651,6 +662,8 @@ def _write_transformed_gcode(
                 lines_out += 1
                 continue
             _, out_cmd, e_val, f_val, tail, n_pieces, start_idx, e_rel, e_start = u
+            if f_val is not None:
+                modal_f = f_val
             for piece in range(n_pieces):
                 pi = start_idx + piece
                 ox, oy, oz = xyz_out[pi]
@@ -667,14 +680,26 @@ def _write_transformed_gcode(
                         # the last segment. (No comp — see docstring.)
                         e_piece = e_start + (e_val - e_start) * (piece + 1) / n_pieces
                         parts.append(f"E{e_piece:.5f}")
-                if f_val is not None and piece == 0:
+                # --- feedrate ---
+                if do_slow and cur is not None and modal_f is not None:
+                    seg_len = float(np.sqrt((ox - cur[0]) ** 2 + (oy - cur[1]) ** 2 + (oz - cur[2]) ** 2))
+                    slope = abs(oz - cur[2]) / seg_len if seg_len > 1e-9 else 0.0
+                    f_amt = min(slope / _REF_SLOPE, 1.0)               # 0 flat → 1 steep
+                    target_f = modal_f * (1.0 - (1.0 - z_slowdown) * f_amt)
+                    if f_amt > 0:
+                        n_slowed += 1
+                    if emitted_f is None or abs(target_f - emitted_f) > 1e-3:
+                        parts.append(f"F{target_f:g}")
+                        emitted_f = target_f
+                elif f_val is not None and piece == 0:
                     parts.append(f"F{f_val:g}")
                 fo.write(" ".join(parts))
                 if tail is not None:
                     fo.write(" ;" + tail)
                 fo.write("\n")
                 lines_out += 1
-    return lines_out
+                cur = (ox, oy, oz)
+    return {"lines_out": lines_out, "n_slowed": n_slowed}
 
 
 def backtransform_gcode_file(
@@ -687,6 +712,7 @@ def backtransform_gcode_file(
     direction: str = "forward",
     extrusion_comp: bool = False,
     extrusion_comp_mode: str = "vertical",
+    z_slowdown: float = 1.0,
 ) -> dict:
     """Three-pass batched G-code transform using a BackTransform's depth field.
 
@@ -787,7 +813,9 @@ def backtransform_gcode_file(
         "deformed-space XYZ inverted to original (non-planar) space"
         + ("; extrusion volume-compensated\n" if escale is not None else "\n")
     )
-    stats["lines_out"] = _write_transformed_gcode(out_path, units, xyz_orig, header, escale=escale)
+    _w = _write_transformed_gcode(out_path, units, xyz_orig, header, escale=escale, z_slowdown=z_slowdown)
+    stats["lines_out"] = _w["lines_out"]
+    stats["n_slowed"] = _w["n_slowed"]
 
     t3 = _time.perf_counter()
 
@@ -815,6 +843,11 @@ def backtransform_gcode_file(
                 f"[backtransform] extrusion comp ({stats['e_comp_mode']}): "
                 f"mean x{stats['e_comp_mean']:.3f} (range x{lo:.2f}..x{hi:.2f}) "
                 f"— E rescaled for the deformation"
+            )
+        if stats.get("n_slowed"):
+            print(
+                f"[backtransform] z-slowdown: {stats['n_slowed']:,} tilted pieces "
+                "had F scaled down (steep stretches eased; firmware still clamps Z)"
             )
         print(
             f"[backtransform] timing: parse {stats['t_parse_s']:.2f}s  "
@@ -916,7 +949,7 @@ def surface_offset_gcode_file(
         "; conform-to-surface by vff/backtransform.py — "
         f"Z lifted by bottom surface of {Path(target_stl_path).name}\n"
     )
-    stats["lines_out"] = _write_transformed_gcode(out_path, units, xyz_out, header)
+    stats["lines_out"] = _write_transformed_gcode(out_path, units, xyz_out, header)["lines_out"]
     t3 = _time.perf_counter()
 
     z_orig_min = float(xyz_out[:, 2].min()) if xyz_out.shape[0] else float("inf")

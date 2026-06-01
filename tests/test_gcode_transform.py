@@ -46,7 +46,8 @@ def _identity_bt() -> BackTransform:
     )
 
 
-def _run(gcode_text: str, direction: str = "forward", subdiv_mm: float = 1.0) -> list[str]:
+def _run(gcode_text: str, direction: str = "forward", subdiv_mm: float = 1.0,
+         z_slowdown: float = 1.0) -> list[str]:
     bt = _identity_bt()
     with tempfile.TemporaryDirectory() as td:
         ip = Path(td) / "in.gcode"
@@ -54,7 +55,7 @@ def _run(gcode_text: str, direction: str = "forward", subdiv_mm: float = 1.0) ->
         ip.write_text(gcode_text, encoding="utf-8")
         backtransform_gcode_file(
             ip, op, bt, subdiv_mm=subdiv_mm, n_jobs=1,
-            verbose=False, direction=direction,
+            verbose=False, direction=direction, z_slowdown=z_slowdown,
         )
         return op.read_text(encoding="utf-8").splitlines()
 
@@ -114,6 +115,33 @@ def test_absolute_e_with_running_start():
     print("  PASS absolute-E honours running start position")
 
 
+def test_z_slowdown_scales_steep_move_feedrate():
+    """--z-slowdown leaves flat moves at full F and halves (×0.5) a 45° move
+    (slope 0.71 > the 0.5 reference). Default (1.0) leaves everything alone."""
+    # X10 @ Z5 = flat extrusion; X11 @ Z6 = a 45° climb.
+    gcode = "M83\nG1 X0 Y0 Z5 F6000\nG1 X10 Y0 Z5 E1\nG1 X11 Y0 Z6 E0.2\n"
+
+    def f_at(lines, xtag):
+        f = None
+        for ln in lines:
+            if not _MOVE_RE.match(ln.strip()):
+                continue
+            m = _E_RE.sub("", ln)  # avoid matching E
+            mf = re.search(r"\bF(-?[0-9.]+)", ln)
+            if mf:
+                f = float(mf.group(1))
+            if xtag in ln:
+                return f
+        return None
+
+    base = _run(gcode, direction="inverse", subdiv_mm=100, z_slowdown=1.0)
+    slow = _run(gcode, direction="inverse", subdiv_mm=100, z_slowdown=0.5)
+    assert f_at(base, "X11.000") == 6000, "default must not touch F"
+    assert abs(f_at(slow, "X10.000") - 6000) < 1, "flat move must stay full speed"
+    assert abs(f_at(slow, "X11.000") - 3000) < 1, "45° move must be halved by z_slowdown=0.5"
+    print("  PASS z-slowdown (flat F 6000 kept; 45° move 6000 -> 3000)")
+
+
 def test_propeller_forward_inverse_roundtrip():
     """forward then inverse on the real mesh should recover XYZ within a
     fraction of the voxel pitch (interpolation error only)."""
@@ -150,6 +178,7 @@ def main() -> int:
         test_relative_e_subdivision_conserves_and_spreads,
         test_absolute_e_subdivision_spreads_monotonically,
         test_absolute_e_with_running_start,
+        test_z_slowdown_scales_steep_move_feedrate,
         test_propeller_forward_inverse_roundtrip,
     ]
     failures = 0

@@ -85,6 +85,7 @@ def _run_gcode_transform(args, stl_path: Path, x: float, y: float, z: float) -> 
             args.gcode_in, out_path, bt3,
             subdiv_mm=args.subdiv_mm, n_jobs=1, direction=args.gcode_direction,
             extrusion_comp=args.extrusion_comp, extrusion_comp_mode=args.extrusion_comp_mode,
+            z_slowdown=args.z_slowdown,
         )
         return 0
 
@@ -170,7 +171,7 @@ def _run_gcode_transform(args, stl_path: Path, x: float, y: float, z: float) -> 
     backtransform_gcode_file(
         args.gcode_in, out_path, bt,
         subdiv_mm=args.subdiv_mm, n_jobs=args.jobs,
-        direction=args.gcode_direction,
+        direction=args.gcode_direction, z_slowdown=args.z_slowdown,
     )
     return 0
 
@@ -281,6 +282,15 @@ def main(argv: list[str] | None = None) -> int:
              "deformation so stretched/compressed layers get the right amount of "
              "material. Requires relative E (M83); absolute E left uncompensated. "
              "Default on; --no-extrusion-comp to disable.",
+    )
+    parser.add_argument(
+        "--z-slowdown", type=float, default=1.0, metavar="FACTOR",
+        help="(gcode transform) Gently slow the feedrate on steep non-planar "
+             "moves (1.0 = off). F is scaled from ×1 on flat moves down to "
+             "×FACTOR at a ~30°-tilted move and steeper, so the firmware's Z "
+             "planner isn't fighting a feedrate aimed straight up. e.g. 0.5 = "
+             "halve F on the steepest parts. The firmware still hard-limits Z "
+             "(Klipper max_z_velocity/accel); this only eases the transition.",
     )
     parser.add_argument(
         "--extrusion-comp-mode", choices=["vertical", "volume"], default="vertical",

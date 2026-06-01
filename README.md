@@ -78,6 +78,7 @@ vff.preview result.gcode        #  E = toggle extrusion,  T = toggle travel
 | `--max-tilt DEG` | **Main knob.** Max nozzle tilt from vertical the head can print at — depends on your hotend/fan shape. `20` bulky head · `30` default · `45` compact/pointed nozzle (stronger non‑planarity). |
 | `--subdivide-error MM` | (export only) Uniformly refine the mesh until the worst per‑face deformation error drops below this, so flat regions built from few large triangles actually bow. Try `0.1`. Off by default; the export prints a hint when it's needed. |
 | `--extrusion-comp-mode` | `vertical` (default, 3‑axis): rescale E by the layer‑height squish — correct for a fixed‑width vertical nozzle. `volume`: rescale by `1/det` (material‑conservative, for 4/5‑axis like S4). `--no-extrusion-comp` disables. |
+| `--z-slowdown FACTOR` | (gcode) Gently slow F on steep non‑planar moves: ×1 flat → ×FACTOR at a 30°+ climb (e.g. `0.5` halves the steepest). Default `1.0` = off (the firmware's Z planner, e.g. Klipper `max_z_velocity`, still hard‑limits Z regardless). |
 | `--pitch MM` | Voxel size (default 1.0). Smaller = finer field, more RAM. |
 | `--smooth-sigma N` | Displacement smoothing in voxels (default 2.0). Higher = smoother mesh / fewer folds, softer domes; lower = sharper. |
 | `--growth-source` | `bfs` (default) or `geodesic` (domes hole‑ceilings more but distorts thin features globally — not recommended for parts with blades). |
