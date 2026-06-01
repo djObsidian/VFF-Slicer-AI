@@ -19,7 +19,9 @@ except Exception:
 
 from vff.build_volume import BuildVolume
 from vff.deform import deform_mesh
-from vff.deform3d import _face_nonaffinity, deform_mesh_3d, solve_deformation_map
+from vff.deform3d import (
+    BackTransform3D, _face_nonaffinity, deform_mesh_3d, solve_deformation_map,
+)
 from vff.growth import compute_growth
 from vff.mesh_io import load_and_place
 from vff.voxelize import voxelize_solid
@@ -223,29 +225,28 @@ def test_default_smoothing_keeps_a_bore_dome():
     print(f"  PASS deformation keeps a bore dome ({dome:.2f} mm at default sigma)")
 
 
-def test_geodesic_growth_source_domes_more_box_identity():
-    """'geodesic' growth source domes a bore ceiling more than 'bfs' (captures
-    the detour around the hole) while keeping a flat box at identity."""
-    box = trimesh.creation.box(extents=(40, 40, 20))
-    box.apply_translation([125, 125, 10])
-    grb = compute_growth(voxelize_solid(box, pitch=1.0), max_tilt_deg=30.0)
-    db = solve_deformation_map(grb, growth_source="geodesic", max_tilt_deg=30.0)
-    disp = float(np.linalg.norm(db.forward_points(box.vertices) - box.vertices, axis=1).max())
-    assert disp < 1e-2, f"geodesic box must stay identity, max disp {disp:.4f}"
-
-    stl = Path(__file__).resolve().parent.parent / "propeller_fixed_flat.stl"
-    if not stl.exists():
-        print(f"  PASS geodesic (box identity {disp:.2e}; propeller skipped)")
-        return
-    m = load_and_place(str(stl), BuildVolume.of(250, 250, 250))
-    gr = compute_growth(voxelize_solid(m, pitch=1.0), max_tilt_deg=30.0)
-    dome_bfs = _bore_ceiling_dome(m, solve_deformation_map(gr, growth_source="bfs"))
-    dome_geo = _bore_ceiling_dome(
-        m, solve_deformation_map(gr, growth_source="geodesic", max_tilt_deg=30.0))
-    assert dome_geo is not None and dome_bfs is not None
-    assert dome_geo > dome_bfs + 0.3, f"geodesic dome {dome_geo:.2f} should exceed bfs {dome_bfs:.2f}"
-    print(f"  PASS geodesic (box identity {disp:.2e}; bore dome bfs {dome_bfs:.2f} -> "
-          f"geodesic {dome_geo:.2f} mm)")
+def test_overhang_mask_flags_unsupported_points():
+    """The post-inverse cooling detector flags toolpath points with no part
+    material straight below (overhang/bridge) and leaves walls / top surfaces /
+    near-bed points alone — on a sphere, the lower hemisphere's underside is the
+    overhang, the upper part is supported."""
+    sphere = trimesh.creation.icosphere(subdivisions=3, radius=10.0)
+    sphere.apply_translation([125.0, 125.0, 10.0])   # Z in [0, 20], bed at 0
+    bt = BackTransform3D(None, mesh=sphere)
+    R, cx, cy, cz = 10.0, 125.0, 125.0, 10.0
+    under = [cx + np.sqrt(R**2 - (3.0 - cz)**2), cy, 3.0]  # lower-hemisphere surface
+    top = [cx, cy, 19.6]                                   # top surface
+    interior = [cx + 5.0, cy, 10.0]                        # solid below
+    nearbed = [cx, cy, 0.3]                                # under min_z
+    pts = np.array([under, top, interior, nearbed], dtype=np.float64)
+    mask = bt.overhang_mask(pts, probe=0.4, min_z=0.6)
+    assert mask[0], "lower-hemisphere underside must be flagged (air below)"
+    assert not mask[1], "top surface must not be flagged (solid below)"
+    assert not mask[2], "interior/wall point must not be flagged (solid below)"
+    assert not mask[3], "near-bed point must be excluded by min_z"
+    # No mesh stored → no flags (a map built straight from a GrowthResult).
+    assert not BackTransform3D(None, mesh=None).overhang_mask(pts).any()
+    print(f"  PASS overhang mask (underside flagged; top/wall/near-bed/no-mesh not)")
 
 
 def main() -> int:
@@ -258,7 +259,7 @@ def main() -> int:
         test_vertical_extrusion_comp_reduces_e_in_bulk,
         test_subdivision_refines_coarse_faces_watertight,
         test_default_smoothing_keeps_a_bore_dome,
-        test_geodesic_growth_source_domes_more_box_identity,
+        test_overhang_mask_flags_unsupported_points,
     ]
     failures = 0
     for t in tests:

@@ -68,8 +68,8 @@ vff.preview result.gcode        #  E = toggle extrusion,  T = toggle travel
 
 > ⚠️ **Every flag that shapes the deformation map must be identical on the
 > export and the inverse:** `--max-tilt`, `--pitch`, `--volume`,
-> `--smooth-sigma`, `--growth-source`. Otherwise the inverse map won't match
-> the mesh that was sliced and the layers land in the wrong place.
+> `--smooth-sigma`. Otherwise the inverse map won't match the mesh that was
+> sliced and the layers land in the wrong place.
 
 ### Key flags
 
@@ -81,7 +81,7 @@ vff.preview result.gcode        #  E = toggle extrusion,  T = toggle travel
 | `--z-slowdown FACTOR` | (gcode) Gently slow F on steep non‑planar moves: ×1 flat → ×FACTOR at a 30°+ climb (e.g. `0.5` halves the steepest). Default `1.0` = off (the firmware's Z planner, e.g. Klipper `max_z_velocity`, still hard‑limits Z regardless). |
 | `--pitch MM` | Voxel size (default 1.0). Smaller = finer field, more RAM. |
 | `--smooth-sigma N` | Displacement smoothing in voxels (default 2.0). Higher = smoother mesh / fewer folds, softer domes; lower = sharper. |
-| `--growth-source` | `bfs` (default) or `geodesic` (domes hole‑ceilings more but distorts thin features globally — not recommended for parts with blades). |
+| `--cool-overhangs` | (gcode `inverse`) Re‑detect overhangs/bridges on the *original‑space* toolpath and force the fan to full there — surfaces the slicer saw as flat (well‑supported) but which become unsupported after the inverse. `--no-cool-overhangs` disables; tune with `--cool-fan`/`--cool-probe`. |
 
 The interactive viewer (`vff part.stl`, no flags) shows voxels / growth field /
 deformed mesh by hotkey, but currently visualizes the **Z‑only** legacy map.
@@ -145,19 +145,11 @@ Poisson solve, the G‑code passes) lives in
 - **Adaptive remeshing.** `--subdivide-error` is uniform → heavy (the propeller
   goes 35k → 562k faces). A conforming adaptive remesh (Rivara longest‑edge
   bisection) would reach the same quality at ~15× fewer faces without cracks.
-- **Tip non‑convergence** (~2 %, caught by a despike pass) — the map folds
-  under steep overhangs; mitigate with a smaller `--max-tilt`.
-- **Targeted cavity domes.** The default already domes a bore ceiling well;
-  `--growth-source geodesic` domes more but distorts thin features globally.
-  Doing geodesic *only* around internal cavities (detect "void wrapped by solid
-  on all sides" vs "open to the outside") would give the best of both.
-- **Cooling / bridge re‑detection after the inverse.** The slicer schedules fan
-  speed (M106) per feature from the DEFORMED, flat geometry. After the inverse,
-  surfaces that the slicer did *not* see as overhangs become overhangs/bridges in
-  the real non‑planar part. The curved layers support them better than planar
-  ones, but they still need active cooling the slicer never scheduled. We should
-  re‑detect overhangs/bridges on the original‑space toolpath (face/segment angle
-  vs what's beneath) and boost the fan there.
+- **Tip non‑convergence** under steep overhangs — the inverse uses a damped
+  (Levenberg–Marquardt) Newton with per‑point line search plus a despike pass,
+  so most tips now converge; the few that can't (Φ genuinely folds there) are
+  flagged and snapped to their best iterate. Mitigate the rest with a smaller
+  `--max-tilt`.
 - **Self‑intersecting / non‑manifold input** needs repair before voxelization.
 - **Real FDM printing** of the output is being validated now; treat results as
   experimental.

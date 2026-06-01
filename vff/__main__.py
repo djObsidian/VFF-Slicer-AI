@@ -70,8 +70,8 @@ def _run_gcode_transform(args, stl_path: Path, x: float, y: float, z: float) -> 
             f"  pitch        : {args.pitch} mm\n"
             f"  max-tilt     : {args.max_tilt} deg\n"
             f"  smooth-sigma : {args.smooth_sigma} (must match the export)\n"
-            f"  growth-source: {args.growth_source} (must match the export)\n"
             f"  extrusion-comp: {(args.extrusion_comp_mode if args.extrusion_comp else 'off')}\n"
+            f"  cool-overhangs: {('S'+str(args.cool_fan)+', probe '+str(args.cool_probe)+' mm' if (args.cool_overhangs and args.gcode_direction == 'inverse') else 'off')}\n"
             f"{align_info}"
             f"  subdiv-mm    : {args.subdiv_mm} mm",
             flush=True,
@@ -79,13 +79,15 @@ def _run_gcode_transform(args, stl_path: Path, x: float, y: float, z: float) -> 
         bt3 = BackTransform3D.from_mesh(
             str(stl_path), volume_side=max(x, y, z), pitch=args.pitch,
             max_tilt_deg=args.max_tilt, smooth_sigma=args.smooth_sigma,
-            growth_source=args.growth_source, xy_center=xy_center,
+            xy_center=xy_center,
         )
         backtransform_gcode_file(
             args.gcode_in, out_path, bt3,
             subdiv_mm=args.subdiv_mm, n_jobs=1, direction=args.gcode_direction,
             extrusion_comp=args.extrusion_comp, extrusion_comp_mode=args.extrusion_comp_mode,
             z_slowdown=args.z_slowdown,
+            cool_overhangs=args.cool_overhangs, cool_fan=args.cool_fan,
+            cool_probe=args.cool_probe, cool_min_z=args.cool_min_z,
         )
         return 0
 
@@ -189,14 +191,13 @@ def _run_3d_export(args, stl_path: Path, x: float, y: float, z: float) -> int:
         f"Full-3D deform export: {stl_path} -> {args.export}\n"
         f"  volume {x:.0f}x{y:.0f}x{z:.0f} mm, pitch {args.pitch} mm, "
         f"max-tilt {args.max_tilt} deg, smooth-sigma {args.smooth_sigma}, "
-        f"growth-source {args.growth_source}, subdivide-error {args.subdivide_error} mm",
+        f"subdivide-error {args.subdivide_error} mm",
         flush=True,
     )
     vg = voxelize_solid(mesh, pitch=args.pitch)
     gr = compute_growth(vg, max_tilt_deg=args.max_tilt)
     dmap = solve_deformation_map(
-        gr, displacement_smooth_sigma=args.smooth_sigma,
-        growth_source=args.growth_source, max_tilt_deg=args.max_tilt,
+        gr, displacement_smooth_sigma=args.smooth_sigma, max_tilt_deg=args.max_tilt,
     )
     base_err = float(_face_nonaffinity(mesh, dmap).max())
     dm = deform_mesh_3d(mesh, dmap, subdivide_max_error=args.subdivide_error)
@@ -259,15 +260,6 @@ def main(argv: list[str] | None = None) -> int:
              "viewer is z-only regardless.",
     )
     parser.add_argument(
-        "--growth-source", choices=["bfs", "geodesic"], default="bfs",
-        help="(--deform-mode 3d) Source of the layer/growth direction. 'bfs' "
-             "(default): local BFS growth vectors — lowest distortion. "
-             "'geodesic': gradient of the geodesic depth — captures detours "
-             "around holes so a bore ceiling domes up (the bfs field leaves it "
-             "nearly flat), at a small global distortion cost. MUST match "
-             "between --export and the inverse.",
-    )
-    parser.add_argument(
         "--subdivide-error", type=float, default=0.0, metavar="MM",
         help="(--deform-mode 3d --export only) Uniformly subdivide the mesh "
              "before deforming until the worst per-face deformation error drops "
@@ -300,6 +292,33 @@ def main(argv: list[str] | None = None) -> int:
              "'volume' (4/5-axis, S4-style): scale by 1/det(JΦ) — material-"
              "conservative, for a tilting nozzle whose road deforms in all axes. "
              "On the propeller they differ ~12% and opposite sign in the bulk.",
+    )
+    parser.add_argument(
+        "--cool-overhangs", action=argparse.BooleanOptionalAction, default=True,
+        help="(--deform-mode 3d, --gcode-direction inverse) Re-detect overhangs/"
+             "bridges on the ORIGINAL-space toolpath and force the fan to "
+             "--cool-fan there. The slicer schedules cooling from the deformed, "
+             "flat mesh; after the inverse, surfaces it saw as flat can hang over "
+             "a void in the real part. Default on; --no-cool-overhangs to disable "
+             "(e.g. ABS/ASA, or to skip the extra mesh-containment pass).",
+    )
+    parser.add_argument(
+        "--cool-fan", type=int, default=255, metavar="0-255",
+        help="(--cool-overhangs) Fan PWM forced over detected overhangs/bridges "
+             "(default 255 = full). Only raises the fan above the slicer's own "
+             "setting, never lowers it.",
+    )
+    parser.add_argument(
+        "--cool-probe", type=float, default=0.4, metavar="MM",
+        help="(--cool-overhangs) How far straight down (mm) to test for support. "
+             "A point is an overhang/bridge if no part material lies this far "
+             "below it. Default 0.4 (~a layer or two); larger = only steeper "
+             "overhangs flagged.",
+    )
+    parser.add_argument(
+        "--cool-min-z", type=float, default=0.6, metavar="MM",
+        help="(--cool-overhangs) Never flag points within this height of the "
+             "plate (the bed supports them). Default 0.6 mm.",
     )
     parser.add_argument(
         "--export", metavar="PATH",

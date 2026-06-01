@@ -142,16 +142,16 @@ generalisation of `integrate_vectors_to_potential` (same Laplacian).
    pinned seeds and the inverse pushes the sliced first layer to a varying,
    partly negative original Z (nozzle digs in).
 
-**Forward map** = trilinear sample of Φ. **Inverse map** = vectorised Newton on
-the trilinear Φ field (`q → p` with `Φ(p)=q`) using precomputed Jacobian fields;
-converges in a few iterations on a fold‑free Φ. It tracks the best iterate (not
-the last clamped one) and a `_despike_path` pass repairs the occasional
-wrong‑branch spike at a fold by neighbour interpolation.
-
-`--growth-source`: `bfs` (default) drives the rotations from the local BFS
-vectors (lowest distortion); `geodesic` drives them from the geodesic‑depth
-gradient (domes hole‑ceilings ~2× more but raises distortion globally → degrades
-thin features; opt‑in only).
+**Forward map** = trilinear sample of Φ. **Inverse map** = vectorised
+**damped (Levenberg–Marquardt) Newton** on the trilinear Φ field (`q → p` with
+`Φ(p)=q`) using precomputed Jacobian fields; converges in a few iterations on a
+fold‑free Φ. Each per‑point step is `(JᵀJ + λI)⁻¹ Jᵀr` with a per‑point λ that
+backs off (accept, shrink λ) or damps harder (reject, grow λ) by whether the
+residual actually dropped — so a near‑singular Jacobian at a fold damps into a
+short gradient step instead of exploding. It tracks the best iterate (not the
+last clamped one) and a `_despike_path` pass repairs the occasional
+wrong‑branch spike at a fold by neighbour interpolation. The rotations are
+driven by the local BFS growth vectors (lowest distortion).
 
 ### Mesh resolution (`--subdivide-error`, export)
 
@@ -179,9 +179,9 @@ absolute E untouched). Two modes (`--extrusion-comp-mode`):
 
 ### Consistency
 
-Every map‑shaping flag (`--max-tilt`, `--pitch`, `--volume`, `--smooth-sigma`,
-`--growth-source`) must be identical on the export and the inverse, or the
-inverse won't match the sliced mesh.
+Every map‑shaping flag (`--max-tilt`, `--pitch`, `--volume`, `--smooth-sigma`)
+must be identical on the export and the inverse, or the inverse won't match the
+sliced mesh.
 
 ---
 
@@ -234,10 +234,12 @@ positional: STL                 path to STL (default ./propeller.stl)
   --depth-method vectors|fmm|dijkstra   inside-model depth (default vectors; z-only)
 
   --deform-mode z-only|3d       deformation model (default z-only; 3d = recommended)
-  --growth-source bfs|geodesic  (3d) layer-direction source (default bfs)
   --subdivide-error MM          (3d --export) refine coarse faces until error < MM (default 0 = off)
   --extrusion-comp / --no-extrusion-comp   (3d) rescale E for the deformation (default on)
   --extrusion-comp-mode vertical|volume    (3d) comp model (default vertical = 3-axis)
+  --cool-overhangs / --no-cool-overhangs   (3d inverse) full fan on re-detected overhangs/bridges (default on)
+  --cool-fan 0..255             (3d inverse) fan PWM forced on overhangs (default 255)
+  --cool-probe MM               (3d inverse) downward support-probe distance (default 0.4)
 
   --export PATH                 save the deformed mesh
   --no-viewer                   skip the interactive viewer (batch)
@@ -272,6 +274,6 @@ Plain‑assert scripts under `tests/`, run with the project venv python:
   forward/inverse round‑trip.
 - `test_deform3d.py` — box→identity, distortion vs Z‑only, inverse round‑trip,
   extrusion comp (volume + vertical), bed blend, subdivision watertightness,
-  bore dome, geodesic growth source.
+  bore dome.
 - `validate_deform3d.py`, `validate_inverse_gcode.py` — diagnostic reports
   (distortion, containment of the inverse inside the original mesh).

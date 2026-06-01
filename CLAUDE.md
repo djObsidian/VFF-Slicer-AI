@@ -49,9 +49,9 @@ forward (trilinear) / inverse (Newton) → G-code rewrite with extrusion comp.
 ## Project-specific gotchas
 
 - **Consistency rule:** every map-shaping flag (`--max-tilt`, `--pitch`,
-  `--volume`, `--smooth-sigma`, `--growth-source`) must be IDENTICAL on the
-  `--export` and the `--gcode-direction inverse` run, or the inverse won't match
-  the sliced mesh. When changing a default, update both paths.
+  `--volume`, `--smooth-sigma`) must be IDENTICAL on the `--export` and the
+  `--gcode-direction inverse` run, or the inverse won't match the sliced mesh.
+  When changing a default, update both paths.
 - **3-axis, not 4-axis:** the nozzle is vertical (that's the whole `--max-tilt`
   premise). Extrusion comp defaults to `vertical` (layer-height squish), NOT the
   volume/`1/det` that S4 uses for its tilting 4-axis nozzle.

@@ -87,6 +87,23 @@ def rotations_to_vertical(vectors: np.ndarray) -> np.ndarray:
     return Rotation.from_rotvec(out).as_matrix().astype(np.float64)
 
 
+def _nearest_good_fill(values: np.ndarray, good: np.ndarray) -> np.ndarray:
+    """For each row, return `values` of the nearest row flagged True in `good`,
+    measured in index order (ties → the earlier one). Rows with no good row
+    anywhere are returned unchanged. Used to warm-start the inverse's leftover
+    non-converged points from a converged neighbour along the toolpath."""
+    N = values.shape[0]
+    gi = np.where(good)[0]
+    if gi.size == 0:
+        return values.copy()
+    idxs = np.arange(N)
+    pos = np.searchsorted(gi, idxs)
+    left = gi[np.clip(pos - 1, 0, gi.size - 1)]
+    right = gi[np.clip(pos, 0, gi.size - 1)]
+    nearest = np.where(np.abs(idxs - left) <= np.abs(idxs - right), left, right)
+    return values[nearest]
+
+
 @dataclass
 class DeformationMap:
     """Φ sampled on the (regular) original voxel grid plus its Jacobian.
@@ -124,86 +141,108 @@ class DeformationMap:
         J = _sample_jac(self.jac, self.origin, self.pitch, np.asarray(pts, float))
         return np.linalg.inv(J)[:, 2, 2]
 
-    # ---- inverse: deformed → original (vectorised Newton) ----
+    # ---- inverse: deformed → original (vectorised damped Newton / LM) ----
     def inverse_points(
-        self, q: np.ndarray, iters: int = 20, tol: float = 1e-4,
+        self, q: np.ndarray, iters: int = 30, tol: float = 1e-4,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Return (p, converged_mask). p[k] satisfies Φ(p[k]) ≈ q[k].
 
-        Newton step:  p ← p − JΦ(p)^{-1} (Φ(p) − q).  Warm-started at q
-        (XY deformation is usually modest). `converged_mask` is False where
-        the iteration didn't reach `tol` (typically folded regions)."""
+        Solved as a per-point least-squares ‖Φ(p) − q‖² with an **adaptive
+        Levenberg–Marquardt** step (a damped Gauss–Newton):
+
+            (JᵀJ + λ·diag(JᵀJ)) Δp = Jᵀ(Φ(p) − q),   p ← clip(p − Δp).
+
+        Each point carries its own λ with a built-in line search: a step that
+        lowers the residual is accepted and λ shrinks (→ undamped Newton, fast
+        quadratic convergence on the fold-free bulk); a step that doesn't is
+        rejected and λ grows (→ a short, safe gradient step). This is what fixes
+        the tips: plain Newton (the old code) FROZE near-singular Jacobians at
+        folds — those points never moved and showed up as the ~2 % that didn't
+        converge; LM instead damps the singular direction and keeps making
+        progress, and where Φ genuinely folds (non-injective) the step can't
+        reduce the residual so the point simply stays at its best iterate.
+
+        We track the BEST iterate per point (not the last): a truly stuck point
+        otherwise drifts to the grid-clamp boundary and returns Z = grid-top
+        garbage (the old wedge-spikes-to-the-ceiling). `converged_mask` is False
+        only where even the best iterate didn't reach `tol`."""
         q = np.asarray(q, dtype=np.float64)
         N = q.shape[0]
         if N == 0:
             return q.copy(), np.zeros(0, dtype=bool)
-        p = q.copy()
         nx, ny, nz = self.phi.shape[:3]
         lo = self.origin + 0.5 * self.pitch
         hi = self.origin + (np.array([nx, ny, nz]) - 0.5) * self.pitch
-        # Track the BEST iterate per point, not the last. A non-convergent point
-        # (folded / overhang region) otherwise drifts to the grid-clamp boundary
-        # and returns Z = grid-top garbage — that's what produced the wedge
-        # spikes to the ceiling in the gcode. The lowest-residual iterate is the
-        # closest sane approximation instead.
+
         best_p = q.copy()
         best_res = np.full(N, np.inf)
-        active = np.arange(N)  # indices still being iterated
-        for _ in range(iters):
-            if active.size == 0:
-                break
-            pa = p[active]
-            r = _sample_vec(self.phi, self.origin, self.pitch, pa) - q[active]
-            rn = np.linalg.norm(r, axis=1)
-            improved = rn < best_res[active]
-            ai = active[improved]
-            best_res[ai] = rn[improved]
-            best_p[ai] = pa[improved]
-            # Drop converged points from the active set — most converge in a few
-            # iterations, so this stops us re-sampling the whole array every step.
-            keep = rn >= tol
-            if not keep.any():
-                break
-            work = active[keep]
-            rw = r[keep]
-            J = _sample_jac(self.jac, self.origin, self.pitch, p[work])  # (n,3,3)
-            # Solve n independent 3×3 systems J·dp = rw. Freeze near-singular
-            # rows (folded regions) so one bad cell can't NaN the whole batch.
-            dp = np.zeros_like(rw)
-            detok = np.abs(np.linalg.det(J)) > 1e-9
-            if detok.any():
-                dp[detok] = np.linalg.solve(J[detok], rw[detok][:, :, None])[:, :, 0]
-            p[work] = np.clip(p[work] - dp, lo, hi)
-            active = work
+        diag3 = np.arange(3)
+
+        def _sweep(seed: np.ndarray, idx: np.ndarray, n_iter: int) -> None:
+            """Adaptive-LM refine the points `idx`, warm-started at seed[idx].
+            Updates best_p / best_res in place."""
+            if idx.size == 0:
+                return
+            p = seed[idx].copy()
+            res = _sample_vec(self.phi, self.origin, self.pitch, p) - q[idx]
+            rn = np.linalg.norm(res, axis=1)
+            better = rn < best_res[idx]
+            best_res[idx[better]] = rn[better]
+            best_p[idx[better]] = p[better]
+            lam = np.full(idx.size, 1e-3)
+            act = np.where(rn >= tol)[0]              # local indices into idx
+            for _ in range(n_iter):
+                if act.size == 0:
+                    break
+                J = _sample_jac(self.jac, self.origin, self.pitch, p[act])  # (n,3,3)
+                Jt = np.transpose(J, (0, 2, 1))
+                JtJ = Jt @ J
+                g = (Jt @ res[act][:, :, None])[:, :, 0]                    # (n,3)
+                A = JtJ.copy()
+                # Marquardt damping (scale by the diagonal) + a tiny absolute
+                # floor so A stays positive-definite even when J is singular
+                # (a column of J vanishes at a fold) → solve never raises.
+                A[:, diag3, diag3] += lam[act, None] * JtJ[:, diag3, diag3] + 1e-9
+                dp = np.linalg.solve(A, g[:, :, None])[:, :, 0]
+                p_try = np.clip(p[act] - dp, lo, hi)
+                res_try = _sample_vec(self.phi, self.origin, self.pitch, p_try) - q[idx[act]]
+                rn_try = np.linalg.norm(res_try, axis=1)
+
+                acc = rn_try < rn[act]
+                ga = act[acc]                          # accepted → take step, relax λ
+                p[ga] = p_try[acc]
+                res[ga] = res_try[acc]
+                rn[ga] = rn_try[acc]
+                lam[ga] = np.maximum(lam[ga] * 0.3, 1e-7)
+                rj = act[~acc]                         # rejected → stay put, damp more
+                lam[rj] = np.minimum(lam[rj] * 3.0, 1e7)
+
+                imp = rn[ga] < best_res[idx[ga]]
+                gi = ga[imp]
+                best_res[idx[gi]] = rn[gi]
+                best_p[idx[gi]] = p[gi]
+                act = act[rn[act] >= tol]              # drop converged
+
+        _sweep(q, np.arange(N), iters)
+
+        # Second chance for stragglers: re-seed each still-unconverged point from
+        # the nearest CONVERGED point in array order (consecutive toolpath points
+        # are spatially close, so a neighbour's original-space position is a much
+        # better warm start than q at a fold) and refine again. Only the leftover
+        # tips re-run, so this is cheap.
+        bad = np.where(best_res >= tol)[0]
+        if bad.size and bad.size < N:
+            seed = _nearest_good_fill(best_p, best_res < tol)
+            _sweep(seed, bad, max(8, iters // 2))
+
         converged = best_res < tol
         return best_p, converged
-
-
-def _geodesic_direction_field(growth: GrowthResult, sigma: float, max_tilt_deg: float) -> np.ndarray:
-    """Direction field from the gradient of the geodesic (FMM/Dijkstra) depth.
-
-    The local BFS growth vectors only know where each voxel was *reached from*,
-    so above a hole (e.g. a bore ceiling) they point ~straight up and the
-    deformation under-domes that region. The geodesic depth, by contrast,
-    encodes the detour the front had to take *around* the hole — its gradient
-    tilts toward the deeper centre, so aligning it to vertical actually domes
-    the ceiling. Normalized and tilt-clamped like the BFS field."""
-    from .deform import smoothed_depth_field
-    from .growth import clamp_to_vertical
-    phi = smoothed_depth_field(growth, sigma=sigma, method="fmm", outside_mode="extend")
-    gx, gy, gz = np.gradient(phi)
-    V = np.stack([gx, gy, gz], axis=-1).astype(np.float32)
-    n = np.linalg.norm(V, axis=-1, keepdims=True)
-    V = np.where(n > 1e-9, V / n, 0.0).astype(np.float32)
-    V[growth.step < 0] = 0.0
-    return clamp_to_vertical(V, max_tilt_deg)
 
 
 def solve_deformation_map(
     growth: GrowthResult,
     *,
     displacement_smooth_sigma: float = 2.0,
-    growth_source: str = "bfs",
     max_tilt_deg: float = 30.0,
     bed_blend_height: float = 2.0,
     eps: float = 1e-6,
@@ -224,11 +263,8 @@ def solve_deformation_map(
     changes the deformation, so the export that gets sliced and the inverse
     that undoes it must use the SAME value (like dz for the Z-only path).
 
-    `growth_source`: 'bfs' (default) drives the rotations from the local BFS
-    growth vectors — lowest distortion. 'geodesic' drives them from the geodesic
-    depth gradient, which captures detours around holes (domes a bore ceiling
-    that 'bfs' leaves nearly flat) at a modest global distortion cost. Must
-    match between the sliced export and the inverse.
+    The rotations are driven by the local BFS growth vectors (lowest
+    distortion). Must match between the sliced export and the inverse.
     """
     matrix = growth.step >= 0
     nx, ny, nz = matrix.shape
@@ -253,13 +289,8 @@ def solve_deformation_map(
     flat_idx = np.full(matrix.shape, -1, dtype=np.int64)
     flat_idx[matrix] = np.arange(n_model)
 
-    # Per-model-voxel rotation taking growth dir → +ẑ. 'geodesic' swaps the
-    # local BFS direction for the geodesic-depth gradient (domes ceilings).
-    if growth_source == "geodesic":
-        dir_field = _geodesic_direction_field(growth, displacement_smooth_sigma, max_tilt_deg)
-        vecs = dir_field[matrix]
-    else:
-        vecs = growth.vectors[matrix]
+    # Per-model-voxel rotation taking the local BFS growth dir → +ẑ.
+    vecs = growth.vectors[matrix]
     R = rotations_to_vertical(vecs)                       # (M,3,3)
 
     rows_l, cols_l, vals_l = [], [], []
@@ -452,8 +483,13 @@ class BackTransform3D:
 
     is_3d = True  # marker: the gcode driver must not use the depth-field MP path
 
-    def __init__(self, dmap: DeformationMap) -> None:
+    def __init__(self, dmap: DeformationMap, mesh: trimesh.Trimesh | None = None) -> None:
         self.dmap = dmap
+        # The ORIGINAL placed mesh (same coords the inverse maps back into).
+        # Kept so the post-inverse overhang/bridge cooling pass can ask "is
+        # there part material directly below this toolpath point?". Optional —
+        # None when the map was built without a source mesh (tests).
+        self.mesh = mesh
 
     @classmethod
     def from_mesh(
@@ -464,14 +500,13 @@ class BackTransform3D:
         pitch: float = 1.0,
         max_tilt_deg: float = 30.0,
         smooth_sigma: float = 2.0,
-        growth_source: str = "bfs",
         xy_center: tuple[float, float] | None = None,
     ) -> "BackTransform3D":
         """Voxelise + grow + solve the deformation map for `stl_path`, placed
         the same way the Z-only path places it (Z_min→0, XY centred on
-        `xy_center` if given, else the build-volume centre). `smooth_sigma`,
-        `growth_source` and `max_tilt_deg` must match the values the sliced
-        export was built with."""
+        `xy_center` if given, else the build-volume centre). `smooth_sigma`
+        and `max_tilt_deg` must match the values the sliced export was built
+        with."""
         from .build_volume import BuildVolume
         from .growth import compute_growth
         from .mesh_io import load_and_place
@@ -491,10 +526,10 @@ class BackTransform3D:
             mesh = load_and_place(stl_path, BuildVolume.cube(volume_side))
         vg = voxelize_solid(mesh, pitch=pitch)
         gr = compute_growth(vg, max_tilt_deg=max_tilt_deg)
-        return cls(solve_deformation_map(
-            gr, displacement_smooth_sigma=smooth_sigma,
-            growth_source=growth_source, max_tilt_deg=max_tilt_deg,
-        ))
+        dmap = solve_deformation_map(
+            gr, displacement_smooth_sigma=smooth_sigma, max_tilt_deg=max_tilt_deg,
+        )
+        return cls(dmap, mesh=mesh)
 
     def forward_points_batch(self, xyz_orig: np.ndarray) -> np.ndarray:
         xyz = np.asarray(xyz_orig, dtype=np.float64)
@@ -519,6 +554,34 @@ class BackTransform3D:
                 file=sys.stderr, flush=True,
             )
         return p
+
+    def overhang_mask(
+        self, xyz_orig: np.ndarray, probe: float = 0.4, min_z: float = 0.6,
+    ) -> np.ndarray:
+        """Per-point boolean: True where an ORIGINAL-space toolpath point is
+        unsupported from directly below — an overhang or bridge.
+
+        The slicer scheduled cooling (M106) from the DEFORMED, flat geometry,
+        where every layer rests squarely on the one beneath it. After the
+        inverse maps the path back onto the curved part, a segment can end up
+        hanging over a void that the slicer never saw as an overhang. On this
+        3-axis machine the nozzle is vertical, so material is laid on whatever
+        is directly below in world Z — hence "supported" ⇔ part material exists
+        `probe` mm straight down. We test `contains(p − probe·ẑ)` against the
+        original mesh: walls/infill/top-surfaces have solid below (→ supported,
+        not flagged); only downward-facing overhang surfaces and bridge spans
+        have air below (→ flagged). Points within `min_z` of the plate are
+        never flagged (the bed supports them). Returns all-False if no mesh was
+        stored (e.g. a map built directly from a GrowthResult)."""
+        xyz = np.asarray(xyz_orig, dtype=np.float64)
+        n = xyz.shape[0]
+        if self.mesh is None or n == 0:
+            return np.zeros(n, dtype=bool)
+        bed_z = float(self.mesh.bounds[0, 2])
+        probe_pts = xyz.copy()
+        probe_pts[:, 2] -= float(probe)
+        supported = np.asarray(self.mesh.contains(probe_pts), dtype=bool)
+        return (~supported) & (xyz[:, 2] > bed_z + float(min_z))
 
 
 # --------------------------------------------------------------------------
