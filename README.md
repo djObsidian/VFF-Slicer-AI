@@ -151,6 +151,13 @@ Poisson solve, the G‑code passes) lives in
   `--growth-source geodesic` domes more but distorts thin features globally.
   Doing geodesic *only* around internal cavities (detect "void wrapped by solid
   on all sides" vs "open to the outside") would give the best of both.
+- **Cooling / bridge re‑detection after the inverse.** The slicer schedules fan
+  speed (M106) per feature from the DEFORMED, flat geometry. After the inverse,
+  surfaces that the slicer did *not* see as overhangs become overhangs/bridges in
+  the real non‑planar part. The curved layers support them better than planar
+  ones, but they still need active cooling the slicer never scheduled. We should
+  re‑detect overhangs/bridges on the original‑space toolpath (face/segment angle
+  vs what's beneath) and boost the fan there.
 - **Self‑intersecting / non‑manifold input** needs repair before voxelization.
 - **Real FDM printing** of the output is being validated now; treat results as
   experimental.
