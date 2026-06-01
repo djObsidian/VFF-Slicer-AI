@@ -70,6 +70,7 @@ def _run_gcode_transform(args, stl_path: Path, x: float, y: float, z: float) -> 
             f"  pitch        : {args.pitch} mm\n"
             f"  max-tilt     : {args.max_tilt} deg\n"
             f"  smooth-sigma : {args.smooth_sigma} (must match the export)\n"
+            f"  extrusion-comp: {'on' if args.extrusion_comp else 'off'}\n"
             f"{align_info}"
             f"  subdiv-mm    : {args.subdiv_mm} mm",
             flush=True,
@@ -82,6 +83,7 @@ def _run_gcode_transform(args, stl_path: Path, x: float, y: float, z: float) -> 
         backtransform_gcode_file(
             args.gcode_in, out_path, bt3,
             subdiv_mm=args.subdiv_mm, n_jobs=1, direction=args.gcode_direction,
+            extrusion_comp=args.extrusion_comp,
         )
         return 0
 
@@ -238,6 +240,15 @@ def main(argv: list[str] | None = None) -> int:
              "MUST match between --export and the inverse) but ignores "
              "--dz-per-layer/--dz-auto-fit/--depth-method. Note: the interactive "
              "viewer is z-only regardless.",
+    )
+    parser.add_argument(
+        "--extrusion-comp", action=argparse.BooleanOptionalAction, default=True,
+        help="(--deform-mode 3d only) Volume-compensate extrusion: scale each "
+             "G-code segment's E by the local volume stretch of the deformation "
+             "(1/det(JΦ) for inverse), so stretched/compressed layers get the "
+             "right amount of material. Mean factor ≈ 1/volume-ratio. Requires "
+             "relative E (M83); absolute E is left uncompensated. Default on; "
+             "--no-extrusion-comp to disable.",
     )
     parser.add_argument(
         "--export", metavar="PATH",

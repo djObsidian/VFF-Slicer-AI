@@ -94,11 +94,42 @@ def test_inverse_roundtrip_converged_is_exact():
     print(f"  PASS inverse roundtrip ({100*conv.mean():.1f}% converged, p99 err {np.percentile(err,99):.2e} mm)")
 
 
+def test_extrusion_comp_matches_volume_ratio():
+    """Extrusion compensation = 1/det(JΦ). Mean over the model must equal the
+    inverse volume ratio (material conservation); a flat box stays ~1."""
+    box = trimesh.creation.box(extents=(40, 40, 20))
+    box.apply_translation([125, 125, 10])
+    grb = compute_growth(voxelize_solid(box, pitch=1.0), max_tilt_deg=30.0)
+    dmb = solve_deformation_map(grb)
+    matb = grb.step >= 0
+    Pb = dmb.origin + (np.argwhere(matb) + 0.5) * dmb.pitch
+    detb = dmb.jacobian_det(Pb)
+    assert np.allclose(detb, 1.0, atol=1e-3), f"box det should be ~1, got [{detb.min():.3f},{detb.max():.3f}]"
+
+    stl = Path(__file__).resolve().parent.parent / "propeller.stl"
+    if not stl.exists():
+        print("  PASS extrusion comp (box det~1; propeller skipped — no STL)")
+        return
+    m = load_and_place(str(stl), BuildVolume.of(250, 250, 250))
+    gr = compute_growth(voxelize_solid(m, pitch=1.0), max_tilt_deg=30.0)
+    dmap = solve_deformation_map(gr)
+    dm = deform_mesh_3d(m, dmap)
+    mat = gr.step >= 0
+    P = dmap.origin + (np.argwhere(mat) + 0.5) * dmap.pitch
+    comp_mean = float(np.mean(1.0 / dmap.jacobian_det(P)))
+    inv_vol_ratio = float(m.volume / dm.volume)
+    assert abs(comp_mean - inv_vol_ratio) < 0.02, (
+        f"mean comp {comp_mean:.3f} should match 1/vol-ratio {inv_vol_ratio:.3f}")
+    print(f"  PASS extrusion comp (box det~1; propeller mean comp {comp_mean:.3f} "
+          f"== 1/vol-ratio {inv_vol_ratio:.3f})")
+
+
 def main() -> int:
     tests = [
         test_flat_box_maps_to_identity,
         test_propeller_less_distortion_than_zonly,
         test_inverse_roundtrip_converged_is_exact,
+        test_extrusion_comp_matches_volume_ratio,
     ]
     failures = 0
     for t in tests:

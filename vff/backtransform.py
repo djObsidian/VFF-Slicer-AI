@@ -629,8 +629,18 @@ def clip_gcode_file(
     return stats
 
 
-def _write_transformed_gcode(out_path: Path, units: list, xyz_out: np.ndarray, header: str) -> int:
-    """Pass 3: stream-write the unit list, reading move endpoints from xyz_out."""
+def _write_transformed_gcode(
+    out_path: Path, units: list, xyz_out: np.ndarray, header: str,
+    escale: np.ndarray | None = None,
+) -> int:
+    """Pass 3: stream-write the unit list, reading move endpoints from xyz_out.
+
+    `escale` (per-point extrusion multiplier, parallel to xyz_out) applies
+    volume compensation: the deformation stretches/compresses the road, so the
+    slicer's E (computed for the source geometry) is scaled per piece. Only
+    positive (extruding) E is scaled — retractions are a fixed mechanical
+    amount. Absolute E is NOT compensated (it would desync the modal E
+    reference for later moves); callers should use relative E with comp."""
     lines_out = 0
     with out_path.open("w", encoding="utf-8", newline="\n") as fo:
         fo.write(header)
@@ -642,15 +652,19 @@ def _write_transformed_gcode(out_path: Path, units: list, xyz_out: np.ndarray, h
                 continue
             _, out_cmd, e_val, f_val, tail, n_pieces, start_idx, e_rel, e_start = u
             for piece in range(n_pieces):
-                ox, oy, oz = xyz_out[start_idx + piece]
+                pi = start_idx + piece
+                ox, oy, oz = xyz_out[pi]
                 parts = [out_cmd, f"X{ox:.3f} Y{oy:.3f} Z{oz:.3f}"]
                 if e_val is not None:
                     if e_rel:
-                        parts.append(f"E{(e_val / n_pieces):.5f}")
+                        piece_e = e_val / n_pieces
+                        if escale is not None and e_val > 0:
+                            piece_e *= float(escale[pi])
+                        parts.append(f"E{piece_e:.5f}")
                     else:
                         # Absolute E: ramp from e_start to e_val across pieces so
                         # filament is laid along the whole move, not dumped in
-                        # the last segment.
+                        # the last segment. (No comp — see docstring.)
                         e_piece = e_start + (e_val - e_start) * (piece + 1) / n_pieces
                         parts.append(f"E{e_piece:.5f}")
                 if f_val is not None and piece == 0:
@@ -671,6 +685,7 @@ def backtransform_gcode_file(
     n_jobs: int = -1,
     verbose: bool = True,
     direction: str = "forward",
+    extrusion_comp: bool = False,
 ) -> dict:
     """Three-pass batched G-code transform using a BackTransform's depth field.
 
@@ -742,11 +757,26 @@ def backtransform_gcode_file(
         z_orig_min = float(xyz_orig[:, 2].min())
         z_orig_max = float(xyz_orig[:, 2].max())
 
+    # Extrusion (volume) compensation: the deformation stretches/compresses the
+    # road, so the slicer's E (computed for the source geometry) is rescaled by
+    # the local volume ratio. det(JΦ) = dV_def/dV_orig, sampled at the
+    # ORIGINAL-space point. inverse: source=deformed, want original → ×1/det.
+    # forward: source=original, want deformed → ×det. Only the 3D map exposes a
+    # Jacobian; the Z-only path has no XY volume change to compensate here.
+    escale = None
+    if extrusion_comp and getattr(bt, "is_3d", False) and n_pts:
+        orig_pts = xyz_orig if direction == "inverse" else xyz_def
+        det = np.clip(bt.dmap.jacobian_det(orig_pts), 0.2, 5.0)
+        escale = (1.0 / det) if direction == "inverse" else det
+        stats["e_comp_mean"] = float(escale.mean())
+        stats["e_comp_range"] = (float(escale.min()), float(escale.max()))
+
     header = (
         "; backtransformed by vff/backtransform.py — "
-        "deformed-space XYZ inverted to original (non-planar) space\n"
+        "deformed-space XYZ inverted to original (non-planar) space"
+        + ("; extrusion volume-compensated\n" if escale is not None else "\n")
     )
-    stats["lines_out"] = _write_transformed_gcode(out_path, units, xyz_orig, header)
+    stats["lines_out"] = _write_transformed_gcode(out_path, units, xyz_orig, header, escale=escale)
 
     t3 = _time.perf_counter()
 
@@ -768,6 +798,12 @@ def backtransform_gcode_file(
             f"[backtransform] deformed Z: [{stats['z_min']:.3f}, {stats['z_max']:.3f}] mm  "
             f"→ original Z: [{stats['z_orig_min']:.3f}, {stats['z_orig_max']:.3f}] mm"
         )
+        if "e_comp_mean" in stats:
+            lo, hi = stats["e_comp_range"]
+            print(
+                f"[backtransform] extrusion comp: mean x{stats['e_comp_mean']:.3f} "
+                f"(range x{lo:.2f}..x{hi:.2f}) — volume-corrected E for the deformation"
+            )
         print(
             f"[backtransform] timing: parse {stats['t_parse_s']:.2f}s  "
             f"invert {stats['t_invert_s']:.2f}s ({stats['n_invert_pts']:,} pts)  "
