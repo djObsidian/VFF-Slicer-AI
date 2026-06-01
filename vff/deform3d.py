@@ -120,7 +120,13 @@ class DeformationMap:
         nx, ny, nz = self.phi.shape[:3]
         lo = self.origin + 0.5 * self.pitch
         hi = self.origin + (np.array([nx, ny, nz]) - 0.5) * self.pitch
-        res = np.full(N, np.inf)
+        # Track the BEST iterate per point, not the last. A non-convergent point
+        # (folded / overhang region) otherwise drifts to the grid-clamp boundary
+        # and returns Z = grid-top garbage — that's what produced the wedge
+        # spikes to the ceiling in the gcode. The lowest-residual iterate is the
+        # closest sane approximation instead.
+        best_p = q.copy()
+        best_res = np.full(N, np.inf)
         active = np.arange(N)  # indices still being iterated
         for _ in range(iters):
             if active.size == 0:
@@ -128,12 +134,14 @@ class DeformationMap:
             pa = p[active]
             r = _sample_vec(self.phi, self.origin, self.pitch, pa) - q[active]
             rn = np.linalg.norm(r, axis=1)
-            res[active] = rn
+            improved = rn < best_res[active]
+            ai = active[improved]
+            best_res[ai] = rn[improved]
+            best_p[ai] = pa[improved]
             # Drop converged points from the active set — most converge in a few
             # iterations, so this stops us re-sampling the whole array every step.
             keep = rn >= tol
             if not keep.any():
-                active = active[:0]
                 break
             work = active[keep]
             rw = r[keep]
@@ -146,8 +154,8 @@ class DeformationMap:
                 dp[detok] = np.linalg.solve(J[detok], rw[detok][:, :, None])[:, :, 0]
             p[work] = np.clip(p[work] - dp, lo, hi)
             active = work
-        converged = res < tol
-        return p, converged
+        converged = best_res < tol
+        return best_p, converged
 
 
 def solve_deformation_map(
@@ -292,6 +300,28 @@ def deform_mesh_3d(mesh: trimesh.Trimesh, dmap: DeformationMap) -> trimesh.Trime
     return trimesh.Trimesh(vertices=new_verts, faces=mesh.faces, process=False)
 
 
+def _despike_path(p: np.ndarray, thresh: float = 1.5) -> int:
+    """In-place repair of isolated "out-and-back" spikes in an ordered point
+    path. A spike is one point far from BOTH array-neighbours while the two
+    neighbours are close to each other — the signature of a wrong-branch
+    inverse at a fold (the toolpath darts to the grid ceiling and back).
+    A travel move is a single jump, not out-and-back, so it never matches.
+
+    Returns the number of points repaired (replaced by the neighbour midpoint).
+    """
+    n = p.shape[0]
+    if n < 3:
+        return 0
+    d_prev = np.linalg.norm(p[1:-1] - p[:-2], axis=1)
+    d_next = np.linalg.norm(p[1:-1] - p[2:], axis=1)
+    d_chord = np.linalg.norm(p[2:] - p[:-2], axis=1)
+    spike = (d_prev > thresh) & (d_next > thresh) & (d_chord < thresh)
+    idx = np.where(spike)[0] + 1  # back to absolute indices
+    if idx.size:
+        p[idx] = 0.5 * (p[idx - 1] + p[idx + 1])
+    return int(idx.size)
+
+
 class BackTransform3D:
     """Full-3D map adapter exposing the same forward_points_batch /
     invert_points_batch interface as backtransform.BackTransform, so it drops
@@ -349,12 +379,14 @@ class BackTransform3D:
             return xyz.copy()
         p, conv = self.dmap.inverse_points(xyz)
         n_bad = int((~conv).sum())
+        n_spikes = _despike_path(p, thresh=1.5)
         if n_bad:
             import sys
             print(
-                f"  [3d-inverse] WARNING: {n_bad:,}/{len(conv):,} points did not "
-                "converge (folded / overhang region where Φ is not injective) — "
-                "left at best-effort position. These are the unreliable tips.",
+                f"  [3d-inverse] {n_bad:,}/{len(conv):,} points did not converge "
+                "(folded / overhang region where Φ is not injective); "
+                f"{n_spikes:,} isolated wrong-branch spikes repaired by neighbour "
+                "interpolation. Tips remain the unreliable region.",
                 file=sys.stderr, flush=True,
             )
         return p
