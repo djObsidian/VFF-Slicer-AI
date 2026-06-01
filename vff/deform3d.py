@@ -103,6 +103,15 @@ class DeformationMap:
     def forward_points(self, pts: np.ndarray) -> np.ndarray:
         return _sample_vec(self.phi, self.origin, self.pitch, np.asarray(pts, float))
 
+    # ---- local volume scaling det(JΦ) at original-space points ----
+    def jacobian_det(self, pts: np.ndarray) -> np.ndarray:
+        """det of the forward Jacobian ∂Φ/∂(world) at each point = dV_def/dV_orig
+        (the local volume stretch of the deformation). Used for extrusion
+        compensation: the slicer's E assumes the deformed road volume, so the
+        true original-space deposit scales by 1/det."""
+        J = _sample_jac(self.jac, self.origin, self.pitch, np.asarray(pts, float))
+        return np.linalg.det(J)
+
     # ---- inverse: deformed → original (vectorised Newton) ----
     def inverse_points(
         self, q: np.ndarray, iters: int = 20, tol: float = 1e-4,
@@ -316,10 +325,44 @@ def solve_deformation_map(
     return DeformationMap(phi=phi, jac=jac, origin=origin, pitch=pitch)
 
 
-def deform_mesh_3d(mesh: trimesh.Trimesh, dmap: DeformationMap) -> trimesh.Trimesh:
-    """Apply the full-3D map Φ to every mesh vertex (all axes move)."""
-    new_verts = dmap.forward_points(mesh.vertices.astype(np.float64, copy=False))
-    return trimesh.Trimesh(vertices=new_verts, faces=mesh.faces, process=False)
+def _face_nonaffinity(mesh: trimesh.Trimesh, dmap: DeformationMap) -> np.ndarray:
+    """Per-face deformation error: ‖Φ(centroid) − mean(Φ(verts))‖. Nonzero where
+    Φ curves across the face — i.e. where the face is too coarse to represent the
+    deformation (a big flat triangle stays flat instead of bowing)."""
+    V = mesh.vertices.astype(np.float64, copy=False)
+    F = mesh.faces
+    cen = V[F].mean(axis=1)
+    phi_v = dmap.forward_points(V)
+    return np.linalg.norm(dmap.forward_points(cen) - phi_v[F].mean(axis=1), axis=1)
+
+
+def deform_mesh_3d(
+    mesh: trimesh.Trimesh,
+    dmap: DeformationMap,
+    subdivide_max_error: float = 0.0,
+    max_faces: int = 2_000_000,
+) -> trimesh.Trimesh:
+    """Apply the full-3D map Φ to every mesh vertex (all axes move).
+
+    The map is applied PER VERTEX, so a flat region with few/large triangles
+    can't follow Φ's curvature — it stays flat (e.g. a bore ceiling that should
+    bow). `subdivide_max_error` (mm) > 0 uniformly subdivides the mesh until the
+    worst per-face non-affinity (see _face_nonaffinity) drops below it, capped at
+    `max_faces`. Uniform subdivision is used because it stays watertight (no
+    T-junction cracks); it's heavier than a conforming adaptive remesh (Rivara
+    longest-edge bisection would hit the same quality at ~15× fewer faces — a
+    backlog item), but safe for slicing."""
+    cur = mesh
+    if subdivide_max_error and subdivide_max_error > 0:
+        while True:
+            err = _face_nonaffinity(cur, dmap)
+            if err.size == 0 or err.max() <= subdivide_max_error:
+                break
+            if len(cur.faces) * 4 > max_faces:
+                break
+            cur = cur.subdivide()
+    new_verts = dmap.forward_points(cur.vertices.astype(np.float64, copy=False))
+    return trimesh.Trimesh(vertices=new_verts, faces=cur.faces, process=False)
 
 
 def _despike_path(p: np.ndarray, thresh: float = 1.5) -> int:

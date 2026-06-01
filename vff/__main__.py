@@ -177,7 +177,7 @@ def _run_gcode_transform(args, stl_path: Path, x: float, y: float, z: float) -> 
 def _run_3d_export(args, stl_path: Path, x: float, y: float, z: float) -> int:
     """Headless full-3D deformed-mesh export (no Viewer / pyvista)."""
     from .build_volume import BuildVolume
-    from .deform3d import deform_mesh_3d, solve_deformation_map
+    from .deform3d import _face_nonaffinity, deform_mesh_3d, solve_deformation_map
     from .growth import compute_growth
     from .mesh_io import load_and_place
     from .voxelize import voxelize_solid
@@ -186,20 +186,30 @@ def _run_3d_export(args, stl_path: Path, x: float, y: float, z: float) -> int:
     print(
         f"Full-3D deform export: {stl_path} -> {args.export}\n"
         f"  volume {x:.0f}x{y:.0f}x{z:.0f} mm, pitch {args.pitch} mm, "
-        f"max-tilt {args.max_tilt} deg, smooth-sigma {args.smooth_sigma}",
+        f"max-tilt {args.max_tilt} deg, smooth-sigma {args.smooth_sigma}, "
+        f"subdivide-error {args.subdivide_error} mm",
         flush=True,
     )
     vg = voxelize_solid(mesh, pitch=args.pitch)
     gr = compute_growth(vg, max_tilt_deg=args.max_tilt)
     dmap = solve_deformation_map(gr, displacement_smooth_sigma=args.smooth_sigma)
-    dm = deform_mesh_3d(mesh, dmap)
+    base_err = float(_face_nonaffinity(mesh, dmap).max())
+    dm = deform_mesh_3d(mesh, dmap, subdivide_max_error=args.subdivide_error)
     dm.export(args.export)
     vr = (dm.volume / mesh.volume) if mesh.volume > 0 else 0.0
     print(
-        f"  saved: {len(dm.faces):,} faces, Z [{dm.bounds[0, 2]:.2f}, "
-        f"{dm.bounds[1, 2]:.2f}] mm, volume ratio {vr:.3f}",
+        f"  saved: {len(mesh.faces):,} -> {len(dm.faces):,} faces, "
+        f"Z [{dm.bounds[0, 2]:.2f}, {dm.bounds[1, 2]:.2f}] mm, volume ratio {vr:.3f}\n"
+        f"  per-face deform error: {base_err:.3f} mm at input resolution",
         flush=True,
     )
+    if args.subdivide_error <= 0 and base_err > 0.1:
+        print(
+            f"  NOTE: {base_err:.2f} mm of deformation error on coarse faces "
+            "(flat regions stay flat). Re-run with --subdivide-error 0.1 to "
+            "refine them.",
+            file=sys.stderr, flush=True,
+        )
     return 0
 
 
@@ -240,6 +250,15 @@ def main(argv: list[str] | None = None) -> int:
              "MUST match between --export and the inverse) but ignores "
              "--dz-per-layer/--dz-auto-fit/--depth-method. Note: the interactive "
              "viewer is z-only regardless.",
+    )
+    parser.add_argument(
+        "--subdivide-error", type=float, default=0.0, metavar="MM",
+        help="(--deform-mode 3d --export only) Uniformly subdivide the mesh "
+             "before deforming until the worst per-face deformation error drops "
+             "below this many mm (0 = off). Fixes flat regions defined by few "
+             "large triangles (e.g. a bore ceiling) that otherwise stay flat "
+             "instead of following the curved deformation. Try 0.1. Heavier "
+             "meshes; capped at ~2M faces.",
     )
     parser.add_argument(
         "--extrusion-comp", action=argparse.BooleanOptionalAction, default=True,

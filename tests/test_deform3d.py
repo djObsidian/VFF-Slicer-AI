@@ -19,7 +19,7 @@ except Exception:
 
 from vff.build_volume import BuildVolume
 from vff.deform import deform_mesh
-from vff.deform3d import deform_mesh_3d, solve_deformation_map
+from vff.deform3d import _face_nonaffinity, deform_mesh_3d, solve_deformation_map
 from vff.growth import compute_growth
 from vff.mesh_io import load_and_place
 from vff.voxelize import voxelize_solid
@@ -124,12 +124,34 @@ def test_extrusion_comp_matches_volume_ratio():
           f"== 1/vol-ratio {inv_vol_ratio:.3f})")
 
 
+def test_subdivision_refines_coarse_faces_watertight():
+    """Coarse flat faces deform with large per-face error; --subdivide-error
+    refines them and the result stays watertight (uniform → no T-cracks)."""
+    stl = Path(__file__).resolve().parent.parent / "propeller_fixed_flat.stl"
+    if not stl.exists():
+        print("  SKIP subdivision (propeller_fixed_flat.stl not found)")
+        return
+    m = load_and_place(str(stl), BuildVolume.of(250, 250, 250))
+    gr = compute_growth(voxelize_solid(m, pitch=1.0), max_tilt_deg=30.0)
+    dmap = solve_deformation_map(gr)
+    err0 = float(_face_nonaffinity(m, dmap).max())
+    assert err0 > 0.1, f"expected coarse faces with >0.1mm error, got {err0:.3f}"
+
+    coarse = deform_mesh_3d(m, dmap)                                  # no subdiv
+    fine = deform_mesh_3d(m, dmap, subdivide_max_error=0.1)           # auto subdiv
+    assert len(fine.faces) > len(coarse.faces), "subdivision must add faces"
+    assert fine.is_watertight, "uniform subdivision must stay watertight (no cracks)"
+    print(f"  PASS subdivision ({err0:.2f}mm coarse err; {len(coarse.faces):,}->"
+          f"{len(fine.faces):,} faces, watertight {fine.is_watertight})")
+
+
 def main() -> int:
     tests = [
         test_flat_box_maps_to_identity,
         test_propeller_less_distortion_than_zonly,
         test_inverse_roundtrip_converged_is_exact,
         test_extrusion_comp_matches_volume_ratio,
+        test_subdivision_refines_coarse_faces_watertight,
     ]
     failures = 0
     for t in tests:
