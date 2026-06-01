@@ -237,9 +237,10 @@ positional: STL                 path to STL (default ./propeller_fixed_flat.stl)
   --subdivide-error MM          (3d --export) refine coarse faces until error < MM (default 0 = off)
   --extrusion-comp / --no-extrusion-comp   (3d) rescale E for the deformation (default on)
   --extrusion-comp-mode vertical|volume    (3d) comp model (default vertical = 3-axis)
-  --cool-overhangs / --no-cool-overhangs   (3d inverse) full fan on re-detected overhangs/bridges (default on)
-  --cool-fan 0..255             (3d inverse) fan PWM forced on overhangs (default 255)
-  --cool-probe MM               (3d inverse) downward support-probe distance (default 0.4)
+  --cool-overhangs / --no-cool-overhangs   (3d inverse) ramp fan on re-detected overhangs/bridges (default on)
+  --cool-fan-min 0..255         (3d inverse) fan PWM at the lightest overhang (default 128)
+  --cool-fan-max 0..255         (3d inverse) fan PWM at a full bridge (default 255); lerp by severity
+  --cool-probe MM               (3d inverse) downward support-probe column depth (default 0.8)
 
   --export PATH                 save the deformed mesh
   --no-viewer                   skip the interactive viewer (batch)

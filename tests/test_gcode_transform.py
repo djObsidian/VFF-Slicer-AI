@@ -172,31 +172,34 @@ def test_max_z_speed_hard_caps_z_velocity():
     print(f"  PASS max-z-speed (flat F 6000 kept; 45° move capped 6000 -> {expect:.0f})")
 
 
-def test_overhang_cooling_injects_and_restores_fan():
-    """Inverse cooling: a printing move whose original-space points are flagged
-    unsupported gets a fan boost (M106 S255) injected before it; once the part
-    is supported again for `cool_linger` moves the slicer's own fan is restored.
-    Uses a stub 3D BackTransform (identity inverse, Z-band overhang flag) so the
-    test is deterministic and geometry-free."""
+def test_overhang_cooling_ramps_fan_by_severity():
+    """Inverse cooling ramps the fan LINEARLY between cool_fan_min/max by the
+    overhang degree (like a slicer's per-overlap fan curve): degree 0.5 → mid,
+    1.0 → max, and the slicer's own fan is restored after the part is supported
+    for `cool_linger` moves. Stub 3D BackTransform (identity inverse, a Z-band
+    degree) keeps it deterministic and geometry-free."""
     class _StubBT:
         is_3d = True
         mesh = object()  # non-None: passes the gate
         def invert_points_batch(self, xyz):
             return np.asarray(xyz, dtype=np.float64).copy()  # identity
-        def overhang_mask(self, xyz, probe=0.4, min_z=0.6):
-            return np.asarray(xyz, dtype=np.float64)[:, 2] >= 5.0  # high band
+        def overhang_degree(self, xyz, probe=0.8, min_z=0.6):
+            z = np.asarray(xyz, dtype=np.float64)[:, 2]
+            d = np.zeros(len(z))
+            d[(z >= 5) & (z < 8)] = 0.5   # partial overhang
+            d[z >= 8] = 1.0               # full bridge
+            return d
 
     gcode = (
         "M83\nM106 S80\n"
         "G1 X0 Y0 Z1 F1800\n"
         "G1 X1 Y0 Z1 E1\n"   # supported
-        "G1 X2 Y0 Z6 E1\n"   # climbs into the overhang band → boost here
-        "G1 X3 Y0 Z6 E1\n"   # still overhang
-        "G1 X4 Y0 Z1 E1\n"   # supported again (linger 1)
-        "G1 X5 Y0 Z1 E1\n"   # linger 2
-        "G1 X6 Y0 Z1 E1\n"   # linger 3
-        "G1 X7 Y0 Z1 E1\n"   # linger 4 (>3) → restore S80
-        "G1 X8 Y0 Z1 E1\n"
+        "G1 X2 Y0 Z6 E1\n"   # degree 0.5 → 100 + 0.5*(200-100) = 150
+        "G1 X3 Y0 Z9 E1\n"   # degree 1.0 → 200
+        "G1 X4 Y0 Z1 E1\n"   # supported (linger 1)
+        "G1 X5 Y0 Z1 E1\n"   # 2
+        "G1 X6 Y0 Z1 E1\n"   # 3
+        "G1 X7 Y0 Z1 E1\n"   # 4 (>3) → restore S80
     )
     with tempfile.TemporaryDirectory() as td:
         ip = Path(td) / "in.gcode"
@@ -205,18 +208,21 @@ def test_overhang_cooling_injects_and_restores_fan():
         stats = backtransform_gcode_file(
             ip, op, _StubBT(), subdiv_mm=100, n_jobs=1, verbose=False,
             direction="inverse", extrusion_comp=False,
-            cool_overhangs=True, cool_fan=255,
+            cool_overhangs=True, cool_fan_min=100, cool_fan_max=200,
         )
         lines = op.read_text(encoding="utf-8").splitlines()
 
-    boosts = [i for i, ln in enumerate(lines) if ln.startswith("M106 S255")]
-    assert len(boosts) == 1, f"expected exactly one fan boost, got {len(boosts)}: {lines}"
-    assert stats["n_cool_boosts"] == 1 and stats["n_cool_moves"] == 2, (
-        f"expected 1 boost over 2 flagged moves, got {stats['n_cool_boosts']}/{stats['n_cool_moves']}")
-    # The slicer's S80 must be restored AFTER the boost (fan not stuck on full).
-    restores = [i for i, ln in enumerate(lines) if ln.startswith("M106 S80") and i > boosts[0]]
-    assert restores, f"slicer fan S80 not restored after the overhang: {lines}"
-    print("  PASS overhang cooling (1 boost over 2 moves; S80 restored after linger)")
+    def idx(prefix):
+        return [i for i, ln in enumerate(lines) if ln.startswith(prefix)]
+    mid, full = idx("M106 S150"), idx("M106 S200")
+    assert len(mid) == 1 and len(full) == 1, f"want one S150 + one S200: {lines}"
+    assert mid[0] < full[0], "lighter overhang (S150) must come before the bridge (S200)"
+    assert stats["n_cool_moves"] == 2 and stats["n_cool_boosts"] == 2, (
+        f"want 2 overhang moves / 2 fan changes, got "
+        f"{stats['n_cool_moves']}/{stats['n_cool_boosts']}")
+    restore = [i for i in idx("M106 S80") if i > full[0]]
+    assert restore, f"slicer fan S80 not restored after the overhang: {lines}"
+    print("  PASS overhang cooling ramp (S150 @0.5 → S200 @1.0; S80 restored)")
 
 
 def test_propeller_forward_inverse_roundtrip():
@@ -257,7 +263,7 @@ def main() -> int:
         test_absolute_e_with_running_start,
         test_z_slowdown_scales_steep_move_feedrate,
         test_max_z_speed_hard_caps_z_velocity,
-        test_overhang_cooling_injects_and_restores_fan,
+        test_overhang_cooling_ramps_fan_by_severity,
         test_propeller_forward_inverse_roundtrip,
     ]
     failures = 0

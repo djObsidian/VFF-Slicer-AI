@@ -632,8 +632,8 @@ def clip_gcode_file(
 def _write_transformed_gcode(
     out_path: Path, units: list, xyz_out: np.ndarray, header: str,
     escale: np.ndarray | None = None, z_slowdown: float = 1.0,
-    overhang_mask: np.ndarray | None = None, cool_fan: int = 255,
-    cool_linger: int = 3, max_z_speed: float = 0.0,
+    overhang_deg: np.ndarray | None = None, cool_fan_min: int = 128,
+    cool_fan_max: int = 255, cool_linger: int = 3, max_z_speed: float = 0.0,
 ) -> dict:
     """Pass 3: stream-write the unit list, reading move endpoints from xyz_out.
 
@@ -658,12 +658,15 @@ def _write_transformed_gcode(
     onto steep sections; use `max_z_speed` to actually bound Z velocity. e.g. 0.5
     = halve F on the steepest parts.
 
-    `overhang_mask` (per-point bool, parallel to xyz_out): force the fan to
-    `cool_fan` over any printing move that contains a flagged (unsupported,
-    post-inverse) point — see BackTransform3D.overhang_mask. The slicer's own
-    M106/M107 are tracked; while a boost is active they're swallowed and then
-    restored once the overhang ends (after `cool_linger` supported moves of
-    hysteresis, so the fan doesn't flap)."""
+    `overhang_deg` (per-point severity in [0,1], parallel to xyz_out): ramp the
+    fan over overhang/bridge moves — see BackTransform3D.overhang_degree. Per
+    printing move the worst (max) degree d of its pieces picks a fan by linear
+    interpolation `cool_fan_min + d·(cool_fan_max − cool_fan_min)` (so a slight
+    overhang gets a gentle boost, a full bridge gets the max), applied only
+    where it exceeds the slicer's own fan. Supported moves (d = 0) get no boost.
+    The slicer's own M106/M107 are tracked; while a boost is active they're
+    swallowed and restored once the part is supported again for `cool_linger`
+    moves of hysteresis (so the fan doesn't flap)."""
     _REF_SLOPE = 0.5   # |dz|/len at ~30° (the default --max-tilt); full slowdown here
     lines_out = 0
     cur = None         # last written position (cx, cy, cz)
@@ -677,13 +680,15 @@ def _write_transformed_gcode(
     do_feed = do_slow or do_zcap
 
     # --- overhang cooling state ---
-    do_cool = overhang_mask is not None
+    do_cool = overhang_deg is not None
+    cool_span = max(0, int(cool_fan_max) - int(cool_fan_min))
     cool_on = False          # is our boost currently overriding the fan?
+    cur_boost = 0            # the fan value we last forced (while cool_on)
     slicer_fan_line = None   # the last fan command the slicer itself issued
     slicer_fan_val = 0       # its parsed S (M107 → 0)
     since_overhang = cool_linger + 1
-    n_cool_boosts = 0        # M106 boosts we injected
-    n_cool_moves = 0         # printing moves flagged as overhang/bridge
+    n_cool_boosts = 0        # M106 lines we injected
+    n_cool_moves = 0         # printing moves with an overhang ramp
 
     with out_path.open("w", encoding="utf-8", newline="\n") as fo:
         fo.write(header)
@@ -712,23 +717,30 @@ def _write_transformed_gcode(
             _, out_cmd, e_val, f_val, tail, n_pieces, start_idx, e_rel, e_start = u
             if f_val is not None:
                 modal_f = f_val
-            # --- overhang cooling, decided per printing move ---
+            # --- overhang cooling, ramped per printing move ---
             if do_cool and out_cmd == "G1" and e_val is not None:
-                flagged = bool(overhang_mask[start_idx:start_idx + n_pieces].any())
-                if flagged:
+                seg = overhang_deg[start_idx:start_idx + n_pieces]
+                deg = float(seg.max()) if seg.size else 0.0
+                if deg > 0.0:
                     n_cool_moves += 1
                     since_overhang = 0
-                    if not cool_on and cool_fan > slicer_fan_val:
-                        fo.write(f"M106 S{int(cool_fan)} ; vff cool overhang\n")
+                    # lerp min→max by severity, but never drop below the slicer.
+                    eff = max(int(round(cool_fan_min + cool_span * deg)), slicer_fan_val)
+                    if eff > slicer_fan_val and (not cool_on or eff != cur_boost):
+                        fo.write(f"M106 S{eff} ; vff cool overhang {int(round(deg*100))}%\n")
                         lines_out += 1
                         n_cool_boosts += 1
-                        cool_on = True
+                        cool_on, cur_boost = True, eff
+                    elif cool_on and eff <= slicer_fan_val:
+                        fo.write((slicer_fan_line or "M107") + "\n")
+                        lines_out += 1
+                        cool_on, cur_boost = False, 0
                 else:
                     since_overhang += 1
                     if cool_on and since_overhang > cool_linger:
                         fo.write((slicer_fan_line or "M107") + "\n")
                         lines_out += 1
-                        cool_on = False
+                        cool_on, cur_boost = False, 0
             for piece in range(n_pieces):
                 pi = start_idx + piece
                 ox, oy, oz = xyz_out[pi]
@@ -798,8 +810,9 @@ def backtransform_gcode_file(
     z_slowdown: float = 1.0,
     max_z_speed: float = 0.0,
     cool_overhangs: bool = False,
-    cool_fan: int = 255,
-    cool_probe: float = 0.4,
+    cool_fan_min: int = 128,
+    cool_fan_max: int = 255,
+    cool_probe: float = 0.8,
     cool_min_z: float = 0.6,
 ) -> dict:
     """Three-pass batched G-code transform using a BackTransform's depth field.
@@ -896,28 +909,30 @@ def backtransform_gcode_file(
         stats["e_comp_mean"] = float(escale.mean())
         stats["e_comp_range"] = (float(escale.min()), float(escale.max()))
 
-    # Overhang/bridge re-detection + cooling boost. The slicer scheduled the fan
+    # Overhang/bridge re-detection + graded cooling. The slicer scheduled the fan
     # from the DEFORMED, flat geometry; after the inverse, surfaces it treated as
     # flat (well-supported) can hang over a void in the real part. Only the 3D
-    # inverse exposes the original mesh to test "is there material directly below
-    # this point?". See BackTransform3D.overhang_mask.
-    overhang_mask = None
+    # inverse exposes the original mesh to grade "how much material is below this
+    # point?" into a [0,1] severity. See BackTransform3D.overhang_degree.
+    overhang_deg = None
     if (cool_overhangs and direction == "inverse"
             and getattr(bt, "is_3d", False) and getattr(bt, "mesh", None) is not None
             and n_pts):
-        overhang_mask = bt.overhang_mask(xyz_orig, probe=cool_probe, min_z=cool_min_z)
-        stats["n_overhang_pts"] = int(overhang_mask.sum())
+        overhang_deg = bt.overhang_degree(xyz_orig, probe=cool_probe, min_z=cool_min_z)
+        stats["n_overhang_pts"] = int((overhang_deg > 0).sum())
 
     header = (
         "; backtransformed by vff/backtransform.py — "
         "deformed-space XYZ inverted to original (non-planar) space"
         + ("; extrusion volume-compensated" if escale is not None else "")
-        + ("; overhang/bridge cooling re-detected" if overhang_mask is not None else "")
+        + (f"; overhang cooling S{cool_fan_min}..{cool_fan_max} ramped"
+           if overhang_deg is not None else "")
         + "\n"
     )
     _w = _write_transformed_gcode(
         out_path, units, xyz_orig, header, escale=escale, z_slowdown=z_slowdown,
-        max_z_speed=max_z_speed, overhang_mask=overhang_mask, cool_fan=cool_fan,
+        max_z_speed=max_z_speed, overhang_deg=overhang_deg,
+        cool_fan_min=cool_fan_min, cool_fan_max=cool_fan_max,
     )
     stats["lines_out"] = _w["lines_out"]
     stats["n_slowed"] = _w["n_slowed"]
@@ -963,7 +978,8 @@ def backtransform_gcode_file(
             print(
                 f"[backtransform] overhang cooling: {stats['n_overhang_pts']:,} unsupported "
                 f"points on {stats['n_cool_moves']:,} moves → {stats['n_cool_boosts']:,} fan "
-                f"boosts to S{cool_fan} (overhangs/bridges the slicer scheduled from the flat mesh)"
+                f"changes ramped S{cool_fan_min}..{cool_fan_max} by overhang severity "
+                "(overhangs/bridges the slicer scheduled from the flat mesh)"
             )
         print(
             f"[backtransform] timing: parse {stats['t_parse_s']:.2f}s  "

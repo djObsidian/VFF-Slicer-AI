@@ -555,33 +555,42 @@ class BackTransform3D:
             )
         return p
 
-    def overhang_mask(
-        self, xyz_orig: np.ndarray, probe: float = 0.4, min_z: float = 0.6,
+    def overhang_degree(
+        self, xyz_orig: np.ndarray, probe: float = 0.8, min_z: float = 0.6,
+        n_probes: int = 4,
     ) -> np.ndarray:
-        """Per-point boolean: True where an ORIGINAL-space toolpath point is
-        unsupported from directly below — an overhang or bridge.
+        """Per-point overhang SEVERITY in [0, 1] for the post-inverse cooling
+        ramp: 0 = fully supported (part material the whole way down the probe
+        column), 1 = fully unsupported (a bridge — air all `probe` mm below).
 
         The slicer scheduled cooling (M106) from the DEFORMED, flat geometry,
         where every layer rests squarely on the one beneath it. After the
-        inverse maps the path back onto the curved part, a segment can end up
-        hanging over a void that the slicer never saw as an overhang. On this
-        3-axis machine the nozzle is vertical, so material is laid on whatever
-        is directly below in world Z — hence "supported" ⇔ part material exists
-        `probe` mm straight down. We test `contains(p − probe·ẑ)` against the
-        original mesh: walls/infill/top-surfaces have solid below (→ supported,
-        not flagged); only downward-facing overhang surfaces and bridge spans
-        have air below (→ flagged). Points within `min_z` of the plate are
-        never flagged (the bed supports them). Returns all-False if no mesh was
-        stored (e.g. a map built directly from a GrowthResult)."""
+        inverse maps the path back onto the curved part, a segment can hang over
+        a void the slicer never saw. On this 3-axis machine the nozzle is
+        vertical, so material is laid on whatever is directly below in world Z —
+        hence "support" ⇔ part material straight down. We sample `n_probes`
+        evenly spaced depths in (0, probe] and return the FRACTION that fall
+        OUTSIDE the part (`contains` False). That fraction is the continuous
+        analogue of a slicer's overhang/overlap % (overlap ≈ 1 − degree), so the
+        caller can ramp the fan with severity instead of switching it fully on:
+        a near-vertical wall has solid right below (→ ~0), a steep overhang sits
+        out over more air (→ mid), a flat bridge has none (→ 1). Walls / infill
+        / top-surfaces read ~0. Points within `min_z` of the plate are forced to
+        0 (the bed supports them). All-zero if no mesh was stored."""
         xyz = np.asarray(xyz_orig, dtype=np.float64)
         n = xyz.shape[0]
-        if self.mesh is None or n == 0:
-            return np.zeros(n, dtype=bool)
+        if self.mesh is None or n == 0 or n_probes < 1:
+            return np.zeros(n, dtype=np.float64)
         bed_z = float(self.mesh.bounds[0, 2])
-        probe_pts = xyz.copy()
-        probe_pts[:, 2] -= float(probe)
-        supported = np.asarray(self.mesh.contains(probe_pts), dtype=bool)
-        return (~supported) & (xyz[:, 2] > bed_z + float(min_z))
+        air = np.zeros(n, dtype=np.float64)
+        for k in range(n_probes):
+            depth = (k + 0.5) / n_probes * float(probe)
+            pp = xyz.copy()
+            pp[:, 2] -= depth
+            air += ~np.asarray(self.mesh.contains(pp), dtype=bool)
+        degree = air / n_probes
+        degree[xyz[:, 2] <= bed_z + float(min_z)] = 0.0
+        return degree
 
 
 # --------------------------------------------------------------------------

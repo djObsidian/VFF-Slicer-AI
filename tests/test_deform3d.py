@@ -266,28 +266,31 @@ def test_inverse_keeps_first_layer_z_and_never_digs_bed():
           f"worst {worst:+.4f} mm)")
 
 
-def test_overhang_mask_flags_unsupported_points():
-    """The post-inverse cooling detector flags toolpath points with no part
-    material straight below (overhang/bridge) and leaves walls / top surfaces /
-    near-bed points alone — on a sphere, the lower hemisphere's underside is the
-    overhang, the upper part is supported."""
-    sphere = trimesh.creation.icosphere(subdivisions=3, radius=10.0)
-    sphere.apply_translation([125.0, 125.0, 10.0])   # Z in [0, 20], bed at 0
-    bt = BackTransform3D(None, mesh=sphere)
-    R, cx, cy, cz = 10.0, 125.0, 125.0, 10.0
-    under = [cx + np.sqrt(R**2 - (3.0 - cz)**2), cy, 3.0]  # lower-hemisphere surface
-    top = [cx, cy, 19.6]                                   # top surface
-    interior = [cx + 5.0, cy, 10.0]                        # solid below
-    nearbed = [cx, cy, 0.3]                                # under min_z
-    pts = np.array([under, top, interior, nearbed], dtype=np.float64)
-    mask = bt.overhang_mask(pts, probe=0.4, min_z=0.6)
-    assert mask[0], "lower-hemisphere underside must be flagged (air below)"
-    assert not mask[1], "top surface must not be flagged (solid below)"
-    assert not mask[2], "interior/wall point must not be flagged (solid below)"
-    assert not mask[3], "near-bed point must be excluded by min_z"
-    # No mesh stored → no flags (a map built straight from a GrowthResult).
-    assert not BackTransform3D(None, mesh=None).overhang_mask(pts).any()
-    print(f"  PASS overhang mask (underside flagged; top/wall/near-bed/no-mesh not)")
+def test_overhang_degree_ramps_with_severity():
+    """overhang_degree is a continuous [0,1] severity (the fraction of the
+    downward probe column that is air) — the input to the fan ramp. 0 = solid
+    right below (supported), 1 = air all the way (bridge), graded between.
+    Checked against a half-space slab (solid below z=5) so the fractions are
+    exact: 4 probes at depths 0.1/0.3/0.5/0.7 below the point."""
+    class _Slab:
+        bounds = np.array([[0.0, 0.0, 0.0], [10.0, 10.0, 20.0]])
+        def contains(self, pts):
+            return np.asarray(pts, dtype=np.float64)[:, 2] < 5.0
+
+    bt = BackTransform3D(None, mesh=_Slab())
+
+    def deg(z):
+        return float(bt.overhang_degree(
+            np.array([[1.0, 1.0, z]]), probe=0.8, min_z=0.6, n_probes=4)[0])
+
+    assert deg(10.0) == 1.0, "all probes air → bridge → 1.0"
+    assert deg(4.0) == 0.0, "all probes solid → supported → 0.0"
+    assert abs(deg(5.4) - 0.5) < 1e-9, "probes 5.3,5.1 air / 4.9,4.7 solid → 0.5"
+    assert abs(deg(5.6) - 0.75) < 1e-9, "probes 5.5,5.3,5.1 air / 4.9 solid → 0.75"
+    assert deg(0.3) == 0.0, "near-bed (< min_z) forced to 0"
+    assert not BackTransform3D(None, mesh=None).overhang_degree(
+        np.array([[1.0, 1.0, 10.0]])).any(), "no mesh → all 0"
+    print("  PASS overhang degree ramp (1.0 / 0.75 / 0.5 / 0.0; near-bed & no-mesh 0)")
 
 
 def main() -> int:
@@ -301,7 +304,7 @@ def main() -> int:
         test_subdivision_refines_coarse_faces_watertight,
         test_default_smoothing_keeps_a_bore_dome,
         test_inverse_keeps_first_layer_z_and_never_digs_bed,
-        test_overhang_mask_flags_unsupported_points,
+        test_overhang_degree_ramps_with_severity,
     ]
     failures = 0
     for t in tests:

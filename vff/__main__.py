@@ -71,7 +71,7 @@ def _run_gcode_transform(args, stl_path: Path, x: float, y: float, z: float) -> 
             f"  max-tilt     : {args.max_tilt} deg\n"
             f"  smooth-sigma : {args.smooth_sigma} (must match the export)\n"
             f"  extrusion-comp: {(args.extrusion_comp_mode if args.extrusion_comp else 'off')}\n"
-            f"  cool-overhangs: {('S'+str(args.cool_fan)+', probe '+str(args.cool_probe)+' mm' if (args.cool_overhangs and args.gcode_direction == 'inverse') else 'off')}\n"
+            f"  cool-overhangs: {('S'+str(args.cool_fan_min)+'..'+str(args.cool_fan_max)+' ramped, probe '+str(args.cool_probe)+' mm' if (args.cool_overhangs and args.gcode_direction == 'inverse') else 'off')}\n"
             f"  max-z-speed  : {(str(args.max_z_speed)+' mm/s' if args.max_z_speed and args.max_z_speed > 0 else 'off')}\n"
             f"{align_info}"
             f"  subdiv-mm    : {args.subdiv_mm} mm",
@@ -87,7 +87,8 @@ def _run_gcode_transform(args, stl_path: Path, x: float, y: float, z: float) -> 
             subdiv_mm=args.subdiv_mm, n_jobs=1, direction=args.gcode_direction,
             extrusion_comp=args.extrusion_comp, extrusion_comp_mode=args.extrusion_comp_mode,
             z_slowdown=args.z_slowdown, max_z_speed=args.max_z_speed,
-            cool_overhangs=args.cool_overhangs, cool_fan=args.cool_fan,
+            cool_overhangs=args.cool_overhangs,
+            cool_fan_min=args.cool_fan_min, cool_fan_max=args.cool_fan_max,
             cool_probe=args.cool_probe, cool_min_z=args.cool_min_z,
         )
         return 0
@@ -315,17 +316,23 @@ def main(argv: list[str] | None = None) -> int:
              "(e.g. ABS/ASA, or to skip the extra mesh-containment pass).",
     )
     parser.add_argument(
-        "--cool-fan", type=int, default=255, metavar="0-255",
-        help="(--cool-overhangs) Fan PWM forced over detected overhangs/bridges "
-             "(default 255 = full). Only raises the fan above the slicer's own "
-             "setting, never lowers it.",
+        "--cool-fan-min", type=int, default=128, metavar="0-255",
+        help="(--cool-overhangs) Fan PWM at the LIGHTEST detected overhang "
+             "(default 128). The fan ramps linearly from here to --cool-fan-max "
+             "with overhang severity (like a slicer's per-overlap fan curve). "
+             "Only ever raises the fan above the slicer's own value.",
     )
     parser.add_argument(
-        "--cool-probe", type=float, default=0.4, metavar="MM",
-        help="(--cool-overhangs) How far straight down (mm) to test for support. "
-             "A point is an overhang/bridge if no part material lies this far "
-             "below it. Default 0.4 (~a layer or two); larger = only steeper "
-             "overhangs flagged.",
+        "--cool-fan-max", type=int, default=255, metavar="0-255",
+        help="(--cool-overhangs) Fan PWM at a full bridge / worst overhang "
+             "(default 255 = full).",
+    )
+    parser.add_argument(
+        "--cool-probe", type=float, default=0.8, metavar="MM",
+        help="(--cool-overhangs) Depth (mm) of the downward support-probe "
+             "column. Severity = fraction of that column (4 samples) that is "
+             "air below the point: 0 = solid right below (no boost), 1 = air all "
+             "the way (bridge → --cool-fan-max). Default 0.8 (~a few layers).",
     )
     parser.add_argument(
         "--cool-min-z", type=float, default=0.6, metavar="MM",
