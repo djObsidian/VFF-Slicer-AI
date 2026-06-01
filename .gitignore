@@ -17,6 +17,7 @@ section_xz.png
 deformed.stl
 deformed.gcode
 deformed_3d.gcode
+result.gcode
 propeller_inverse*.gcode
 propeller_nonplanar*.gcode
 propeller_conformed*.gcode
