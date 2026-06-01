@@ -71,7 +71,7 @@ def _run_gcode_transform(args, stl_path: Path, x: float, y: float, z: float) -> 
             f"  max-tilt     : {args.max_tilt} deg\n"
             f"  smooth-sigma : {args.smooth_sigma} (must match the export)\n"
             f"  growth-source: {args.growth_source} (must match the export)\n"
-            f"  extrusion-comp: {'on' if args.extrusion_comp else 'off'}\n"
+            f"  extrusion-comp: {(args.extrusion_comp_mode if args.extrusion_comp else 'off')}\n"
             f"{align_info}"
             f"  subdiv-mm    : {args.subdiv_mm} mm",
             flush=True,
@@ -84,7 +84,7 @@ def _run_gcode_transform(args, stl_path: Path, x: float, y: float, z: float) -> 
         backtransform_gcode_file(
             args.gcode_in, out_path, bt3,
             subdiv_mm=args.subdiv_mm, n_jobs=1, direction=args.gcode_direction,
-            extrusion_comp=args.extrusion_comp,
+            extrusion_comp=args.extrusion_comp, extrusion_comp_mode=args.extrusion_comp_mode,
         )
         return 0
 
@@ -230,11 +230,11 @@ def main(argv: list[str] | None = None) -> int:
         help="Max nozzle tilt from vertical in degrees (default 30). Set at startup, not changed dynamically.",
     )
     parser.add_argument(
-        "--smooth-sigma", type=float, default=None,
-        help="Gaussian sigma (in voxels). Mode-dependent default: 3d smooths the "
-             "DISPLACEMENT field (default 0.5 — keep low or it crushes real "
-             "curvature like a bore-ceiling dome); z-only smooths the DEPTH field "
-             "(default 2.0). Lower = sharper deformation; higher = smoother but weaker.",
+        "--smooth-sigma", type=float, default=2.0,
+        help="Gaussian sigma (in voxels), default 2.0. 3d smooths the DISPLACEMENT "
+             "field (smoother mesh, fewer folds; softens domes — pair with "
+             "--subdivide-error to keep them, or lower sigma for a sharper dome). "
+             "z-only smooths the DEPTH field. Lower = sharper; higher = smoother/weaker.",
     )
     parser.add_argument(
         "--depth-method", choices=["vectors", "fmm", "dijkstra"], default="vectors",
@@ -277,12 +277,19 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--extrusion-comp", action=argparse.BooleanOptionalAction, default=True,
-        help="(--deform-mode 3d only) Volume-compensate extrusion: scale each "
-             "G-code segment's E by the local volume stretch of the deformation "
-             "(1/det(JΦ) for inverse), so stretched/compressed layers get the "
-             "right amount of material. Mean factor ≈ 1/volume-ratio. Requires "
-             "relative E (M83); absolute E is left uncompensated. Default on; "
-             "--no-extrusion-comp to disable.",
+        help="(--deform-mode 3d only) Rescale each G-code segment's E for the "
+             "deformation so stretched/compressed layers get the right amount of "
+             "material. Requires relative E (M83); absolute E left uncompensated. "
+             "Default on; --no-extrusion-comp to disable.",
+    )
+    parser.add_argument(
+        "--extrusion-comp-mode", choices=["vertical", "volume"], default="vertical",
+        help="Extrusion-comp model. 'vertical' (default, 3-axis vertical nozzle): "
+             "scale by the layer-height squish ∂orig_z/∂def_z — fixed road width, "
+             "so only the layer spacing matters; reduces E where layers compress. "
+             "'volume' (4/5-axis, S4-style): scale by 1/det(JΦ) — material-"
+             "conservative, for a tilting nozzle whose road deforms in all axes. "
+             "On the propeller they differ ~12% and opposite sign in the bulk.",
     )
     parser.add_argument(
         "--export", metavar="PATH",
@@ -386,13 +393,6 @@ def main(argv: list[str] | None = None) -> int:
              "this one will.",
     )
     args = parser.parse_args(argv)
-
-    # --smooth-sigma means different things per mode and wants different
-    # defaults: 3d smooths the DISPLACEMENT field (keep LOW — 0.5 — or the
-    # dome gets crushed); z-only smooths the DEPTH field (2.0). Resolve here so
-    # both --export and the inverse pick the same value.
-    if args.smooth_sigma is None:
-        args.smooth_sigma = 0.5 if args.deform_mode == "3d" else 2.0
 
     # Fast path: --gcode-in + (--conform-to | --clip-to) needs neither a build
     # volume nor the positional STL (depth field is bypassed). Skip the

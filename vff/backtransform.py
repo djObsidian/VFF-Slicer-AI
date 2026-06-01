@@ -686,6 +686,7 @@ def backtransform_gcode_file(
     verbose: bool = True,
     direction: str = "forward",
     extrusion_comp: bool = False,
+    extrusion_comp_mode: str = "vertical",
 ) -> dict:
     """Three-pass batched G-code transform using a BackTransform's depth field.
 
@@ -757,17 +758,27 @@ def backtransform_gcode_file(
         z_orig_min = float(xyz_orig[:, 2].min())
         z_orig_max = float(xyz_orig[:, 2].max())
 
-    # Extrusion (volume) compensation: the deformation stretches/compresses the
-    # road, so the slicer's E (computed for the source geometry) is rescaled by
-    # the local volume ratio. det(JΦ) = dV_def/dV_orig, sampled at the
-    # ORIGINAL-space point. inverse: source=deformed, want original → ×1/det.
-    # forward: source=original, want deformed → ×det. Only the 3D map exposes a
-    # Jacobian; the Z-only path has no XY volume change to compensate here.
+    # Extrusion compensation: the deformation stretches/compresses each road, so
+    # the slicer's E (computed for the source geometry) is rescaled. Sampled at
+    # the ORIGINAL-space point. Only the 3D map exposes a Jacobian.
+    #   'vertical' (default, 3-axis): scale by the layer-height squish
+    #       ∂orig_z/∂def_z. The vertical nozzle has a fixed road WIDTH, so
+    #       over/under-extrusion is driven by how the layer spacing changes, not
+    #       the full volume. Reduces E where layers compress → fixes the
+    #       over-extrusion the volume mode causes in the bulk.
+    #   'volume' (4/5-axis, S4-style): scale by 1/det — material-conservative,
+    #       correct when the nozzle tilts and the road deforms in all directions.
     escale = None
     if extrusion_comp and getattr(bt, "is_3d", False) and n_pts:
         orig_pts = xyz_orig if direction == "inverse" else xyz_def
-        det = np.clip(bt.dmap.jacobian_det(orig_pts), 0.2, 5.0)
-        escale = (1.0 / det) if direction == "inverse" else det
+        if extrusion_comp_mode == "volume":
+            det = np.clip(bt.dmap.jacobian_det(orig_pts), 0.2, 5.0)
+            escale = (1.0 / det) if direction == "inverse" else det
+        else:  # 'vertical' — 3-axis layer-height squish
+            gap = bt.dmap.layer_gap_ratio(orig_pts)  # ∂orig_z/∂def_z
+            escale = gap if direction == "inverse" else 1.0 / np.where(np.abs(gap) > 1e-3, gap, 1e-3)
+            escale = np.clip(escale, 0.3, 3.0)
+        stats["e_comp_mode"] = extrusion_comp_mode
         stats["e_comp_mean"] = float(escale.mean())
         stats["e_comp_range"] = (float(escale.min()), float(escale.max()))
 
@@ -801,8 +812,9 @@ def backtransform_gcode_file(
         if "e_comp_mean" in stats:
             lo, hi = stats["e_comp_range"]
             print(
-                f"[backtransform] extrusion comp: mean x{stats['e_comp_mean']:.3f} "
-                f"(range x{lo:.2f}..x{hi:.2f}) — volume-corrected E for the deformation"
+                f"[backtransform] extrusion comp ({stats['e_comp_mode']}): "
+                f"mean x{stats['e_comp_mean']:.3f} (range x{lo:.2f}..x{hi:.2f}) "
+                f"— E rescaled for the deformation"
             )
         print(
             f"[backtransform] timing: parse {stats['t_parse_s']:.2f}s  "
