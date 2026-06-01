@@ -406,30 +406,59 @@ class Viewer:
         for key, (label, fn) in bindings.items():
             self.plotter.add_key_event(key, _safe(label, fn))
 
-        # Diagnostic: log every key VTK actually sees, regardless of binding.
-        # Lets us see e.g. "user pressed F1, got no callback" or "keysym
-        # was Cyrillic_..." on a non-US layout.
+        # --- Non-US keyboard-layout crash guard -------------------------------
+        # On Windows a non-US layout (e.g. Russian) feeds VTK's key translator a
+        # keysym/char its default dispatch mishandles → a native access violation
+        # deep in the C++ event loop, BEFORE any normal-priority Python observer
+        # runs (that's exactly why the old diagnostic never managed to print the
+        # offending key). The only Python-reachable lever is a HIGH-priority
+        # observer that runs ahead of VTK's interactor style and ABORTS the event
+        # for any key that isn't a plain ASCII character or named key. Every
+        # binding we use — plus VTK's own w/s/r defaults — is ASCII, so nothing
+        # functional is lost; only the untranslatable Cyrillic / dead keys that
+        # would otherwise crash get dropped.
         iren = self.plotter.iren.interactor
+        guard_tags: list[int] = []
 
-        def _on_key(_obj, _evt):
+        def _is_safe_key(sym: str, code: str) -> bool:
+            if code and code != "\x00":
+                return ord(code[0]) < 128           # character key: ASCII only
+            return bool(sym) and sym.isascii()       # named key: ASCII keysym
+
+        def _key_guard(caller, _evt):
             try:
-                ks = iren.GetKeySym()
-                kc = iren.GetKeyCode()
-                _log(f"[vff] keypress: keysym={ks!r}  code={kc!r}")
+                sym = caller.GetKeySym() or ""
             except Exception:
-                _log("[vff] keypress: failed to read keysym")
-                _log(traceback.format_exc())
+                sym = ""
+            try:
+                code = caller.GetKeyCode() or ""
+            except Exception:
+                code = ""
+            if not _is_safe_key(sym, code):
+                _log(f"[vff] keypress: SWALLOWED non-ASCII key (sym={sym!r} "
+                     f"code={code!r}) — non-US layout crash guard")
+                # AbortFlagOn on the currently-invoked command stops VTK from
+                # calling the lower-priority interactor-style handler (and
+                # PyVista's keysym dispatch) for this event — i.e. the code that
+                # segfaults never sees the bad key.
+                for t in guard_tags:
+                    cmd = caller.GetCommand(t)
+                    if cmd is not None:
+                        cmd.AbortFlagOn()
+                return
+            _log(f"[vff] keypress: sym={sym!r} code={code!r}")
 
         def _on_click(_obj, _evt):
             _log("[vff] mouse: left button down")
 
-        # Default priority; observers run AFTER VTK's own dispatch so they
-        # don't disturb event handling.
-        self._diag_observer_tags = [
-            iren.AddObserver("KeyPressEvent", _on_key),
+        # Priority 10 (> the interactor style's default 0) so the guard runs
+        # first and its abort takes effect before VTK's crashing dispatch.
+        guard_tags.append(iren.AddObserver("KeyPressEvent", _key_guard, 10.0))
+        guard_tags.append(iren.AddObserver("CharEvent", _key_guard, 10.0))
+        self._diag_observer_tags = guard_tags + [
             iren.AddObserver("LeftButtonPressEvent", _on_click),
         ]
-        _log("[vff] diagnostic observers installed")
+        _log("[vff] key-guard + diagnostic observers installed")
 
     def _reset_view(self) -> None:
         self._set_default_view()
