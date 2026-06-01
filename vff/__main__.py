@@ -72,6 +72,7 @@ def _run_gcode_transform(args, stl_path: Path, x: float, y: float, z: float) -> 
             f"  smooth-sigma : {args.smooth_sigma} (must match the export)\n"
             f"  extrusion-comp: {(args.extrusion_comp_mode if args.extrusion_comp else 'off')}\n"
             f"  cool-overhangs: {('S'+str(args.cool_fan)+', probe '+str(args.cool_probe)+' mm' if (args.cool_overhangs and args.gcode_direction == 'inverse') else 'off')}\n"
+            f"  max-z-speed  : {(str(args.max_z_speed)+' mm/s' if args.max_z_speed and args.max_z_speed > 0 else 'off')}\n"
             f"{align_info}"
             f"  subdiv-mm    : {args.subdiv_mm} mm",
             flush=True,
@@ -85,7 +86,7 @@ def _run_gcode_transform(args, stl_path: Path, x: float, y: float, z: float) -> 
             args.gcode_in, out_path, bt3,
             subdiv_mm=args.subdiv_mm, n_jobs=1, direction=args.gcode_direction,
             extrusion_comp=args.extrusion_comp, extrusion_comp_mode=args.extrusion_comp_mode,
-            z_slowdown=args.z_slowdown,
+            z_slowdown=args.z_slowdown, max_z_speed=args.max_z_speed,
             cool_overhangs=args.cool_overhangs, cool_fan=args.cool_fan,
             cool_probe=args.cool_probe, cool_min_z=args.cool_min_z,
         )
@@ -174,6 +175,7 @@ def _run_gcode_transform(args, stl_path: Path, x: float, y: float, z: float) -> 
         args.gcode_in, out_path, bt,
         subdiv_mm=args.subdiv_mm, n_jobs=args.jobs,
         direction=args.gcode_direction, z_slowdown=args.z_slowdown,
+        max_z_speed=args.max_z_speed,
     )
     return 0
 
@@ -281,8 +283,18 @@ def main(argv: list[str] | None = None) -> int:
              "moves (1.0 = off). F is scaled from ×1 on flat moves down to "
              "×FACTOR at a ~30°-tilted move and steeper, so the firmware's Z "
              "planner isn't fighting a feedrate aimed straight up. e.g. 0.5 = "
-             "halve F on the steepest parts. The firmware still hard-limits Z "
-             "(Klipper max_z_velocity/accel); this only eases the transition.",
+             "halve F on the steepest parts. A soft ease for the transition; for "
+             "an actual bound on Z velocity use --max-z-speed.",
+    )
+    parser.add_argument(
+        "--max-z-speed", type=float, default=15.0, metavar="MM/S",
+        help="(gcode transform) HARD cap on the Z-axis velocity component "
+             "(default 15 mm/s; 0 = off). On a curved move the Z speed is "
+             "F·|dz|/L; F is recomputed per segment so it never exceeds this, "
+             "i.e. the firmware's Z clamp (Klipper max_z_velocity) is applied in "
+             "the toolpath itself so the planner sees honest feedrates instead "
+             "of silently dragging the whole move down to obey Z. Flat moves are "
+             "untouched. Composes with --z-slowdown (the lower F wins).",
     )
     parser.add_argument(
         "--extrusion-comp-mode", choices=["vertical", "volume"], default="vertical",

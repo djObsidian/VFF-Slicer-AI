@@ -250,8 +250,10 @@ positional: STL                 path to STL (default ./propeller.stl)
   --gcode-out PATH              output (default <in>.{nonplanar,planar}.gcode)
   --gcode-direction forward|inverse   (default forward; inverse = un-deform a sliced deformed mesh)
   --subdiv-mm FLOAT             split G1 moves longer than this (default 0.5)
-  --z-slowdown FACTOR          gently slow F on steep non-planar moves (default 1.0 = off;
-                               x1 flat -> xFACTOR at a 30deg+ climb; firmware still hard-limits Z)
+  --max-z-speed MM/S            hard-cap the Z-velocity component F*|dz|/L (default 15; 0 = off;
+                               firmware Z clamp applied in the toolpath; flat moves untouched)
+  --z-slowdown FACTOR          soft-ease F on steep non-planar moves (default 1.0 = off;
+                               x1 flat -> xFACTOR at a 30deg+ climb; composes with --max-z-speed)
   --dz-per-layer FLOAT          (z-only) forward-map Z scale
   --dz-auto-fit                 (z-only, forward) pick dz so Z-extent matches the STL
   --no-gcode-align              don't align the map to the gcode XY bounds

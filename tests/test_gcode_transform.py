@@ -47,7 +47,7 @@ def _identity_bt() -> BackTransform:
 
 
 def _run(gcode_text: str, direction: str = "forward", subdiv_mm: float = 1.0,
-         z_slowdown: float = 1.0) -> list[str]:
+         z_slowdown: float = 1.0, max_z_speed: float = 0.0) -> list[str]:
     bt = _identity_bt()
     with tempfile.TemporaryDirectory() as td:
         ip = Path(td) / "in.gcode"
@@ -56,6 +56,7 @@ def _run(gcode_text: str, direction: str = "forward", subdiv_mm: float = 1.0,
         backtransform_gcode_file(
             ip, op, bt, subdiv_mm=subdiv_mm, n_jobs=1,
             verbose=False, direction=direction, z_slowdown=z_slowdown,
+            max_z_speed=max_z_speed,
         )
         return op.read_text(encoding="utf-8").splitlines()
 
@@ -142,6 +143,35 @@ def test_z_slowdown_scales_steep_move_feedrate():
     print("  PASS z-slowdown (flat F 6000 kept; 45° move 6000 -> 3000)")
 
 
+def test_max_z_speed_hard_caps_z_velocity():
+    """--max-z-speed bounds the Z-velocity component F·|dz|/L. A 45° move at
+    F6000 climbs Z at 6000·1/√2 ≈ 4243 mm/min ≈ 70.7 mm/s; capping at 15 mm/s
+    recomputes F = 15·60·√2 ≈ 1273 mm/min. Flat moves stay full speed; 0 = off."""
+    import math
+    gcode = "M83\nG1 X0 Y0 Z5 F6000\nG1 X10 Y0 Z5 E1\nG1 X11 Y0 Z6 E0.2\n"
+
+    def f_at(lines, xtag):
+        f = None
+        for ln in lines:
+            if not _MOVE_RE.match(ln.strip()):
+                continue
+            mf = re.search(r"\bF(-?[0-9.]+)", ln)
+            if mf:
+                f = float(mf.group(1))
+            if xtag in ln:
+                return f
+        return None
+
+    off = _run(gcode, direction="inverse", subdiv_mm=100, max_z_speed=0.0)
+    cap = _run(gcode, direction="inverse", subdiv_mm=100, max_z_speed=15.0)
+    expect = 15.0 * 60.0 * math.sqrt(2.0)        # ≈ 1272.79 mm/min
+    assert f_at(off, "X11.000") == 6000, "off (0) must not touch F"
+    assert abs(f_at(cap, "X10.000") - 6000) < 1, "flat move must stay full speed"
+    assert abs(f_at(cap, "X11.000") - expect) < 1, (
+        f"45° move Z-vel must be capped: want F≈{expect:.0f}, got {f_at(cap, 'X11.000')}")
+    print(f"  PASS max-z-speed (flat F 6000 kept; 45° move capped 6000 -> {expect:.0f})")
+
+
 def test_overhang_cooling_injects_and_restores_fan():
     """Inverse cooling: a printing move whose original-space points are flagged
     unsupported gets a fan boost (M106 S255) injected before it; once the part
@@ -226,6 +256,7 @@ def main() -> int:
         test_absolute_e_subdivision_spreads_monotonically,
         test_absolute_e_with_running_start,
         test_z_slowdown_scales_steep_move_feedrate,
+        test_max_z_speed_hard_caps_z_velocity,
         test_overhang_cooling_injects_and_restores_fan,
         test_propeller_forward_inverse_roundtrip,
     ]

@@ -633,21 +633,30 @@ def _write_transformed_gcode(
     out_path: Path, units: list, xyz_out: np.ndarray, header: str,
     escale: np.ndarray | None = None, z_slowdown: float = 1.0,
     overhang_mask: np.ndarray | None = None, cool_fan: int = 255,
-    cool_linger: int = 3,
+    cool_linger: int = 3, max_z_speed: float = 0.0,
 ) -> dict:
     """Pass 3: stream-write the unit list, reading move endpoints from xyz_out.
 
     `escale` (per-point extrusion multiplier, parallel to xyz_out) applies
     extrusion compensation: only positive relative E is scaled.
 
-    `z_slowdown` (factor in (0,1], 1 = off): the slicer's feedrate F is the
-    PLANAR (XY) speed, but after the non-planar transform a move can climb
-    steeply in Z. We do NOT hard-cap to the Z axis max (the firmware planner
-    clamps that); we just **gently slow the steep stretches** so the planner
-    isn't fighting a feedrate aimed straight up. F is scaled smoothly from ×1 on
-    flat moves to ×z_slowdown at a 30°-tilted move (slope 0.5) and beyond; the
-    slicer's intended F is tracked and restored on flat moves. e.g. 0.5 = halve
-    F on the steepest parts.
+    Two independent feedrate tweaks (both compose — the lowest F wins, and the
+    slicer's intended F is tracked and restored when a move no longer needs it):
+
+    `max_z_speed` (mm/s, 0 = off): a HARD cap on the Z-axis velocity component.
+    The slicer's F is the speed ALONG the path; after the non-planar transform a
+    move with slope |dz|/L climbs in Z at `F·|dz|/L`. We recompute F per piece so
+    that component never exceeds `max_z_speed` (i.e. F ≤ max_z_speed·60·L/|dz|).
+    This is the principled version of the firmware's own Z clamp (Klipper
+    `max_z_velocity`), done in the toolpath so the planner sees honest feedrates
+    instead of silently dragging the whole move (XY+E) down to obey Z. Flat moves
+    (|dz|≈0) are untouched.
+
+    `z_slowdown` (factor in (0,1], 1 = off): a SOFT, proportional ease for the
+    steep stretches — F is scaled smoothly from ×1 on flat moves to ×z_slowdown
+    at a 30°-tilted move (slope 0.5) and beyond. Use it to gentle the *transition*
+    onto steep sections; use `max_z_speed` to actually bound Z velocity. e.g. 0.5
+    = halve F on the steepest parts.
 
     `overhang_mask` (per-point bool, parallel to xyz_out): force the fan to
     `cool_fan` over any printing move that contains a flagged (unsupported,
@@ -660,8 +669,12 @@ def _write_transformed_gcode(
     cur = None         # last written position (cx, cy, cz)
     modal_f = None     # slicer's intended feedrate (mm/min), un-scaled
     emitted_f = None   # F value last actually written
-    n_slowed = 0
+    n_slowed = 0       # pieces whose F we reduced (either tweak)
+    n_zcapped = 0      # pieces limited specifically by the Z-velocity cap
     do_slow = z_slowdown < 1.0
+    do_zcap = max_z_speed and max_z_speed > 0
+    _z_cap_mmin = float(max_z_speed) * 60.0 if do_zcap else 0.0  # mm/s → mm/min
+    do_feed = do_slow or do_zcap
 
     # --- overhang cooling state ---
     do_cool = overhang_mask is not None
@@ -732,14 +745,24 @@ def _write_transformed_gcode(
                         # the last segment. (No comp — see docstring.)
                         e_piece = e_start + (e_val - e_start) * (piece + 1) / n_pieces
                         parts.append(f"E{e_piece:.5f}")
-                # --- feedrate ---
-                if do_slow and cur is not None and modal_f is not None:
-                    seg_len = float(np.sqrt((ox - cur[0]) ** 2 + (oy - cur[1]) ** 2 + (oz - cur[2]) ** 2))
-                    slope = abs(oz - cur[2]) / seg_len if seg_len > 1e-9 else 0.0
-                    f_amt = min(slope / _REF_SLOPE, 1.0)               # 0 flat → 1 steep
-                    target_f = modal_f * (1.0 - (1.0 - z_slowdown) * f_amt)
-                    if f_amt > 0:
+                # --- feedrate: soft z-slowdown and/or hard Z-velocity cap ---
+                if do_feed and cur is not None and modal_f is not None:
+                    dz = abs(oz - cur[2])
+                    seg_len = float(np.sqrt((ox - cur[0]) ** 2 + (oy - cur[1]) ** 2 + dz ** 2))
+                    target_f = modal_f
+                    zcapped = False
+                    if do_slow and seg_len > 1e-9:
+                        f_amt = min((dz / seg_len) / _REF_SLOPE, 1.0)  # 0 flat → 1 steep
+                        target_f = min(target_f, modal_f * (1.0 - (1.0 - z_slowdown) * f_amt))
+                    if do_zcap and dz > 1e-9 and seg_len > 1e-9:
+                        # F·dz/seg_len = Z-velocity; cap it: F ≤ z_cap·seg_len/dz.
+                        f_cap = _z_cap_mmin * seg_len / dz
+                        if f_cap < target_f:
+                            target_f, zcapped = f_cap, True
+                    if target_f < modal_f - 1e-9:
                         n_slowed += 1
+                        if zcapped:
+                            n_zcapped += 1
                     if emitted_f is None or abs(target_f - emitted_f) > 1e-3:
                         parts.append(f"F{target_f:g}")
                         emitted_f = target_f
@@ -757,7 +780,7 @@ def _write_transformed_gcode(
             fo.write((slicer_fan_line or "M107") + "\n")
             lines_out += 1
     return {
-        "lines_out": lines_out, "n_slowed": n_slowed,
+        "lines_out": lines_out, "n_slowed": n_slowed, "n_zcapped": n_zcapped,
         "n_cool_boosts": n_cool_boosts, "n_cool_moves": n_cool_moves,
     }
 
@@ -773,6 +796,7 @@ def backtransform_gcode_file(
     extrusion_comp: bool = False,
     extrusion_comp_mode: str = "vertical",
     z_slowdown: float = 1.0,
+    max_z_speed: float = 0.0,
     cool_overhangs: bool = False,
     cool_fan: int = 255,
     cool_probe: float = 0.4,
@@ -893,10 +917,11 @@ def backtransform_gcode_file(
     )
     _w = _write_transformed_gcode(
         out_path, units, xyz_orig, header, escale=escale, z_slowdown=z_slowdown,
-        overhang_mask=overhang_mask, cool_fan=cool_fan,
+        max_z_speed=max_z_speed, overhang_mask=overhang_mask, cool_fan=cool_fan,
     )
     stats["lines_out"] = _w["lines_out"]
     stats["n_slowed"] = _w["n_slowed"]
+    stats["n_zcapped"] = _w["n_zcapped"]
     stats["n_cool_boosts"] = _w["n_cool_boosts"]
     stats["n_cool_moves"] = _w["n_cool_moves"]
 
@@ -928,9 +953,11 @@ def backtransform_gcode_file(
                 f"— E rescaled for the deformation"
             )
         if stats.get("n_slowed"):
+            zc = stats.get("n_zcapped", 0)
+            extra = f" ({zc:,} of them hard-capped to ≤{max_z_speed:g} mm/s Z)" if zc else ""
             print(
-                f"[backtransform] z-slowdown: {stats['n_slowed']:,} tilted pieces "
-                "had F scaled down (steep stretches eased; firmware still clamps Z)"
+                f"[backtransform] feedrate: {stats['n_slowed']:,} tilted pieces "
+                f"had F scaled down{extra}"
             )
         if "n_overhang_pts" in stats:
             print(
