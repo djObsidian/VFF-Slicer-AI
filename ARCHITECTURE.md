@@ -157,10 +157,20 @@ driven by the local BFS growth vectors (lowest distortion).
 
 Φ is applied **per vertex**, so a flat region built from few large triangles
 (e.g. a bore ceiling, one 11 mm triangle) stays flat instead of bowing — up to
-~0.5 mm error on the propeller. The flag uniformly subdivides the mesh until the
-worst per‑face non‑affinity drops below the tolerance (stays watertight, no
-T‑junction cracks). Uniform is heavy (35k → 562k faces at 0.1 mm); a conforming
-adaptive remesh is the backlog item.
+~0.5 mm error on the propeller. `--subdivide-error MM` (default 0.1; 0 = off)
+refines the mesh until the worst per‑face non‑affinity drops below the tolerance.
+
+`--remesh` picks the method (both stay watertight — no T‑junction cracks):
+
+- **`adaptive`** (default): **Rivara longest‑edge bisection** (`_adaptive_refine`).
+  Each pass marks the longest edge of every over‑error face, takes the
+  *longest‑edge closure* (if any edge of a face is marked, mark its longest too —
+  iterated to a fixed point), then splits faces by their marked‑edge pattern.
+  Edge midpoints are shared between neighbours, so it's conforming. It refines
+  ONLY the curved faces: propeller 35k → **36k** faces at 0.1 mm (0.52 → 0.10 mm),
+  vs uniform's 562k — **~16× lighter**, and faster.
+- **`uniform`**: trimesh's 1→4 subdivide of every face each pass. Simple but
+  blows the count up (562k); kept as a fallback.
 
 ### Extrusion compensation (`backtransform.py`)
 
@@ -234,7 +244,8 @@ positional: STL                 path to STL (default ./propeller_fixed_flat.stl)
   --depth-method vectors|fmm|dijkstra   inside-model depth (default vectors; z-only)
 
   --deform-mode z-only|3d       deformation model (default z-only; 3d = recommended)
-  --subdivide-error MM          (3d --export) refine coarse faces until error < MM (default 0 = off)
+  --subdivide-error MM          (3d --export) refine coarse faces until error < MM (default 0.1; 0 = off)
+  --remesh adaptive|uniform     (3d --export) refine method (default adaptive = Rivara longest-edge bisection)
   --extrusion-comp / --no-extrusion-comp   (3d) rescale E for the deformation (default on)
   --extrusion-comp-mode vertical|volume    (3d) comp model (default vertical = 3-axis)
   --cool-overhangs / --no-cool-overhangs   (3d inverse) ramp fan on re-detected overhangs/bridges (default on)

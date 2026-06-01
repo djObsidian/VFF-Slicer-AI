@@ -194,7 +194,7 @@ def _run_3d_export(args, stl_path: Path, x: float, y: float, z: float) -> int:
         f"Full-3D deform export: {stl_path} -> {args.export}\n"
         f"  volume {x:.0f}x{y:.0f}x{z:.0f} mm, pitch {args.pitch} mm, "
         f"max-tilt {args.max_tilt} deg, smooth-sigma {args.smooth_sigma}, "
-        f"subdivide-error {args.subdivide_error} mm",
+        f"subdivide-error {args.subdivide_error} mm ({args.remesh} remesh)",
         flush=True,
     )
     vg = voxelize_solid(mesh, pitch=args.pitch)
@@ -203,7 +203,9 @@ def _run_3d_export(args, stl_path: Path, x: float, y: float, z: float) -> int:
         gr, displacement_smooth_sigma=args.smooth_sigma, max_tilt_deg=args.max_tilt,
     )
     base_err = float(_face_nonaffinity(mesh, dmap).max())
-    dm = deform_mesh_3d(mesh, dmap, subdivide_max_error=args.subdivide_error)
+    dm = deform_mesh_3d(
+        mesh, dmap, subdivide_max_error=args.subdivide_error, refine=args.remesh,
+    )
     dm.export(args.export)
     vr = (dm.volume / mesh.volume) if mesh.volume > 0 else 0.0
     print(
@@ -215,8 +217,8 @@ def _run_3d_export(args, stl_path: Path, x: float, y: float, z: float) -> int:
     if args.subdivide_error <= 0 and base_err > 0.1:
         print(
             f"  NOTE: {base_err:.2f} mm of deformation error on coarse faces "
-            "(flat regions stay flat). Re-run with --subdivide-error 0.1 to "
-            "refine them.",
+            "(flat regions stay flat) and refinement is off. Drop "
+            "--subdivide-error 0 to re-enable it (default 0.1).",
             file=sys.stderr, flush=True,
         )
     return 0
@@ -263,13 +265,21 @@ def main(argv: list[str] | None = None) -> int:
              "viewer is z-only regardless.",
     )
     parser.add_argument(
-        "--subdivide-error", type=float, default=0.0, metavar="MM",
-        help="(--deform-mode 3d --export only) Uniformly subdivide the mesh "
-             "before deforming until the worst per-face deformation error drops "
-             "below this many mm (0 = off). Fixes flat regions defined by few "
-             "large triangles (e.g. a bore ceiling) that otherwise stay flat "
-             "instead of following the curved deformation. Try 0.1. Heavier "
-             "meshes; capped at ~2M faces.",
+        "--subdivide-error", type=float, default=0.1, metavar="MM",
+        help="(--deform-mode 3d --export only) Refine the mesh before deforming "
+             "until the worst per-face deformation error drops below this many "
+             "mm (default 0.1; 0 = off). Fixes flat regions defined by few large "
+             "triangles (e.g. a bore ceiling) that otherwise stay flat instead "
+             "of following the curved deformation. Capped at ~2M faces. See "
+             "--remesh for the refinement method.",
+    )
+    parser.add_argument(
+        "--remesh", choices=["adaptive", "uniform"], default="adaptive",
+        help="(--subdivide-error) Refinement method. 'adaptive' (default): "
+             "Rivara longest-edge bisection — conforming/crack-free, refines "
+             "only the curved faces (~15× fewer faces than uniform for the same "
+             "quality, e.g. propeller 562k → 36k). 'uniform': trimesh 1→4 "
+             "subdivide of every face each pass — simpler but far heavier.",
     )
     parser.add_argument(
         "--extrusion-comp", action=argparse.BooleanOptionalAction, default=True,

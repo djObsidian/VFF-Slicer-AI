@@ -424,31 +424,132 @@ def _face_nonaffinity(mesh: trimesh.Trimesh, dmap: DeformationMap) -> np.ndarray
     return np.linalg.norm(dmap.forward_points(cen) - phi_v[F].mean(axis=1), axis=1)
 
 
+def _split_tris(a, b, c, mab, mbc, mca):
+    """Sub-triangles of (a,b,c) for a longest-edge bisection, given the midpoint
+    vertex id of each edge (-1 = that edge isn't being split). The triangle is
+    pre-rotated so (a,b) is the LONGEST edge, and the conformity invariant holds:
+    if any edge is split, the longest one is too — so `mab` is always set when
+    any midpoint is. Bisecting the longest edge first (m_ab→opposite vertex),
+    then each further marked edge, keeps Rivara's bounded-angle property and,
+    because edge midpoints are shared between neighbours, stays crack-free."""
+    if mab < 0:                                   # nothing marked
+        return ((a, b, c),)
+    if mbc < 0 and mca < 0:                        # longest only → 2
+        return ((a, mab, c), (mab, b, c))
+    if mca < 0:                                    # longest + bc → 3
+        return ((a, mab, c), (mab, b, mbc), (mab, mbc, c))
+    if mbc < 0:                                    # longest + ca → 3
+        return ((a, mab, mca), (mab, c, mca), (mab, b, c))
+    return (                                        # all three → 4
+        (a, mab, mca), (mab, c, mca), (mab, b, mbc), (mab, mbc, c))
+
+
+def _adaptive_refine(
+    mesh: trimesh.Trimesh, dmap: DeformationMap, max_error: float,
+    max_faces: int, max_passes: int = 12,
+) -> trimesh.Trimesh:
+    """Conforming adaptive remesh by **Rivara longest-edge bisection**: refine
+    only the faces whose Φ-non-affinity (see _face_nonaffinity) exceeds
+    `max_error`, by bisecting longest edges, until none are left or `max_faces`
+    is hit. Crack-free without uniform subdivision's 4×-per-pass blowup.
+
+    Each pass: mark the longest edge of every over-error face, then take the
+    **longest-edge closure** — if any edge of a face is marked, mark its longest
+    edge too (iterated to a fixed point). Because an edge is shared by its two
+    faces, marking is symmetric, so both faces split it at the SAME midpoint →
+    no T-junctions. Faces are then split per their marked-edge pattern."""
+    V = np.asarray(mesh.vertices, dtype=np.float64)
+    F = np.asarray(mesh.faces, dtype=np.int64)
+    for _ in range(max_passes):
+        if F.shape[0] >= max_faces:
+            break
+        cen = V[F].mean(axis=1)
+        phiV = dmap.forward_points(V)
+        err = np.linalg.norm(dmap.forward_points(cen) - phiV[F].mean(axis=1), axis=1)
+        bad = err > max_error
+        if not bad.any():
+            break
+
+        n = F.shape[0]
+        # Unique undirected edges + per-face local→global edge ids.
+        loc = np.stack([F[:, [0, 1]], F[:, [1, 2]], F[:, [2, 0]]], axis=1)  # (n,3,2)
+        ek = np.sort(loc, axis=2).reshape(-1, 2)
+        uniq, inv = np.unique(ek, axis=0, return_inverse=True)
+        face_edges = inv.ravel().reshape(n, 3)
+        elen = np.linalg.norm(V[uniq[:, 0]] - V[uniq[:, 1]], axis=1)
+        longest_local = np.argmax(elen[face_edges], axis=1)                 # (n,)
+        face_long_eid = face_edges[np.arange(n), longest_local]
+
+        # Mark + longest-edge closure.
+        marked = np.zeros(uniq.shape[0], dtype=bool)
+        marked[face_long_eid[bad]] = True
+        while True:
+            need = marked[face_edges].any(axis=1) & ~marked[face_long_eid]
+            if not need.any():
+                break
+            marked[face_long_eid[need]] = True
+
+        # One midpoint vertex per marked edge (shared → conforming).
+        midids = np.full(uniq.shape[0], -1, dtype=np.int64)
+        me = np.where(marked)[0]
+        if me.size == 0:
+            break
+        midids[me] = V.shape[0] + np.arange(me.size)
+        V = np.vstack([V, 0.5 * (V[uniq[me, 0]] + V[uniq[me, 1]])])
+
+        # Split each touched face; untouched faces pass through as a block.
+        nm = marked[face_edges].sum(axis=1)
+        out = [F[nm == 0]]
+        changed = np.where(nm > 0)[0]
+        rows: list[tuple[int, int, int]] = []
+        for t in changed:
+            s = int(longest_local[t])
+            o0, o1, o2 = s, (s + 1) % 3, (s + 2) % 3
+            rows.extend(_split_tris(
+                int(F[t, o0]), int(F[t, o1]), int(F[t, o2]),
+                int(midids[face_edges[t, o0]]),
+                int(midids[face_edges[t, o1]]),
+                int(midids[face_edges[t, o2]]),
+            ))
+        if rows:
+            out.append(np.asarray(rows, dtype=np.int64))
+        F = np.vstack([b for b in out if b.size])
+    return trimesh.Trimesh(vertices=V, faces=F, process=False)
+
+
 def deform_mesh_3d(
     mesh: trimesh.Trimesh,
     dmap: DeformationMap,
     subdivide_max_error: float = 0.0,
     max_faces: int = 2_000_000,
+    refine: str = "adaptive",
 ) -> trimesh.Trimesh:
     """Apply the full-3D map Φ to every mesh vertex (all axes move).
 
     The map is applied PER VERTEX, so a flat region with few/large triangles
     can't follow Φ's curvature — it stays flat (e.g. a bore ceiling that should
-    bow). `subdivide_max_error` (mm) > 0 uniformly subdivides the mesh until the
-    worst per-face non-affinity (see _face_nonaffinity) drops below it, capped at
-    `max_faces`. Uniform subdivision is used because it stays watertight (no
-    T-junction cracks); it's heavier than a conforming adaptive remesh (Rivara
-    longest-edge bisection would hit the same quality at ~15× fewer faces — a
-    backlog item), but safe for slicing."""
+    bow). `subdivide_max_error` (mm) > 0 refines the mesh until the worst
+    per-face non-affinity (see _face_nonaffinity) drops below it, capped at
+    `max_faces`:
+
+    - `refine="adaptive"` (default): **Rivara longest-edge bisection**
+      (`_adaptive_refine`) — conforming/crack-free and refines ONLY the curved
+      faces, so it reaches the same quality at far fewer faces than uniform
+      (propeller ~15× fewer).
+    - `refine="uniform"`: trimesh's 1→4 subdivide of EVERY face each pass. Simple
+      and watertight but blows the face count up; kept as a fallback."""
     cur = mesh
     if subdivide_max_error and subdivide_max_error > 0:
-        while True:
-            err = _face_nonaffinity(cur, dmap)
-            if err.size == 0 or err.max() <= subdivide_max_error:
-                break
-            if len(cur.faces) * 4 > max_faces:
-                break
-            cur = cur.subdivide()
+        if refine == "uniform":
+            while True:
+                err = _face_nonaffinity(cur, dmap)
+                if err.size == 0 or err.max() <= subdivide_max_error:
+                    break
+                if len(cur.faces) * 4 > max_faces:
+                    break
+                cur = cur.subdivide()
+        else:
+            cur = _adaptive_refine(cur, dmap, subdivide_max_error, max_faces)
     new_verts = dmap.forward_points(cur.vertices.astype(np.float64, copy=False))
     return trimesh.Trimesh(vertices=new_verts, faces=cur.faces, process=False)
 

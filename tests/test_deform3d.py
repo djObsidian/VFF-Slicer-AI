@@ -20,7 +20,8 @@ except Exception:
 from vff.build_volume import BuildVolume
 from vff.deform import deform_mesh
 from vff.deform3d import (
-    BackTransform3D, _face_nonaffinity, deform_mesh_3d, solve_deformation_map,
+    BackTransform3D, _adaptive_refine, _face_nonaffinity, deform_mesh_3d,
+    solve_deformation_map,
 )
 from vff.growth import compute_growth
 from vff.mesh_io import load_and_place
@@ -126,12 +127,14 @@ def test_extrusion_comp_matches_volume_ratio():
           f"== 1/vol-ratio {inv_vol_ratio:.3f})")
 
 
-def test_subdivision_refines_coarse_faces_watertight():
-    """Coarse flat faces deform with large per-face error; --subdivide-error
-    refines them and the result stays watertight (uniform → no T-cracks)."""
+def test_adaptive_refine_hits_error_watertight_and_beats_uniform():
+    """Rivara longest-edge bisection (the default --subdivide-error refine)
+    drives the worst per-face Φ-non-affinity below the threshold, stays
+    watertight (conforming → no T-cracks), and uses far fewer faces than uniform
+    1→4 subdivision for the same quality."""
     stl = Path(__file__).resolve().parent.parent / "propeller_fixed_flat.stl"
     if not stl.exists():
-        print("  SKIP subdivision (propeller_fixed_flat.stl not found)")
+        print("  SKIP adaptive remesh (propeller_fixed_flat.stl not found)")
         return
     m = load_and_place(str(stl), BuildVolume.of(250, 250, 250))
     gr = compute_growth(voxelize_solid(m, pitch=1.0), max_tilt_deg=30.0)
@@ -139,12 +142,22 @@ def test_subdivision_refines_coarse_faces_watertight():
     err0 = float(_face_nonaffinity(m, dmap).max())
     assert err0 > 0.1, f"expected coarse faces with >0.1mm error, got {err0:.3f}"
 
-    coarse = deform_mesh_3d(m, dmap)                                  # no subdiv
-    fine = deform_mesh_3d(m, dmap, subdivide_max_error=0.1)           # auto subdiv
-    assert len(fine.faces) > len(coarse.faces), "subdivision must add faces"
-    assert fine.is_watertight, "uniform subdivision must stay watertight (no cracks)"
-    print(f"  PASS subdivision ({err0:.2f}mm coarse err; {len(coarse.faces):,}->"
-          f"{len(fine.faces):,} faces, watertight {fine.is_watertight})")
+    # _adaptive_refine returns the refined ORIGINAL-coords mesh, so the error
+    # metric (which forward-maps through Φ) is meaningful on it directly.
+    ref = _adaptive_refine(m, dmap, 0.1, max_faces=2_000_000)
+    err1 = float(_face_nonaffinity(ref, dmap).max())
+    assert err1 <= 0.1 + 1e-3, f"adaptive must hit the error target, left {err1:.4f} mm"
+    assert ref.is_watertight, "Rivara LEB must stay watertight (conforming)"
+    assert len(ref.faces) > len(m.faces), "must add faces where Φ curves"
+
+    uni = deform_mesh_3d(m, dmap, subdivide_max_error=0.1, refine="uniform")
+    adapt = deform_mesh_3d(m, dmap, subdivide_max_error=0.1)          # default adaptive
+    assert adapt.is_watertight
+    assert len(adapt.faces) * 4 < len(uni.faces), (
+        f"adaptive {len(adapt.faces):,} must be far below uniform {len(uni.faces):,}")
+    print(f"  PASS adaptive remesh ({err0:.2f}mm coarse err → {err1:.3f}mm; "
+          f"{len(m.faces):,}->{len(adapt.faces):,} faces watertight; "
+          f"uniform would be {len(uni.faces):,} = {len(uni.faces)/len(adapt.faces):.0f}x)")
 
 
 def test_bed_blend_keeps_near_bed_identity():
@@ -301,7 +314,7 @@ def main() -> int:
         test_extrusion_comp_matches_volume_ratio,
         test_bed_blend_keeps_near_bed_identity,
         test_vertical_extrusion_comp_reduces_e_in_bulk,
-        test_subdivision_refines_coarse_faces_watertight,
+        test_adaptive_refine_hits_error_watertight_and_beats_uniform,
         test_default_smoothing_keeps_a_bore_dome,
         test_inverse_keeps_first_layer_z_and_never_digs_bed,
         test_overhang_degree_ramps_with_severity,

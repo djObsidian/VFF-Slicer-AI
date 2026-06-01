@@ -76,7 +76,8 @@ vff.preview result.gcode        #  E = toggle extrusion,  T = toggle travel
 | Flag | What it does |
 |---|---|
 | `--max-tilt DEG` | **Main knob.** Max nozzle tilt from vertical the head can print at — depends on your hotend/fan shape. `20` bulky head · `30` default · `45` compact/pointed nozzle (stronger non‑planarity). |
-| `--subdivide-error MM` | (export only) Uniformly refine the mesh until the worst per‑face deformation error drops below this, so flat regions built from few large triangles actually bow. Try `0.1`. Off by default; the export prints a hint when it's needed. |
+| `--subdivide-error MM` | (export only) Refine the mesh until the worst per‑face deformation error drops below this, so flat regions built from few large triangles actually bow. **Default `0.1` (on)**; `0` disables. |
+| `--remesh` | (export only) Refinement method: `adaptive` (default) = Rivara longest‑edge bisection — conforming, refines only the curved faces (~15× fewer faces than uniform). `uniform` = trimesh 1→4 subdivide (heavier fallback). |
 | `--extrusion-comp-mode` | `vertical` (default, 3‑axis): rescale E by the layer‑height squish — correct for a fixed‑width vertical nozzle. `volume`: rescale by `1/det` (material‑conservative, for 4/5‑axis like S4). `--no-extrusion-comp` disables. |
 | `--max-z-speed MM/S` | (gcode) **Hard cap** on the Z‑axis velocity component `F·\|dz\|/L`: F is recomputed per segment so a curved move never climbs in Z faster than this. Default `15`; `0` = off. Applies the firmware's Z clamp (Klipper `max_z_velocity`) in the toolpath, so the planner sees honest feedrates. Flat moves untouched. |
 | `--z-slowdown FACTOR` | (gcode) **Soft ease** for steep non‑planar moves: ×1 flat → ×FACTOR at a 30°+ climb (e.g. `0.5` halves the steepest). Default `1.0` = off. Gentles the *transition* onto steep sections; use `--max-z-speed` to actually bound Z velocity. Composes with it (lower F wins). |
@@ -143,9 +144,6 @@ Poisson solve, the G‑code passes) lives in
 
 ## Limitations & backlog
 
-- **Adaptive remeshing.** `--subdivide-error` is uniform → heavy (the propeller
-  goes 35k → 562k faces). A conforming adaptive remesh (Rivara longest‑edge
-  bisection) would reach the same quality at ~15× fewer faces without cracks.
 - **Tip non‑convergence** under steep overhangs — the inverse uses a damped
   (Levenberg–Marquardt) Newton with per‑point line search plus a despike pass,
   so most tips now converge; the few that can't (Φ genuinely folds there) are
