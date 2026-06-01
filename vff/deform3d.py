@@ -167,10 +167,32 @@ class DeformationMap:
         return best_p, converged
 
 
+def _geodesic_direction_field(growth: GrowthResult, sigma: float, max_tilt_deg: float) -> np.ndarray:
+    """Direction field from the gradient of the geodesic (FMM/Dijkstra) depth.
+
+    The local BFS growth vectors only know where each voxel was *reached from*,
+    so above a hole (e.g. a bore ceiling) they point ~straight up and the
+    deformation under-domes that region. The geodesic depth, by contrast,
+    encodes the detour the front had to take *around* the hole — its gradient
+    tilts toward the deeper centre, so aligning it to vertical actually domes
+    the ceiling. Normalized and tilt-clamped like the BFS field."""
+    from .deform import smoothed_depth_field
+    from .growth import clamp_to_vertical
+    phi = smoothed_depth_field(growth, sigma=sigma, method="fmm", outside_mode="extend")
+    gx, gy, gz = np.gradient(phi)
+    V = np.stack([gx, gy, gz], axis=-1).astype(np.float32)
+    n = np.linalg.norm(V, axis=-1, keepdims=True)
+    V = np.where(n > 1e-9, V / n, 0.0).astype(np.float32)
+    V[growth.step < 0] = 0.0
+    return clamp_to_vertical(V, max_tilt_deg)
+
+
 def solve_deformation_map(
     growth: GrowthResult,
     *,
     displacement_smooth_sigma: float = 2.0,
+    growth_source: str = "bfs",
+    max_tilt_deg: float = 30.0,
     eps: float = 1e-6,
     rtol: float = 1e-7,
     maxiter: int = 5000,
@@ -188,6 +210,12 @@ def solve_deformation_map(
     folded tips). See the smoothing block below for measured effect. NOTE: it
     changes the deformation, so the export that gets sliced and the inverse
     that undoes it must use the SAME value (like dz for the Z-only path).
+
+    `growth_source`: 'bfs' (default) drives the rotations from the local BFS
+    growth vectors — lowest distortion. 'geodesic' drives them from the geodesic
+    depth gradient, which captures detours around holes (domes a bore ceiling
+    that 'bfs' leaves nearly flat) at a modest global distortion cost. Must
+    match between the sliced export and the inverse.
     """
     matrix = growth.step >= 0
     nx, ny, nz = matrix.shape
@@ -212,8 +240,14 @@ def solve_deformation_map(
     flat_idx = np.full(matrix.shape, -1, dtype=np.int64)
     flat_idx[matrix] = np.arange(n_model)
 
-    # Per-model-voxel rotation taking growth dir → +ẑ.
-    R = rotations_to_vertical(growth.vectors[matrix])     # (M,3,3)
+    # Per-model-voxel rotation taking growth dir → +ẑ. 'geodesic' swaps the
+    # local BFS direction for the geodesic-depth gradient (domes ceilings).
+    if growth_source == "geodesic":
+        dir_field = _geodesic_direction_field(growth, displacement_smooth_sigma, max_tilt_deg)
+        vecs = dir_field[matrix]
+    else:
+        vecs = growth.vectors[matrix]
+    R = rotations_to_vertical(vecs)                       # (M,3,3)
 
     rows_l, cols_l, vals_l = [], [], []
     b = np.zeros((n_model, 3), dtype=np.float64)          # RHS, one column per coord
@@ -407,12 +441,14 @@ class BackTransform3D:
         pitch: float = 1.0,
         max_tilt_deg: float = 30.0,
         smooth_sigma: float = 2.0,
+        growth_source: str = "bfs",
         xy_center: tuple[float, float] | None = None,
     ) -> "BackTransform3D":
         """Voxelise + grow + solve the deformation map for `stl_path`, placed
         the same way the Z-only path places it (Z_min→0, XY centred on
-        `xy_center` if given, else the build-volume centre). `smooth_sigma`
-        must match the value the sliced export was built with."""
+        `xy_center` if given, else the build-volume centre). `smooth_sigma`,
+        `growth_source` and `max_tilt_deg` must match the values the sliced
+        export was built with."""
         from .build_volume import BuildVolume
         from .growth import compute_growth
         from .mesh_io import load_and_place
@@ -432,7 +468,10 @@ class BackTransform3D:
             mesh = load_and_place(stl_path, BuildVolume.cube(volume_side))
         vg = voxelize_solid(mesh, pitch=pitch)
         gr = compute_growth(vg, max_tilt_deg=max_tilt_deg)
-        return cls(solve_deformation_map(gr, displacement_smooth_sigma=smooth_sigma))
+        return cls(solve_deformation_map(
+            gr, displacement_smooth_sigma=smooth_sigma,
+            growth_source=growth_source, max_tilt_deg=max_tilt_deg,
+        ))
 
     def forward_points_batch(self, xyz_orig: np.ndarray) -> np.ndarray:
         xyz = np.asarray(xyz_orig, dtype=np.float64)

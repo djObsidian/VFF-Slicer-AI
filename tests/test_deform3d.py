@@ -145,6 +145,42 @@ def test_subdivision_refines_coarse_faces_watertight():
           f"{len(fine.faces):,} faces, watertight {fine.is_watertight})")
 
 
+def _bore_ceiling_dome(m, dmap):
+    cx, cy = 125.0, 125.0
+    rs = np.linspace(0, 6, 13)
+    pts = np.column_stack([cx + rs, np.full(13, cy), np.full(13, 9.0)])
+    ins = m.contains(pts)
+    if ins.sum() < 3:
+        return None
+    pz = dmap.forward_points(pts)[:, 2]
+    return float(pz[ins][0] - pz[ins][-1])
+
+
+def test_geodesic_growth_source_domes_more_box_identity():
+    """'geodesic' growth source domes a bore ceiling more than 'bfs' (captures
+    the detour around the hole) while keeping a flat box at identity."""
+    box = trimesh.creation.box(extents=(40, 40, 20))
+    box.apply_translation([125, 125, 10])
+    grb = compute_growth(voxelize_solid(box, pitch=1.0), max_tilt_deg=30.0)
+    db = solve_deformation_map(grb, growth_source="geodesic", max_tilt_deg=30.0)
+    disp = float(np.linalg.norm(db.forward_points(box.vertices) - box.vertices, axis=1).max())
+    assert disp < 1e-2, f"geodesic box must stay identity, max disp {disp:.4f}"
+
+    stl = Path(__file__).resolve().parent.parent / "propeller_fixed_flat.stl"
+    if not stl.exists():
+        print(f"  PASS geodesic (box identity {disp:.2e}; propeller skipped)")
+        return
+    m = load_and_place(str(stl), BuildVolume.of(250, 250, 250))
+    gr = compute_growth(voxelize_solid(m, pitch=1.0), max_tilt_deg=30.0)
+    dome_bfs = _bore_ceiling_dome(m, solve_deformation_map(gr, growth_source="bfs"))
+    dome_geo = _bore_ceiling_dome(
+        m, solve_deformation_map(gr, growth_source="geodesic", max_tilt_deg=30.0))
+    assert dome_geo is not None and dome_bfs is not None
+    assert dome_geo > dome_bfs + 0.3, f"geodesic dome {dome_geo:.2f} should exceed bfs {dome_bfs:.2f}"
+    print(f"  PASS geodesic (box identity {disp:.2e}; bore dome bfs {dome_bfs:.2f} -> "
+          f"geodesic {dome_geo:.2f} mm)")
+
+
 def main() -> int:
     tests = [
         test_flat_box_maps_to_identity,
@@ -152,6 +188,7 @@ def main() -> int:
         test_inverse_roundtrip_converged_is_exact,
         test_extrusion_comp_matches_volume_ratio,
         test_subdivision_refines_coarse_faces_watertight,
+        test_geodesic_growth_source_domes_more_box_identity,
     ]
     failures = 0
     for t in tests:

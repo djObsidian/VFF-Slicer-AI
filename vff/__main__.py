@@ -70,6 +70,7 @@ def _run_gcode_transform(args, stl_path: Path, x: float, y: float, z: float) -> 
             f"  pitch        : {args.pitch} mm\n"
             f"  max-tilt     : {args.max_tilt} deg\n"
             f"  smooth-sigma : {args.smooth_sigma} (must match the export)\n"
+            f"  growth-source: {args.growth_source} (must match the export)\n"
             f"  extrusion-comp: {'on' if args.extrusion_comp else 'off'}\n"
             f"{align_info}"
             f"  subdiv-mm    : {args.subdiv_mm} mm",
@@ -78,7 +79,7 @@ def _run_gcode_transform(args, stl_path: Path, x: float, y: float, z: float) -> 
         bt3 = BackTransform3D.from_mesh(
             str(stl_path), volume_side=max(x, y, z), pitch=args.pitch,
             max_tilt_deg=args.max_tilt, smooth_sigma=args.smooth_sigma,
-            xy_center=xy_center,
+            growth_source=args.growth_source, xy_center=xy_center,
         )
         backtransform_gcode_file(
             args.gcode_in, out_path, bt3,
@@ -187,12 +188,15 @@ def _run_3d_export(args, stl_path: Path, x: float, y: float, z: float) -> int:
         f"Full-3D deform export: {stl_path} -> {args.export}\n"
         f"  volume {x:.0f}x{y:.0f}x{z:.0f} mm, pitch {args.pitch} mm, "
         f"max-tilt {args.max_tilt} deg, smooth-sigma {args.smooth_sigma}, "
-        f"subdivide-error {args.subdivide_error} mm",
+        f"growth-source {args.growth_source}, subdivide-error {args.subdivide_error} mm",
         flush=True,
     )
     vg = voxelize_solid(mesh, pitch=args.pitch)
     gr = compute_growth(vg, max_tilt_deg=args.max_tilt)
-    dmap = solve_deformation_map(gr, displacement_smooth_sigma=args.smooth_sigma)
+    dmap = solve_deformation_map(
+        gr, displacement_smooth_sigma=args.smooth_sigma,
+        growth_source=args.growth_source, max_tilt_deg=args.max_tilt,
+    )
     base_err = float(_face_nonaffinity(mesh, dmap).max())
     dm = deform_mesh_3d(mesh, dmap, subdivide_max_error=args.subdivide_error)
     dm.export(args.export)
@@ -250,6 +254,15 @@ def main(argv: list[str] | None = None) -> int:
              "MUST match between --export and the inverse) but ignores "
              "--dz-per-layer/--dz-auto-fit/--depth-method. Note: the interactive "
              "viewer is z-only regardless.",
+    )
+    parser.add_argument(
+        "--growth-source", choices=["bfs", "geodesic"], default="bfs",
+        help="(--deform-mode 3d) Source of the layer/growth direction. 'bfs' "
+             "(default): local BFS growth vectors — lowest distortion. "
+             "'geodesic': gradient of the geodesic depth — captures detours "
+             "around holes so a bore ceiling domes up (the bfs field leaves it "
+             "nearly flat), at a small global distortion cost. MUST match "
+             "between --export and the inverse.",
     )
     parser.add_argument(
         "--subdivide-error", type=float, default=0.0, metavar="MM",
