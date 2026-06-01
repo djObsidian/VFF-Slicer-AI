@@ -743,7 +743,13 @@ def _write_transformed_gcode(
                         cool_on, cur_boost = False, 0
             for piece in range(n_pieces):
                 pi = start_idx + piece
-                ox, oy, oz = xyz_out[pi]
+                # Round to the 3 decimals we actually emit, then use THOSE for
+                # the Z-velocity cap below — otherwise the cap is computed from
+                # full-precision dz that gets rounded away in the G-code, letting
+                # tiny segments slip a few % over the limit.
+                ox = round(float(xyz_out[pi, 0]), 3)
+                oy = round(float(xyz_out[pi, 1]), 3)
+                oz = round(float(xyz_out[pi, 2]), 3)
                 parts = [out_cmd, f"X{ox:.3f} Y{oy:.3f} Z{oz:.3f}"]
                 if e_val is not None:
                     if e_rel:

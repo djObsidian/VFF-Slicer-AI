@@ -172,6 +172,43 @@ def test_max_z_speed_hard_caps_z_velocity():
     print(f"  PASS max-z-speed (flat F 6000 kept; 45° move capped 6000 -> {expect:.0f})")
 
 
+def test_max_z_speed_caps_travel_moves_too():
+    """The Z cap must apply to TRAVEL (G0 / no-extrusion) moves, not just
+    extrusion — travel feedrates are typically much higher, so an un-capped
+    steep Z travel is the worst offender. A G0 climbing 45° at F9000 (Z-vel
+    ≈ 6364 mm/min ≈ 106 mm/s) must be capped to 15 mm/s like any other move."""
+    import math
+    gcode = (
+        "M83\n"
+        "G1 X0 Y0 Z5 F6000\n"
+        "G1 X10 Y0 Z5 E1\n"     # flat extrusion
+        "G0 X11 Y0 Z6 F9000\n"  # TRAVEL, 45° climb at high travel feedrate
+    )
+
+    def f_at(lines, xtag):
+        f = None
+        for ln in lines:
+            if not _MOVE_RE.match(ln.strip()):
+                continue
+            mf = re.search(r"\bF(-?[0-9.]+)", ln)
+            if mf:
+                f = float(mf.group(1))
+            if xtag in ln:
+                return f
+        return None
+
+    off = _run(gcode, direction="inverse", subdiv_mm=100, max_z_speed=0.0)
+    cap = _run(gcode, direction="inverse", subdiv_mm=100, max_z_speed=15.0)
+    # The G0 line must survive as a G0 (travel), and its F must be capped.
+    g0 = [ln for ln in cap if ln.startswith("G0") and "X11.000" in ln]
+    assert g0, f"expected a G0 travel move in output: {cap}"
+    expect = 15.0 * 60.0 * math.sqrt(2.0)        # ≈ 1272.79 mm/min
+    assert f_at(off, "X11.000") == 9000, "off (0) must leave travel F alone"
+    assert abs(f_at(cap, "X11.000") - expect) < 1, (
+        f"travel Z-vel must be capped: want F≈{expect:.0f}, got {f_at(cap, 'X11.000')}")
+    print(f"  PASS max-z-speed on TRAVEL (G0 climb capped 9000 -> {expect:.0f})")
+
+
 def test_overhang_cooling_ramps_fan_by_severity():
     """Inverse cooling ramps the fan LINEARLY between cool_fan_min/max by the
     overhang degree (like a slicer's per-overlap fan curve): degree 0.5 → mid,
@@ -263,6 +300,7 @@ def main() -> int:
         test_absolute_e_with_running_start,
         test_z_slowdown_scales_steep_move_feedrate,
         test_max_z_speed_hard_caps_z_velocity,
+        test_max_z_speed_caps_travel_moves_too,
         test_overhang_cooling_ramps_fan_by_severity,
         test_propeller_forward_inverse_roundtrip,
     ]
