@@ -166,6 +166,7 @@ class Viewer:
         max_tilt_deg: float = 30.0,
         smooth_sigma: float = 2.0,
         depth_method: str = "vectors",
+        dz_per_layer: float | None = None,
     ) -> None:
         self.mesh = mesh
         self.volume = volume
@@ -176,6 +177,10 @@ class Viewer:
         # Depth-field parameters — tunable at startup via CLI.
         self.smooth_sigma = float(smooth_sigma)
         self.depth_method = str(depth_method)
+        # Z map factor for the exported deformed mesh. None → deform_mesh uses
+        # the voxel pitch (1 layer = 1 mm). Must match the dz used by the
+        # inverse G-code transform, or the inverse won't undo this deformation.
+        self.dz_per_layer = dz_per_layer
 
         self.plotter = pv.Plotter(title="VFF Slicer — Visualizer", window_size=(1280, 800))
         self.plotter.set_background(_BACKGROUND, top=_BACKGROUND_TOP)
@@ -677,6 +682,7 @@ class Viewer:
         t0 = time.perf_counter()
         self.deformed_mesh = deform_mesh(
             self.mesh, self.growth,
+            dz_per_layer=self.dz_per_layer,
             smooth_sigma=self.smooth_sigma,
             depth_method=self.depth_method,
         )

@@ -44,15 +44,33 @@ VFF делает это в две стороны:
 
 ## Установка
 
-Python 3.10+, Windows / Linux / macOS.
+Python 3.10+, Windows / Linux / macOS. Зависимости объявлены в
+[`pyproject.toml`](pyproject.toml) — ставится одной командой в venv:
 
 ```bash
-pip install pyvista vtk trimesh embreex numba scipy scikit-fmm numpy
-pip install rtree  # опционально, ускоряет trimesh
+python -m venv .venv
+# Windows:  .venv\Scripts\activate      Linux/macOS:  source .venv/bin/activate
+
+pip install -e .            # ядро: пайплайн деформации + g-code (headless)
+pip install -e .[viewer]    # + интерактивный PyVista-вьювер / preview / section
+pip install -e .[all]       # + вьювер + FMM-метод глубины (scikit-fmm)
 ```
 
-`embreex` (форк pyembree, поддерживается) даёт быстрый рейкаст: критично для
-inside-теста и contains-проверок на сотнях тысяч точек.
+Editable-установка (`-e`) ещё и регистрирует команду `vff`, так что можно
+`vff propeller.stl ...` вместо `python -m vff propeller.stl ...`.
+
+Кто не любит editable — есть [`requirements.txt`](requirements.txt) с ядром:
+`pip install -r requirements.txt`.
+
+Заметки по зависимостям:
+- **Ядро** (`numpy scipy trimesh rtree embreex`) ставится колёсами даже на
+  свежий Python (проверено на 3.14). `embreex` (поддерживаемый форк pyembree)
+  даёт быстрый рейкаст — критично для `mesh.contains` на сотнях тысяч точек.
+- **Вьювер** (`pyvista`+`vtk`) вынесен в extra `[viewer]`, потому что колёса
+  vtk отстают от новых релизов Python. Headless-пути (`--export`,
+  `--gcode-in`, `--deform-mode 3d`) его НЕ требуют.
+- `scikit-fmm` нужен только для `--depth-method fmm`; дефолтные `vectors` и
+  `dijkstra` обходятся одним `scipy`.
 
 ---
 
@@ -80,8 +98,17 @@ python -m vff propeller.stl --export deformed.stl --no-viewer
 
 ```bash
 python -m vff propeller.stl --gcode-in deformed.gcode --gcode-out result.gcode \
-    --gcode-direction inverse --dz-auto-fit --subdiv-mm 0.5
+    --gcode-direction inverse --subdiv-mm 0.5
 ```
+
+> **Важно про dz в inverse.** `inverse` обязан разворачивать **ту же**
+> деформацию, что сделала `deformed.stl`. Экспорт выше шёл с дефолтным
+> `dz_per_layer = pitch`, поэтому inverse тоже должен идти с дефолтным dz —
+> **не** `--dz-auto-fit` (это forward-приём: он подбирает dz из размеров, и
+> для inverse даст другой dz → слои лягут мимо). Если экспортировал с явным
+> `--dz-per-layer X`, передай тот же `X` и в inverse. `--dz-auto-fit` уместен
+> только для `forward` (когда деформируешь свежий планарный g-code плоской
+> версии).
 
 **Просмотр получившегося g-code** (превью PrusaSlicer не показывает
 непланарные слои — нужен свой):
@@ -186,12 +213,16 @@ Z
 ### Шаг 4. Depth field — геодезическое расстояние от стола (`vff/deform.py`)
 
 Поле `step` дискретно. Нам нужно гладкое поле "глубины материала от стола"
-для деформации. Два варианта:
+для деформации. Три варианта (`--depth-method`):
 
-- **FMM** (default, `scikit-fmm`): решает уравнение Эйконала `|∇φ| = 1` с
-  φ=0 на bed-seeds. Получаем C¹-гладкое скалярное поле.
+- **vectors** (default): интегрирует **зажатое** (tilt-clamp) векторное поле
+  роста в скалярный потенциал φ (МНК-Пуассон, см. `integrate_vectors_to_potential`).
+  Изоповерхности φ перпендикулярны направлению роста, поэтому ограничение
+  наклона сопла **реально формирует слои**. Это и есть основной метод.
+- **FMM** (`scikit-fmm`): решает уравнение Эйконала `|∇φ| = 1` с φ=0 на
+  bed-seeds. C¹-гладко, но игнорирует clamp (идёт по сырой геодезике).
 - **Dijkstra**: дискретный кратчайший путь по графу вокселей. C⁰, дешевле, но
-  с гребешками на изоповерхностях.
+  с гребешками на изоповерхностях; тоже игнорирует clamp.
 
 Результат — `depth(x, y, z)` ∈ ℝ⁺ для каждого вокселя внутри меша. Для
 вокселей снаружи модели (но в build volume) используется `outside_mode="extend"`
@@ -271,6 +302,58 @@ Forward на одной XY-колонке (вид сбоку):
 
 Векторизовано через NumPy, ~700k точек обрабатывает за ~0.5 с в одном
 процессе. Для >5M точек включается multiprocessing (Windows spawn).
+
+---
+
+## Полная 3D-деформация (`--deform-mode 3d`)
+
+Z-only карта выше **выпрямляет поверхности роста в плоскости, но замораживает
+XY** — на наклонных слоях это сдвигает боковые расстояния (проекция наклонной
+поверхности на горизонталь сжимает её на `cos(tilt)`). Правильнее двигать
+**все три оси**: повернуть локальный кадр так, чтобы направление роста стало
+вертикальным, тогда поверхности роста ложатся в горизонтальные плоскости
+*без* бокового искажения.
+
+Это реализовано в [`vff/deform3d.py`](vff/deform3d.py) — обобщение
+`integrate_vectors_to_potential` с 1 скаляра на 3 координаты (тот же Лапласиан):
+
+1. На каждый воксель — поворот `R_i`, переводящий (зажатое) направление роста
+   `ĝ_i → +ẑ` (тождество там, где рост уже вертикален).
+2. На каждое 26-связное ребро `(i,j)` — целевой сдвиг `t_ij = R̄_ij·(p_j − p_i)`,
+   `R̄ = ½(R_i+R_j)`.
+3. МНК `‖Φ_j − Φ_i − t_ij‖²` по всем рёбрам → нормальные уравнения `L·Φᶜ = bᶜ`
+   на каждую координату (Лапласиан общий). Решается **через смещение**
+   `U = Φ − P` с пиннингом дна `U=0` (иначе penalty к абсолютным ~125 мм
+   раздувает RHS и CG врёт про сходимость).
+
+**Прямая карта** — трилинейная выборка `Φ`. **Обратная** — векторизованный
+Ньютон по `Φ` с предпосчитанным якобианом (`q → p`, `Φ(p)=q`); расходится
+только на сложенных кончиках лопастей (нависания — `Φ` там не инъективна),
+такие точки помечаются и оставляются «как есть».
+
+Результаты на пропеллере (pitch=1) против Z-only:
+
+| | Z-only | 3D |
+|---|---|---|
+| Сохранение объёма (ratio) | 0.71 | **0.96** |
+| Боковое искажение (CoV длин рёбер) | 0.148 | **0.063** (×2.35 меньше) |
+| Обратимость | 1D root-find | Ньютон, ~95% точно, ост. — кончики |
+
+Использование (полностью headless, без pyvista):
+
+```bash
+# деформированный меш под слайсер
+python -m vff propeller.stl --deform-mode 3d --export deformed_3d.stl --no-viewer
+# обратное преобразование gcode (после нарезки deformed_3d.stl)
+python -m vff propeller.stl --deform-mode 3d --gcode-in deformed_3d.gcode \
+    --gcode-out result.gcode --gcode-direction inverse --subdiv-mm 0.5
+```
+
+`3d` игнорирует `--dz-per-layer`/`--dz-auto-fit`/`--smooth-sigma`/`--depth-method`
+(масштаб задаётся самим решателем, не скаляром). Интерактивный вьювер пока
+показывает только Z-only. Статус: прямая карта и обратимость провалидированы
+на пропеллере; реальная нарезка/печать — следующий шаг. Компенсация экструзии
+(поверхности роста не равноудалены) — отдельная задача в backlog.
 
 ---
 
@@ -380,7 +463,8 @@ vff/
 ├── mesh_io.py         load_and_place — загрузка STL + центровка
 ├── voxelize.py        солидная воксельная заливка через trimesh.contains
 ├── growth.py          BFS-рост + векторное поле + tilt-clamp
-├── deform.py          depth-field (FMM/Dijkstra), сглаживание, deform_mesh
+├── deform.py          depth-field (vectors/FMM/Dijkstra), сглаживание, Z-only deform_mesh
+├── deform3d.py        полная 3D-деформация (Poisson/ARAP), Ньютон-инверсия, BackTransform3D
 ├── backtransform.py   g-code forward/inverse + conform-to + clip-to
 ├── viewer.py          интерактивный PyVista-viewer с хоткеями
 ├── preview.py         standalone превью g-code

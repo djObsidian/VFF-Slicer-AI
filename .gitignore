@@ -16,6 +16,7 @@ section_xz.png
 # Locally generated artefacts (regenerated from the pipeline)
 deformed.stl
 deformed.gcode
+deformed_3d.gcode
 propeller_inverse*.gcode
 propeller_nonplanar*.gcode
 propeller_conformed*.gcode
@@ -29,3 +30,10 @@ propeller_clipped*.gcode
 .idea/
 .vscode/
 *.swp
+
+# Reference-only external slicer (cloned separately, not part of this repo)
+S4_Slicer/
+
+# Regenerable deformed-mesh artifacts (Z-only + full-3D comparison)
+deformed_zonly.stl
+deformed_3d.stl

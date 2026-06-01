@@ -8,16 +8,16 @@ the original space.
 
 How:
   1. For each mesh vertex v at world position (x, y, z), trilinearly
-     sample the integer-valued `step` field at v. Outside the model the
-     step is -1; we extend it via a nearest-painted-voxel lookup so every
-     vertex gets a sane step value.
-  2. new_z = step_continuous * dz_per_layer. X and Y are preserved.
+     sample the continuous DEPTH field (smoothed_depth_field — the
+     vector-integrated potential by default, extended outside the model)
+     at v. This is the smooth "depth from bed", not the raw integer step.
+  2. new_z = depth(v) * dz_per_layer + bed_z, ramped in over a bed-blend
+     band so the first layers stay flat. X and Y are preserved.
 
 This is the simplest faithful mapping: it makes every growth iso-surface
-land on a single horizontal plane (z = N * dz_per_layer for step N). It
-does NOT try to preserve in-plane distances — that would require solving
-an integration / Poisson problem on the surface; we'll revisit if a
-distortion-aware deformation is needed downstream.
+land on a single horizontal plane. It does NOT preserve in-plane distances
+(XY is untouched) — a full-3D straightening that also moves XY is the
+principled fix; see S4_Slicer's per-tet ARAP for the reference approach.
 """
 
 from __future__ import annotations
@@ -290,31 +290,35 @@ def integrate_vectors_to_potential(growth: GrowthResult, eps: float = 1e-6) -> n
 def smoothed_depth_field(
     growth: GrowthResult,
     sigma: float = 2.0,
-    method: str = "fmm",
+    method: str = "vectors",
     outside_mode: str = "extend",
 ) -> np.ndarray:
     """Continuous "depth from bed" field used by both surface viz and deform.
 
     Construction:
 
-      1. Inside the model: **weighted-Dijkstra geodesic distance from bed**
-         (face/edge/vertex edges with weights 1/√2/√3). Continuous,
-         direction-symmetric, and naturally larger than the integer BFS
-         step for chains that go through diagonals — so the downstream
-         deformation actually stretches.
+      1. Inside the model, per `method` (see the dispatch block below):
+           - "vectors" (DEFAULT): least-squares scalar potential whose
+             gradient matches the CLAMPED growth vectors, so the tilt clamp
+             actually shapes the layer surfaces.
+           - "fmm": Eikonal geodesic distance from the bed (scikit-fmm),
+             C1-smooth; falls back to "dijkstra" if scikit-fmm is missing.
+           - "dijkstra": weighted-Dijkstra geodesic distance (face/edge/
+             vertex weights 1/√2/√3), C0.
 
-      2. Outside the model: vertical depth `field = k - k_bed_layer`.
-         Iso-surfaces in empty space are exact horizontal planes →
-         normals point straight up. No flood-fill perturbations.
+      2. Outside the model, per `outside_mode`:
+           - "extend" (DEFAULT, required by deform_mesh): nearest in-model
+             depth, so the field is continuous across the surface.
+           - "vertical" (surface viz): `k - k_bed_layer`, exact horizontal
+             planes / vertical normals in air.
 
-      3. Light Gaussian smoothing (default sigma=0.6 voxels) to take the
-         edge off the residual BFS-axis flavour in the geodesic field.
-         Less aggressive than before — the geodesic field is already much
-         smoother than the integer step it replaces.
+      3. Gaussian smoothing with `sigma` (default 2.0 voxels) to take the
+         edge off residual BFS-axis flavour. Larger = smoother but weaker
+         deformation; smaller = sharper but ragged tips.
 
-    Boundary continuity: at the bed (k=k_bed_layer) the geodesic distance
-    is 0 (seed voxels) and the vertical extension is 0 (k - k_bed_layer).
-    They agree, so smoothing doesn't drag bed-touching values up.
+    Boundary continuity: at the bed the inside depth is ~0 (seed voxels)
+    and the vertical extension is 0 (k - k_bed_layer), so smoothing doesn't
+    drag bed-touching values up.
     """
     step = growth.step
     if step.size == 0 or not (step >= 0).any():
@@ -490,20 +494,20 @@ def deform_mesh(
     bed_z: float = 0.0,
     bed_blend_height: float | None = None,
     smooth_sigma: float = 2.0,
-    depth_method: str = "fmm",
+    depth_method: str = "vectors",
 ) -> trimesh.Trimesh:
-    """Return a deformed copy of `mesh` whose Z is driven by the growth step.
+    """Return a deformed copy of `mesh` whose Z is driven by the depth field.
 
     Math:
-        step_c = trilinear sample of growth.step (extended) at vertex
-        z_target = step_c * dz_per_layer + bed_z
+        depth_c = trilinear sample of the smoothed depth field at vertex
+        z_target = depth_c * dz_per_layer + bed_z
 
         w = clamp((orig_z - bed_z) / bed_blend_height, 0, 1)
         new_z = (1 - w) * orig_z + w * z_target
 
-    Why the blend: pure step-based mapping `new_z = step_c * dz` lifts
+    Why the blend: pure depth-based mapping `new_z = depth_c * dz` lifts
     bed-touching vertices off the bed when their neighbours-in-XY are
-    outside the model (the extended step field there is non-zero, dragging
+    outside the model (the extended depth field there is non-zero, dragging
     the trilinear sample up). Empirically observed: at pitch=0.5mm on the
     propeller, bed-vertices were spreading over 0.75mm in deformed Z.
 
@@ -525,9 +529,9 @@ def deform_mesh(
     # outside it. See its docstring for why this matters for symmetric parts.
     field = smoothed_depth_field(growth, sigma=smooth_sigma, method=depth_method)
     verts = mesh.vertices.astype(np.float64, copy=False)
-    step_continuous = _sample_trilinear(field, growth.origin, growth.pitch, verts).astype(np.float64)
+    depth_continuous = _sample_trilinear(field, growth.origin, growth.pitch, verts).astype(np.float64)
 
-    z_target = step_continuous * dz_per_layer + bed_z
+    z_target = depth_continuous * dz_per_layer + bed_z
     z_orig = verts[:, 2]
 
     if bed_blend_height > 0:

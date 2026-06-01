@@ -7,10 +7,13 @@ from pathlib import Path
 import numpy as np
 
 # --- Surface every kind of failure to the console BEFORE we import VTK ---
-# 1. Unbuffered stdio so prints survive a hard crash.
+# 1. Unbuffered, UTF-8 stdio so prints survive a hard crash AND don't blow up
+#    on a non-UTF console (Windows cp1251/cp866 etc. can't encode the →/≈/√
+#    we use in banners; errors='replace' degrades gracefully instead of
+#    raising UnicodeEncodeError mid-pipeline).
 try:
-    sys.stdout.reconfigure(line_buffering=True)
-    sys.stderr.reconfigure(line_buffering=True)
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
 except Exception:
     pass
 
@@ -30,6 +33,170 @@ def _excepthook(exc_type, exc_value, exc_tb) -> None:
 
 
 sys.excepthook = _excepthook
+
+
+def _run_gcode_transform(args, stl_path: Path, x: float, y: float, z: float) -> int:
+    """Depth-field G-code transform (forward/inverse). Headless: builds the
+    depth field and rewrites the G-code without ever importing the Viewer /
+    pyvista, so batch slicing works on machines with no display."""
+    from .backtransform import backtransform_gcode_file, quick_gcode_xy_bounds
+
+    out_path = args.gcode_out
+    if not out_path:
+        in_p = Path(args.gcode_in)
+        suffix = ".nonplanar.gcode" if args.gcode_direction == "forward" else ".planar.gcode"
+        out_path = str(in_p.with_suffix(suffix))
+
+    # Quick-scan the gcode XY range so the deformation is aligned to the slicer's
+    # model placement (PrusaSlicer / Cura don't use our --volume centre).
+    xy_center = None
+    align_info = ""
+    if not args.no_gcode_align:
+        xy_min, xy_max = quick_gcode_xy_bounds(args.gcode_in)
+        if np.isfinite(xy_min).all() and np.isfinite(xy_max).all():
+            xy_center = (0.5 * (xy_min[0] + xy_max[0]), 0.5 * (xy_min[1] + xy_max[1]))
+            align_info = (
+                f"  align→gcode  : XY range [{xy_min[0]:.1f}, {xy_max[0]:.1f}] x "
+                f"[{xy_min[1]:.1f}, {xy_max[1]:.1f}], centre ({xy_center[0]:.1f}, {xy_center[1]:.1f})\n"
+            )
+
+    # ---- Full-3D path: BackTransform3D moves all axes; no dz/depth knobs. ----
+    if args.deform_mode == "3d":
+        from .deform3d import BackTransform3D
+        print(
+            f"G-code transform 3d ({args.gcode_direction}): {args.gcode_in} -> {out_path}\n"
+            f"  STL          : {stl_path}\n"
+            f"  volume       : {x:.0f}x{y:.0f}x{z:.0f} mm\n"
+            f"  pitch        : {args.pitch} mm\n"
+            f"  max-tilt     : {args.max_tilt} deg\n"
+            f"{align_info}"
+            f"  subdiv-mm    : {args.subdiv_mm} mm",
+            flush=True,
+        )
+        bt3 = BackTransform3D.from_mesh(
+            str(stl_path), volume_side=max(x, y, z), pitch=args.pitch,
+            max_tilt_deg=args.max_tilt, xy_center=xy_center,
+        )
+        backtransform_gcode_file(
+            args.gcode_in, out_path, bt3,
+            subdiv_mm=args.subdiv_mm, n_jobs=1, direction=args.gcode_direction,
+        )
+        return 0
+
+    # ---- Z-only path (legacy) ----
+    from .backtransform import BackTransform
+
+    # The inverse must undo the SAME deformation that produced the sliced mesh.
+    # --export bakes the mesh with dz = --dz-per-layer (default = pitch), so the
+    # inverse has to use that exact dz. --dz-auto-fit is a forward-only
+    # convenience (it picks dz from the gcode/STL extent) and will generally NOT
+    # match the export's dz → a wrong inverse. Warn loudly.
+    if args.gcode_direction == "inverse" and args.dz_auto_fit:
+        print(
+            "  WARNING: --dz-auto-fit with --gcode-direction inverse. The inverse "
+            "must reuse the dz the deformed mesh was exported with (default = "
+            "pitch). Auto-fit picks a different dz and will mis-map the layers. "
+            "Pass the same --dz-per-layer you used for --export instead.",
+            file=sys.stderr, flush=True,
+        )
+
+    # Auto-fit picks dz so the forward-deformed Z extent matches the STL's Z
+    # extent: build the depth field once, take its max over model voxels,
+    # dz = z_extent / depth_max.
+    chosen_dz = args.dz_per_layer
+    autofit_info = ""
+    if args.dz_auto_fit:
+        import trimesh
+
+        from .build_volume import BuildVolume
+        from .deform import smoothed_depth_field
+        from .growth import compute_growth
+        from .mesh_io import load_and_place
+        from .voxelize import voxelize_solid
+
+        _m = trimesh.load(str(stl_path), force="mesh")
+        if xy_center is not None:
+            _mxy = 0.5 * (_m.bounds[0, :2] + _m.bounds[1, :2])
+            _m.apply_translation([
+                xy_center[0] - float(_mxy[0]),
+                xy_center[1] - float(_mxy[1]),
+                -float(_m.bounds[0, 2]),
+            ])
+        else:
+            _m = load_and_place(str(stl_path), BuildVolume.of(x, y, z))
+        _vg = voxelize_solid(_m, pitch=args.pitch)
+        _gr = compute_growth(_vg, max_tilt_deg=args.max_tilt)
+        _f = smoothed_depth_field(
+            _gr, sigma=args.smooth_sigma, method=args.depth_method, outside_mode="extend"
+        )
+        _depth_max = float(np.nanmax(_f[_gr.step >= 0])) if (_gr.step >= 0).any() else 1.0
+        _z_extent = float(_m.bounds[1, 2] - _m.bounds[0, 2])
+        if _depth_max > 1e-9:
+            chosen_dz = _z_extent / _depth_max
+        autofit_info = (
+            f"  auto-fit     : z_extent={_z_extent:.3f}, depth_max={_depth_max:.3f}, "
+            f"dz_per_layer={chosen_dz:.4f}\n"
+        )
+
+    print(
+        f"G-code transform ({args.gcode_direction}): {args.gcode_in} -> {out_path}\n"
+        f"  STL          : {stl_path}\n"
+        f"  volume       : {x:.0f}x{y:.0f}x{z:.0f} mm\n"
+        f"  pitch        : {args.pitch} mm\n"
+        f"  max-tilt     : {args.max_tilt} deg\n"
+        f"  smooth-sigma : {args.smooth_sigma}\n"
+        f"  depth-method : {args.depth_method}\n"
+        f"  dz_per_layer : {chosen_dz if chosen_dz is not None else 'pitch ('+str(args.pitch)+')'}\n"
+        f"{align_info}"
+        f"{autofit_info}"
+        f"  subdiv-mm    : {args.subdiv_mm} mm",
+        flush=True,
+    )
+    bt = BackTransform.from_mesh(
+        str(stl_path),
+        volume_side=max(x, y, z),
+        pitch=args.pitch,
+        max_tilt_deg=args.max_tilt,
+        smooth_sigma=args.smooth_sigma,
+        depth_method=args.depth_method,
+        dz_per_layer=chosen_dz,
+        xy_center=xy_center,
+    )
+    backtransform_gcode_file(
+        args.gcode_in, out_path, bt,
+        subdiv_mm=args.subdiv_mm, n_jobs=args.jobs,
+        direction=args.gcode_direction,
+    )
+    return 0
+
+
+def _run_3d_export(args, stl_path: Path, x: float, y: float, z: float) -> int:
+    """Headless full-3D deformed-mesh export (no Viewer / pyvista)."""
+    from .build_volume import BuildVolume
+    from .deform3d import deform_mesh_3d, solve_deformation_map
+    from .growth import compute_growth
+    from .mesh_io import load_and_place
+    from .voxelize import voxelize_solid
+
+    mesh = load_and_place(str(stl_path), BuildVolume.of(x, y, z))
+    print(
+        f"Full-3D deform export: {stl_path} -> {args.export}\n"
+        f"  volume {x:.0f}x{y:.0f}x{z:.0f} mm, pitch {args.pitch} mm, "
+        f"max-tilt {args.max_tilt} deg",
+        flush=True,
+    )
+    vg = voxelize_solid(mesh, pitch=args.pitch)
+    gr = compute_growth(vg, max_tilt_deg=args.max_tilt)
+    dmap = solve_deformation_map(gr)
+    dm = deform_mesh_3d(mesh, dmap)
+    dm.export(args.export)
+    vr = (dm.volume / mesh.volume) if mesh.volume > 0 else 0.0
+    print(
+        f"  saved: {len(dm.faces):,} faces, Z [{dm.bounds[0, 2]:.2f}, "
+        f"{dm.bounds[1, 2]:.2f}] mm, volume ratio {vr:.3f}",
+        flush=True,
+    )
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -56,6 +223,16 @@ def main(argv: list[str] | None = None) -> int:
              "(surfaces perpendicular to the growth direction; tilt clamp shapes them). "
              "'fmm' (Eikonal, C1 smooth, requires scikit-fmm) or 'dijkstra' (discrete "
              "shortest path, C0) — both ignore the clamp and follow raw geodesic depth.",
+    )
+    parser.add_argument(
+        "--deform-mode", choices=["z-only", "3d"], default="z-only",
+        help="Deformation model for --export and --gcode-in. 'z-only' (default, "
+             "legacy): only Z moves, XY frozen — shears in-plane distances on "
+             "tilted layers. '3d': full straightening — a Poisson/ARAP map that "
+             "rotates the growth direction to vertical, moving ALL axes (preserves "
+             "in-plane distances, much better volume; see vff/deform3d.py). 3d "
+             "ignores --dz-per-layer/--dz-auto-fit/--smooth-sigma/--depth-method. "
+             "Note: the interactive viewer is z-only regardless.",
     )
     parser.add_argument(
         "--export", metavar="PATH",
@@ -216,6 +393,43 @@ def main(argv: list[str] | None = None) -> int:
             )
         return 0
 
+    # Fast path: full-3D export and/or gcode transform. The 3D deformation
+    # (vff/deform3d.py) is fully headless — no Viewer / pyvista — so handle it
+    # before importing the GUI stack. (The interactive viewer is z-only, so
+    # there's nothing 3D to show there anyway.)
+    if args.deform_mode == "3d" and (args.export or args.gcode_in):
+        stl_path = Path(args.stl) if args.stl else Path.cwd() / "propeller.stl"
+        if not stl_path.exists():
+            print(f"STL not found: {stl_path}", file=sys.stderr)
+            return 1
+        try:
+            x, y, z = (float(v) for v in args.volume.lower().split("x"))
+        except ValueError:
+            print(f"Bad --volume '{args.volume}'. Expected e.g. 250x250x250.", file=sys.stderr)
+            return 2
+        if args.export:
+            _run_3d_export(args, stl_path, x, y, z)
+        if args.gcode_in:
+            return _run_gcode_transform(args, stl_path, x, y, z)
+        return 0
+
+    # Fast path: depth-field G-code transform (forward/inverse) needs the depth
+    # field but NOT the interactive Viewer / pyvista. Handle it before importing
+    # the GUI stack so batch/headless slicing works without a display. Combined
+    # with viewer-only flags (--export / --section-xz / --preview-gcode) it falls
+    # through to the full path below.
+    if args.gcode_in and not (args.export or args.section_xz or args.preview_gcode):
+        stl_path = Path(args.stl) if args.stl else Path.cwd() / "propeller.stl"
+        if not stl_path.exists():
+            print(f"STL not found: {stl_path}", file=sys.stderr)
+            return 1
+        try:
+            x, y, z = (float(v) for v in args.volume.lower().split("x"))
+        except ValueError:
+            print(f"Bad --volume '{args.volume}'. Expected e.g. 250x250x250.", file=sys.stderr)
+            return 2
+        return _run_gcode_transform(args, stl_path, x, y, z)
+
     from .build_volume import BuildVolume
     from .mesh_io import load_and_place
     from .viewer import Viewer
@@ -246,6 +460,8 @@ def main(argv: list[str] | None = None) -> int:
         max_tilt_deg=args.max_tilt,
         smooth_sigma=args.smooth_sigma,
         depth_method=args.depth_method,
+        # Honour --dz-per-layer for the exported mesh (was silently ignored).
+        dz_per_layer=args.dz_per_layer,
     )
 
     if args.export:
@@ -278,96 +494,7 @@ def main(argv: list[str] | None = None) -> int:
         viewer.load_gcode_preview(args.preview_gcode)
 
     if args.gcode_in:
-        from .backtransform import BackTransform, backtransform_gcode_file, quick_gcode_xy_bounds
-        out_path = args.gcode_out
-        if not out_path:
-            from pathlib import Path as _P
-            in_p = _P(args.gcode_in)
-            suffix = ".nonplanar.gcode" if args.gcode_direction == "forward" else ".planar.gcode"
-            out_path = str(in_p.with_suffix(suffix))
-
-        # First: quick-scan the gcode for its XY range so we can align the
-        # depth field to the slicer's model placement. PrusaSlicer / Cura
-        # don't use our --volume centre.
-        xy_center = None
-        align_info = ""
-        if not args.no_gcode_align:
-            xy_min, xy_max = quick_gcode_xy_bounds(args.gcode_in)
-            if np.isfinite(xy_min).all() and np.isfinite(xy_max).all():
-                xy_center = (0.5 * (xy_min[0] + xy_max[0]), 0.5 * (xy_min[1] + xy_max[1]))
-                align_info = (
-                    f"  align→gcode  : XY range [{xy_min[0]:.1f}, {xy_max[0]:.1f}] x "
-                    f"[{xy_min[1]:.1f}, {xy_max[1]:.1f}], centre ({xy_center[0]:.1f}, {xy_center[1]:.1f})\n"
-                )
-
-        # Auto-fit picks dz so the forward-deformed Z extent matches the STL's
-        # Z extent. Computed by building the depth field once, taking its max
-        # over model voxels, then dz = z_extent / depth_max.
-        chosen_dz = args.dz_per_layer
-        autofit_info = ""
-        if args.dz_auto_fit:
-            import numpy as _np
-            import trimesh as _trimesh
-            from .deform import smoothed_depth_field
-            from .growth import compute_growth
-            from .voxelize import voxelize_solid
-
-            _m = _trimesh.load(str(stl_path), force="mesh")
-            if xy_center is not None:
-                _mxy = 0.5 * (_m.bounds[0, :2] + _m.bounds[1, :2])
-                _m.apply_translation([
-                    xy_center[0] - float(_mxy[0]),
-                    xy_center[1] - float(_mxy[1]),
-                    -float(_m.bounds[0, 2]),
-                ])
-            else:
-                from .build_volume import BuildVolume as _BV
-                _vol = _BV.of(x, y, z)
-                _m = load_and_place(str(stl_path), _vol)
-            _vg = voxelize_solid(_m, pitch=args.pitch)
-            _gr = compute_growth(_vg, max_tilt_deg=args.max_tilt)
-            _f = smoothed_depth_field(
-                _gr, sigma=args.smooth_sigma, method=args.depth_method, outside_mode="extend"
-            )
-            _depth_max = float(_np.nanmax(_f[_gr.step >= 0])) if (_gr.step >= 0).any() else 1.0
-            _z_extent = float(_m.bounds[1, 2] - _m.bounds[0, 2])
-            if _depth_max > 1e-9:
-                chosen_dz = _z_extent / _depth_max
-            autofit_info = (
-                f"  auto-fit     : z_extent={_z_extent:.3f}, depth_max={_depth_max:.3f}, "
-                f"dz_per_layer={chosen_dz:.4f}\n"
-            )
-
-        print(
-            f"G-code transform ({args.gcode_direction}): {args.gcode_in} -> {out_path}\n"
-            f"  STL          : {stl_path}\n"
-            f"  volume       : {x:.0f}x{y:.0f}x{z:.0f} mm\n"
-            f"  pitch        : {args.pitch} mm\n"
-            f"  max-tilt     : {args.max_tilt} deg\n"
-            f"  smooth-sigma : {args.smooth_sigma}\n"
-            f"  depth-method : {args.depth_method}\n"
-            f"  dz_per_layer : {chosen_dz if chosen_dz is not None else 'pitch ('+str(args.pitch)+')'}\n"
-            f"{align_info}"
-            f"{autofit_info}"
-            f"  subdiv-mm    : {args.subdiv_mm} mm",
-            flush=True,
-        )
-        bt = BackTransform.from_mesh(
-            str(stl_path),
-            volume_side=max(x, y, z),
-            pitch=args.pitch,
-            max_tilt_deg=args.max_tilt,
-            smooth_sigma=args.smooth_sigma,
-            depth_method=args.depth_method,
-            dz_per_layer=chosen_dz,
-            xy_center=xy_center,
-        )
-        backtransform_gcode_file(
-            args.gcode_in, out_path, bt,
-            subdiv_mm=args.subdiv_mm, n_jobs=args.jobs,
-            direction=args.gcode_direction,
-        )
-        return 0
+        return _run_gcode_transform(args, stl_path, x, y, z)
 
     print(
         "Viewer ready. Hotkeys: M/V/B  G/C/N/H/D/O  [ / ]  Up/Down  F5",

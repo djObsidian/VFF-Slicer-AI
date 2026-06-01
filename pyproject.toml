@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vff-slicer"
+version = "0.1.0"
+description = "Non-planar slicing preprocessor/postprocessor for 3-axis FDM: growth-vector field, mesh deformation, and G-code forward/inverse transform."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "UNLICENSED" }  # experimental; license TBD
+
+# Core: everything the headless pipeline (voxelize → growth → deform → gcode,
+# both Z-only and full-3D) needs. rtree + embreex give trimesh a ray backend
+# so mesh.contains() (voxelization, clip) works fast and out of the box.
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "trimesh>=4.0",
+    "rtree>=1.0",
+    "embreex>=2.17",
+]
+
+[project.optional-dependencies]
+# Interactive PyVista viewer + standalone gcode preview + section renderer.
+# Kept optional because vtk/pyvista wheels lag new Python releases; the
+# headless pipeline never imports them.
+viewer = ["pyvista>=0.43", "vtk>=9.2"]
+# Eikonal depth method (--depth-method fmm). The default 'vectors' method and
+# 'dijkstra' need only scipy, so this is optional.
+fmm = ["scikit-fmm>=2023.4.2"]
+# Everything.
+all = ["pyvista>=0.43", "vtk>=9.2", "scikit-fmm>=2023.4.2"]
+
+[project.scripts]
+vff = "vff.__main__:main"
+
+[tool.setuptools]
+# Flat layout: the package is the top-level vff/ directory. Be explicit so
+# setuptools doesn't try to package tests/ or the gitignored S4_Slicer/.
+packages = ["vff"]

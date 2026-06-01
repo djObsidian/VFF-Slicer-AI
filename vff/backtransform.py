@@ -150,7 +150,7 @@ class BackTransform:
         pitch: float = 1.0,
         max_tilt_deg: float = 30.0,
         smooth_sigma: float = 2.0,
-        depth_method: str = "fmm",
+        depth_method: str = "vectors",
         dz_per_layer: float | None = None,
         bed_blend_height: float | None = None,
         xy_center: tuple[float, float] | None = None,
@@ -365,6 +365,8 @@ def _collect_gcode_units(in_path: Path, subdiv_mm: float) -> tuple[list, np.ndar
             chunk_buf.clear()
 
     cur_x = cur_y = cur_z = 0.0
+    cur_e = 0.0  # absolute extruder position, tracked so we can spread an
+    #             absolute-E (M82) move's delta across its subdivided pieces.
     e_relative = True
     stats = {
         "lines_in": 0,
@@ -429,9 +431,15 @@ def _collect_gcode_units(in_path: Path, subdiv_mm: float) -> tuple[list, np.ndar
                     if len(chunk_buf) >= 65536:
                         _flush_chunk()
 
+                # e_start = absolute E before this move. The writer uses it to
+                # emit a monotone absolute-E ramp across the n_pieces (M82); for
+                # relative E (M83) it's unused but harmless.
+                e_start = cur_e
                 units.append(("move", out_cmd, e_val, f_val, tail if _semi else None,
-                              n_pieces, start_idx, e_relative))
+                              n_pieces, start_idx, e_relative, e_start))
                 stats["moves_out"] += n_pieces
+                if e_val is not None:
+                    cur_e = (cur_e + e_val) if e_relative else e_val
                 cur_x, cur_y, cur_z = new_x, new_y, new_z
                 continue
 
@@ -440,6 +448,7 @@ def _collect_gcode_units(in_path: Path, subdiv_mm: float) -> tuple[list, np.ndar
                 if "X" in params: cur_x = params["X"]
                 if "Y" in params: cur_y = params["Y"]
                 if "Z" in params: cur_z = params["Z"]
+                if "E" in params: cur_e = params["E"]
                 units.append(("raw", line))
                 continue
 
@@ -485,15 +494,7 @@ def _write_clipped_gcode(
                 fo.write(u[1] + "\n")
                 lines_out += 1
                 continue
-            _, out_cmd, e_val, f_val, tail, n_pieces, start_idx, e_rel = u
-            # For absolute E: find the last inside-piece so we can emit the
-            # cumulative E there. If no piece is inside, the move skips E.
-            last_inside_piece = -1
-            if out_cmd == "G1" and e_val is not None and not e_rel:
-                for piece in range(n_pieces - 1, -1, -1):
-                    if inside_mask[start_idx + piece]:
-                        last_inside_piece = piece
-                        break
+            _, out_cmd, e_val, f_val, tail, n_pieces, start_idx, e_rel, e_start = u
             for piece in range(n_pieces):
                 pi = start_idx + piece
                 ox, oy, oz = xyz_out[pi]
@@ -508,8 +509,12 @@ def _write_clipped_gcode(
                             piece_e = e_val / n_pieces
                             e_str = f"E{piece_e:.5f}"
                             e_kept += piece_e
-                        elif piece == last_inside_piece:
-                            e_str = f"E{e_val:.5f}"
+                        else:
+                            # Absolute E: cumulative ramp value at this piece.
+                            # Visual-only mode; an absolute move that is dropped
+                            # then re-enters the target can re-deposit the skipped
+                            # filament at re-entry (see docstring caveat).
+                            e_str = f"E{e_start + (e_val - e_start) * (piece + 1) / n_pieces:.5f}"
                     n_kept += 1
                 else:
                     cmd = "G0"
@@ -635,15 +640,19 @@ def _write_transformed_gcode(out_path: Path, units: list, xyz_out: np.ndarray, h
                 fo.write(u[1] + "\n")
                 lines_out += 1
                 continue
-            _, out_cmd, e_val, f_val, tail, n_pieces, start_idx, e_rel = u
+            _, out_cmd, e_val, f_val, tail, n_pieces, start_idx, e_rel, e_start = u
             for piece in range(n_pieces):
                 ox, oy, oz = xyz_out[start_idx + piece]
                 parts = [out_cmd, f"X{ox:.3f} Y{oy:.3f} Z{oz:.3f}"]
                 if e_val is not None:
                     if e_rel:
                         parts.append(f"E{(e_val / n_pieces):.5f}")
-                    elif piece == n_pieces - 1:
-                        parts.append(f"E{e_val:.5f}")
+                    else:
+                        # Absolute E: ramp from e_start to e_val across pieces so
+                        # filament is laid along the whole move, not dumped in
+                        # the last segment.
+                        e_piece = e_start + (e_val - e_start) * (piece + 1) / n_pieces
+                        parts.append(f"E{e_piece:.5f}")
                 if f_val is not None and piece == 0:
                     parts.append(f"F{f_val:g}")
                 fo.write(" ".join(parts))
@@ -699,7 +708,11 @@ def backtransform_gcode_file(
         # NumPy single-pass beats below ~5 M pts. Override with --jobs N to
         # force the parallel path anyway.
         _MP_AUTO_THRESHOLD = 5_000_000
-        if n_jobs in (0, 1) or (n_jobs == -1 and n_pts < _MP_AUTO_THRESHOLD):
+        # The MP workers reconstruct a depth-field BackTransform from pickled
+        # arrays; the full-3D BackTransform3D has no such representation, so it
+        # always runs single-process (its Newton inverse is fast anyway).
+        is_3d = getattr(bt, "is_3d", False)
+        if is_3d or n_jobs in (0, 1) or (n_jobs == -1 and n_pts < _MP_AUTO_THRESHOLD):
             if direction == "forward":
                 xyz_orig = bt.forward_points_batch(xyz_def)
             else:

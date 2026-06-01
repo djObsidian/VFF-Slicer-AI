@@ -1,0 +1,13 @@
+# Core headless pipeline (voxelize → growth → deform → gcode). Mirrors the
+# [project.dependencies] in pyproject.toml. For the interactive viewer add:
+#   pip install pyvista vtk           (or:  pip install -e .[viewer])
+# For the FMM depth method (--depth-method fmm) add:
+#   pip install scikit-fmm            (or:  pip install -e .[fmm])
+#
+# Easiest path is the editable install, which also gives you the `vff` command:
+#   pip install -e .[all]
+numpy>=1.24
+scipy>=1.10
+trimesh>=4.0
+rtree>=1.0
+embreex>=2.17
