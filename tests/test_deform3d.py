@@ -20,8 +20,8 @@ except Exception:
 from vff.build_volume import BuildVolume
 from vff.deform import deform_mesh
 from vff.deform3d import (
-    BackTransform3D, _adaptive_refine, _face_nonaffinity, deform_mesh_3d,
-    solve_deformation_map,
+    BackTransform3D, DeformationMap, _adaptive_refine, _face_nonaffinity,
+    deform_mesh_3d, solve_deformation_map,
 )
 from vff.growth import compute_growth
 from vff.mesh_io import load_and_place
@@ -279,6 +279,30 @@ def test_inverse_keeps_first_layer_z_and_never_digs_bed():
           f"worst {worst:+.4f} mm)")
 
 
+def test_layer_gap_ratio_correct_and_survives_singular_jacobian():
+    """Vertical extrusion comp samples (JΦ⁻¹)[z,z]. (1) It must equal the true
+    inverse entry on a non-trivial Jacobian, and (2) it must NOT crash on a
+    singular J — a non-converged inverse point at a fold can sample one, and the
+    old np.linalg.inv path raised LinAlgError there, killing the whole transform.
+    Degenerate cells fall back to 1.0 (no compensation)."""
+    jac = np.broadcast_to(np.eye(3), (4, 4, 4, 3, 3)).copy()
+    jac[0, 0, 0] = 0.0                          # singular (rank-0) node
+    jac[2, 2, 2] = np.diag([2.0, 2.0, 0.5])     # (J⁻¹)[z,z] = 1/0.5 = 2.0
+    dmap = DeformationMap(phi=np.zeros((4, 4, 4, 3)), jac=jac,
+                          origin=np.zeros(3), pitch=1.0)
+    # Each query lands on exactly one node (cell-centre sample).
+    g = dmap.layer_gap_ratio(np.array([
+        [0.5, 0.5, 0.5],   # singular node → fallback 1.0
+        [1.5, 1.5, 1.5],   # identity node → 1.0
+        [2.5, 2.5, 2.5],   # diag node → 2.0
+    ]))
+    assert np.isfinite(g).all(), f"must stay finite on a singular J, got {g}"
+    assert abs(g[0] - 1.0) < 1e-9, f"degenerate cell must fall back to 1.0, got {g[0]}"
+    assert abs(g[1] - 1.0) < 1e-9, f"identity J → gap 1.0, got {g[1]}"
+    assert abs(g[2] - 2.0) < 1e-9, f"diag([2,2,.5]) → (J⁻¹)[z,z]=2.0, got {g[2]}"
+    print("  PASS layer_gap_ratio (2.0 on diag; finite 1.0 fallback on singular J)")
+
+
 def test_overhang_degree_ramps_with_severity():
     """overhang_degree is a continuous [0,1] severity (the fraction of the
     downward probe column that is air) — the input to the fan ramp. 0 = solid
@@ -317,6 +341,7 @@ def main() -> int:
         test_adaptive_refine_hits_error_watertight_and_beats_uniform,
         test_default_smoothing_keeps_a_bore_dome,
         test_inverse_keeps_first_layer_z_and_never_digs_bed,
+        test_layer_gap_ratio_correct_and_survives_singular_jacobian,
         test_overhang_degree_ramps_with_severity,
     ]
     failures = 0

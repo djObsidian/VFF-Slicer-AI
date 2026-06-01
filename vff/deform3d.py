@@ -137,9 +137,21 @@ class DeformationMap:
         the full volume. The slicer's E assumes the deformed layer height; the
         real gap to the layer below is this × that, so E scales by it (ratio < 1
         where layers compress → reduce E to avoid over-squish). Unlike 1/det
-        this ignores the in-plane width change a 3-axis nozzle can't realize."""
+        this ignores the in-plane width change a 3-axis nozzle can't realize
+        (valid because the 3D map is near-isometric in-plane)."""
         J = _sample_jac(self.jac, self.origin, self.pitch, np.asarray(pts, float))
-        return np.linalg.inv(J)[:, 2, 2]
+        # (J⁻¹)[z,z] = cofactor_zz / det = (Jxx·Jyy − Jxy·Jyx) / det. Computed
+        # directly rather than via np.linalg.inv: a full batch-inverse RAISES
+        # LinAlgError if ANY sampled J is singular (a non-converged inverse point
+        # at a fold can hit one), which would kill the whole gcode transform.
+        # This is identical for non-singular J, ~3× cheaper, and falls back to
+        # 1.0 (no compensation) on a degenerate cell instead of crashing.
+        det = np.linalg.det(J)
+        cof_zz = J[:, 0, 0] * J[:, 1, 1] - J[:, 0, 1] * J[:, 1, 0]
+        out = np.ones(J.shape[0], dtype=np.float64)
+        ok = np.abs(det) > 1e-9
+        out[ok] = cof_zz[ok] / det[ok]
+        return out
 
     # ---- inverse: deformed → original (vectorised damped Newton / LM) ----
     def inverse_points(
