@@ -49,9 +49,16 @@ forward (trilinear) / inverse (Newton) → G-code rewrite with extrusion comp.
 ## Project-specific gotchas
 
 - **Consistency rule:** every map-shaping flag (`--max-tilt`, `--pitch`,
-  `--volume`, `--smooth-sigma`) must be IDENTICAL on the `--export` and the
-  `--gcode-direction inverse` run, or the inverse won't match the sliced mesh.
-  When changing a default, update both paths.
+  `--volume`, `--smooth-sigma`, `--depth-method`) must be IDENTICAL on the
+  `--export` and the `--gcode-direction inverse` run, or the inverse won't match
+  the sliced mesh. When changing a default, update both paths.
+- **`--depth-method` in 3d** picks the build direction the map rotates to
+  vertical: `vectors` (default, clamped BFS dirs) or `harmonic` (∇φ of the
+  Laplace layer potential — curl-free, NO tilt clamp, no closed layer surfaces;
+  see [GROWTH_SURFACES_MATH.md](GROWTH_SURFACES_MATH.md)). On the mushroom both
+  are fold-free/invertible; harmonic's win is conceptual (true gradient) + the
+  scalar field has no closed shells. Harmonic has no clamp, so overhangs can
+  exceed `--max-tilt`.
 - **3-axis, not 4-axis:** the nozzle is vertical (that's the whole `--max-tilt`
   premise). Extrusion comp defaults to `vertical` (layer-height squish), NOT the
   volume/`1/det` that S4 uses for its tilting 4-axis nozzle.

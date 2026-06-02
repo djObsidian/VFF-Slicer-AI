@@ -70,6 +70,7 @@ def _run_gcode_transform(args, stl_path: Path, x: float, y: float, z: float) -> 
             f"  pitch        : {args.pitch} mm\n"
             f"  max-tilt     : {args.max_tilt} deg\n"
             f"  smooth-sigma : {args.smooth_sigma} (must match the export)\n"
+            f"  depth-method : {args.depth_method} (must match the export)\n"
             f"  extrusion-comp: {(args.extrusion_comp_mode if args.extrusion_comp else 'off')}\n"
             f"  cool-overhangs: {('S'+str(args.cool_fan_min)+'..'+str(args.cool_fan_max)+' ramped, probe '+str(args.cool_probe)+' mm' + (', speed '+str(args.cool_speed)+' mm/s' if args.cool_speed and args.cool_speed > 0 else ', no speed cap') if (args.cool_overhangs and args.gcode_direction == 'inverse') else 'off')}\n"
             f"  max-z-speed  : {(str(args.max_z_speed)+' mm/s' if args.max_z_speed and args.max_z_speed > 0 else 'off')}\n"
@@ -80,7 +81,7 @@ def _run_gcode_transform(args, stl_path: Path, x: float, y: float, z: float) -> 
         bt3 = BackTransform3D.from_mesh(
             str(stl_path), volume_side=max(x, y, z), pitch=args.pitch,
             max_tilt_deg=args.max_tilt, smooth_sigma=args.smooth_sigma,
-            xy_center=xy_center,
+            depth_method=args.depth_method, xy_center=xy_center,
         )
         backtransform_gcode_file(
             args.gcode_in, out_path, bt3,
@@ -195,6 +196,7 @@ def _run_3d_export(args, stl_path: Path, x: float, y: float, z: float) -> int:
         f"Full-3D deform export: {stl_path} -> {args.export}\n"
         f"  volume {x:.0f}x{y:.0f}x{z:.0f} mm, pitch {args.pitch} mm, "
         f"max-tilt {args.max_tilt} deg, smooth-sigma {args.smooth_sigma}, "
+        f"depth-method {args.depth_method}, "
         f"subdivide-error {args.subdivide_error} mm ({args.remesh} remesh)",
         flush=True,
     )
@@ -202,6 +204,7 @@ def _run_3d_export(args, stl_path: Path, x: float, y: float, z: float) -> int:
     gr = compute_growth(vg, max_tilt_deg=args.max_tilt)
     dmap = solve_deformation_map(
         gr, displacement_smooth_sigma=args.smooth_sigma, max_tilt_deg=args.max_tilt,
+        depth_method=args.depth_method,
     )
     base_err = float(_face_nonaffinity(mesh, dmap).max())
     dm = deform_mesh_3d(
@@ -254,7 +257,9 @@ def main(argv: list[str] | None = None) -> int:
              "at a mushroom cap), and don't inherit the geometry's concavity; NO tilt clamp "
              "(overhangs may exceed max-tilt). 'fmm' (Eikonal, C1 smooth, requires scikit-fmm) "
              "or 'dijkstra' (discrete shortest path, C0) — both ignore the clamp and follow "
-             "raw geodesic depth.",
+             "raw geodesic depth. In --deform-mode 3d this selects the growth DIRECTION the "
+             "map rotates to vertical: 'vectors' = clamped BFS vectors (default), 'harmonic' = "
+             "∇φ (curl-free, no clamp). Must MATCH between the sliced export and the inverse.",
     )
     parser.add_argument(
         "--deform-mode", choices=["z-only", "3d"], default="z-only",

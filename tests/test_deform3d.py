@@ -330,6 +330,46 @@ def test_overhang_degree_ramps_with_severity():
     print("  PASS overhang degree ramp (1.0 / 0.75 / 0.5 / 0.0; near-bed & no-mesh 0)")
 
 
+def test_harmonic_3d_direction_fold_free_and_invertible():
+    """--depth-method harmonic in 3D drives the rotation field from ∇φ (curl-
+    free, no clamp) instead of the clamped BFS vectors. Requirements: the map
+    stays FOLD-FREE (det J > 0 over all model voxels) and fully invertible, and
+    'vectors' must remain byte-identical to the default (backward compat). The
+    box checks the plumbing; the mushroom STL (if present) checks the bottleneck
+    case the method exists for."""
+    # Backward compat + plumbing on a flat box.
+    box = trimesh.creation.box(extents=(40, 40, 20)); box.apply_translation([125, 125, 10])
+    gr_b = compute_growth(voxelize_solid(box, pitch=1.0), max_tilt_deg=30.0)
+    d_def = solve_deformation_map(gr_b)
+    d_vec = solve_deformation_map(gr_b, depth_method="vectors")
+    assert np.allclose(d_def.phi, d_vec.phi), "depth_method='vectors' must equal the default"
+    d_h = solve_deformation_map(gr_b, depth_method="harmonic")
+    inb = gr_b.step >= 0
+    assert (np.linalg.det(d_h.jac[inb]) > 0).all(), "harmonic folded a flat box"
+
+    # Bottleneck case: the real mushroom, if available (it is gitignored).
+    stl = Path(__file__).resolve().parent.parent / "example_in" / "np_test1.stl"
+    if not stl.exists():
+        print("  PASS harmonic 3D plumbing (box fold-free; vectors==default) "
+              "[SKIP mushroom: example_in/np_test1.stl not found]")
+        return
+    mesh = load_and_place(str(stl), BuildVolume.of(220, 220, 110))
+    gr = compute_growth(voxelize_solid(mesh, pitch=0.4), max_tilt_deg=30.0)
+    dmap = solve_deformation_map(gr, displacement_smooth_sigma=2.0, depth_method="harmonic")
+    inside = gr.step >= 0
+    folds = int((np.linalg.det(dmap.jac[inside]) <= 0).sum())
+    assert folds == 0, f"harmonic mushroom map folded: {folds} cells with det J <= 0"
+    P = dmap.origin + (np.argwhere(inside) + 0.5) * dmap.pitch
+    rng = np.random.default_rng(0)
+    s = P[rng.choice(P.shape[0], size=min(2000, P.shape[0]), replace=False)]
+    back, conv = dmap.inverse_points(dmap.forward_points(s))
+    err = np.linalg.norm(back - s, axis=1)
+    assert conv.mean() > 0.99, f"harmonic roundtrip converged only {100*conv.mean():.1f}%"
+    assert np.percentile(err, 99) < 0.01, f"harmonic roundtrip p99 {np.percentile(err,99):.4f} mm"
+    print(f"  PASS harmonic 3D (box fold-free, vectors==default; mushroom {folds} folds, "
+          f"roundtrip {100*conv.mean():.0f}% conv, p99 {np.percentile(err,99):.4f} mm)")
+
+
 def main() -> int:
     tests = [
         test_flat_box_maps_to_identity,
@@ -343,6 +383,7 @@ def main() -> int:
         test_inverse_keeps_first_layer_z_and_never_digs_bed,
         test_layer_gap_ratio_correct_and_survives_singular_jacobian,
         test_overhang_degree_ramps_with_severity,
+        test_harmonic_3d_direction_fold_free_and_invertible,
     ]
     failures = 0
     for t in tests:

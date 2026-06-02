@@ -251,12 +251,52 @@ class DeformationMap:
         return best_p, converged
 
 
+def _growth_directions(
+    growth: GrowthResult, depth_method: str, field_sigma: float,
+    grad_floor: float = 0.05,
+) -> np.ndarray:
+    """The per-voxel build direction the deformation rotates to +ẑ, selected by
+    `depth_method`. Returns a full-grid (nx, ny, nz, 3) field.
+
+      - "vectors" (default): the clamped BFS predecessor field, `growth.vectors`
+        — bounded to ≤ max_tilt from +ẑ, but not a gradient (the clamp adds curl,
+        so no single layer family has them as exact normals).
+      - "harmonic" (or any scalar method `smoothed_depth_field` knows): the UNIT
+        GRADIENT of that scalar layer field. For "harmonic" this is ∇φ of the
+        Laplace potential — a curl-free direction, so the rotation field is
+        integrable (no clamp-induced residual) and the field has no closed level
+        sets (see GROWTH_SURFACES_MATH.md). NO tilt clamp is applied, so ∇φ may
+        point past max_tilt in overhang regions (a 3-axis overhang); the 3D map
+        stays fold-free there in practice (validated on the mushroom) thanks to
+        the displacement smoothing, but it is the user's call to pick `vectors`
+        if a hard tilt bound is required.
+
+    Voxels with |∇φ| below `grad_floor` (near-flat layers — e.g. the wide
+    interior of a harmonic field, where the gradient is tiny and its direction
+    is noise) get a ZERO direction → identity rotation (treated as already
+    horizontal), as do outside-model voxels."""
+    if depth_method == "vectors":
+        return growth.vectors
+    from .deform import smoothed_depth_field
+    f = smoothed_depth_field(
+        growth, sigma=field_sigma, method=depth_method, outside_mode="extend"
+    )
+    g = np.stack(np.gradient(f), axis=-1)                  # (nx,ny,nz,3)
+    mag = np.linalg.norm(g, axis=-1)
+    matrix = growth.step >= 0
+    dirs = np.zeros_like(g)
+    good = matrix & (mag > grad_floor)
+    dirs[good] = g[good] / mag[good, None]
+    return dirs.astype(np.float32)
+
+
 def solve_deformation_map(
     growth: GrowthResult,
     *,
     displacement_smooth_sigma: float = 2.0,
     max_tilt_deg: float = 30.0,
     bed_blend_height: float = 2.0,
+    depth_method: str = "vectors",
     eps: float = 1e-6,
     rtol: float = 1e-7,
     maxiter: int = 5000,
@@ -275,8 +315,11 @@ def solve_deformation_map(
     changes the deformation, so the export that gets sliced and the inverse
     that undoes it must use the SAME value (like dz for the Z-only path).
 
-    The rotations are driven by the local BFS growth vectors (lowest
-    distortion). Must match between the sliced export and the inverse.
+    The rotations are driven by the local build direction (`depth_method`):
+    "vectors" (default) = the clamped BFS growth vectors; "harmonic" = ∇φ of the
+    Laplace layer potential (curl-free, no clamp — see _growth_directions). Like
+    smooth_sigma/max_tilt, `depth_method` must MATCH between the sliced export
+    and the inverse, or the inverse won't undo the same map.
     """
     matrix = growth.step >= 0
     nx, ny, nz = matrix.shape
@@ -301,8 +344,10 @@ def solve_deformation_map(
     flat_idx = np.full(matrix.shape, -1, dtype=np.int64)
     flat_idx[matrix] = np.arange(n_model)
 
-    # Per-model-voxel rotation taking the local BFS growth dir → +ẑ.
-    vecs = growth.vectors[matrix]
+    # Per-model-voxel rotation taking the local build dir → +ẑ. The direction
+    # is the clamped BFS vectors ("vectors") or the unit gradient of a scalar
+    # layer field ("harmonic" = ∇φ, curl-free, no clamp); see _growth_directions.
+    vecs = _growth_directions(growth, depth_method, displacement_smooth_sigma)[matrix]
     R = rotations_to_vertical(vecs)                       # (M,3,3)
 
     rows_l, cols_l, vals_l = [], [], []
@@ -613,13 +658,14 @@ class BackTransform3D:
         pitch: float = 1.0,
         max_tilt_deg: float = 30.0,
         smooth_sigma: float = 2.0,
+        depth_method: str = "vectors",
         xy_center: tuple[float, float] | None = None,
     ) -> "BackTransform3D":
         """Voxelise + grow + solve the deformation map for `stl_path`, placed
         the same way the Z-only path places it (Z_min→0, XY centred on
-        `xy_center` if given, else the build-volume centre). `smooth_sigma`
-        and `max_tilt_deg` must match the values the sliced export was built
-        with."""
+        `xy_center` if given, else the build-volume centre). `smooth_sigma`,
+        `max_tilt_deg` and `depth_method` must match the values the sliced
+        export was built with."""
         from .build_volume import BuildVolume
         from .growth import compute_growth
         from .mesh_io import load_and_place
@@ -641,6 +687,7 @@ class BackTransform3D:
         gr = compute_growth(vg, max_tilt_deg=max_tilt_deg)
         dmap = solve_deformation_map(
             gr, displacement_smooth_sigma=smooth_sigma, max_tilt_deg=max_tilt_deg,
+            depth_method=depth_method,
         )
         return cls(dmap, mesh=mesh)
 
