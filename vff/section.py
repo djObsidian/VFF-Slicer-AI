@@ -10,8 +10,10 @@ centre yields the layer curves you'd see in a vertical cross-section of the
 print — exactly the picture that shows how non-planar the layers are and
 how the tilt clamp limits their slope on overhangs.
 
-Only the surfaces are drawn (their intersection curves with the plane);
-nothing else — no mesh, voxels, or arrows — per the spec.
+The layer curves (the surfaces' intersection with the plane) are drawn, plus
+the model's OWN section outline on top in a contrasting colour — the part
+boundary cut by the same plane — so it's always legible over the layer lines.
+Nothing else — no voxels or arrows.
 """
 
 from __future__ import annotations
@@ -176,8 +178,14 @@ def save_xz_section(
     cx = 0.5 * (mesh.bounds[0, 0] + mesh.bounds[1, 0])
     cz = 0.5 * (mesh.bounds[0, 2] + mesh.bounds[1, 2])
     cy = section_y if section_y is not None else 0.5 * (mesh.bounds[0, 1] + mesh.bounds[1, 1])
+    diag = float(np.linalg.norm(mesh.extents)) or 1.0
 
     section = surf.slice(normal=(0.0, 1.0, 0.0), origin=(cx, cy, cz))
+
+    # The model's own outline at the SAME plane: slicing the closed surface mesh
+    # with the XZ plane gives its boundary polylines (the part's cross-section
+    # contour). Drawn over everything below in a contrasting colour.
+    model_outline = pv.wrap(mesh).slice(normal=(0.0, 1.0, 0.0), origin=(cx, cy, cz))
 
     pl = pv.Plotter(off_screen=True, window_size=window_size)
     pl.set_background("white")
@@ -191,11 +199,23 @@ def save_xz_section(
             lighting=False,
             clim=[0.0, max(float(gr.n_steps - 1), 1.0)],
         )
+    # Model contour ON TOP of the layer curves. The view is orthographic down
+    # +Y with the camera on the +Y side, so nudging the outline toward the
+    # camera (+Y) makes it win the depth test against the coplanar layer lines
+    # without moving it one pixel on screen (Y is the view axis → no XZ shift).
+    if model_outline.n_points > 0:
+        model_outline.points[:, 1] += 0.01 * diag
+        pl.add_mesh(
+            model_outline,
+            color="black",
+            line_width=line_width + 1.0,
+            show_scalar_bar=False,
+            lighting=False,
+        )
     # Orthographic, looking straight down the +Y axis: X horizontal, Z up.
     # Set the camera explicitly — view_xz() picks an axis mapping that
     # rotates the section 90°.
     pl.enable_parallel_projection()
-    diag = float(np.linalg.norm(mesh.extents)) or 1.0
     pl.camera_position = [
         (cx, cy + 2.0 * diag, cz),   # camera on the +Y side
         (cx, cy, cz),                # looking at the section
