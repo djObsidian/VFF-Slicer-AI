@@ -251,6 +251,7 @@ positional: STL                 path to STL (default ./propeller_fixed_flat.stl)
   --cool-overhangs / --no-cool-overhangs   (3d inverse) ramp fan on re-detected overhangs/bridges (default on)
   --cool-fan-min 0..255         (3d inverse) fan PWM at the lightest overhang (default 128)
   --cool-fan-max 0..255         (3d inverse) fan PWM at a full bridge (default 255); lerp by severity
+  --cool-speed MM/S             (3d inverse) print speed at a full bridge (default 20; 0 = off); lerp from slicer F
   --cool-probe MM               (3d inverse) downward support-probe column depth (default 0.8)
 
   --export PATH                 save the deformed mesh

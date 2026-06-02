@@ -71,7 +71,7 @@ def _run_gcode_transform(args, stl_path: Path, x: float, y: float, z: float) -> 
             f"  max-tilt     : {args.max_tilt} deg\n"
             f"  smooth-sigma : {args.smooth_sigma} (must match the export)\n"
             f"  extrusion-comp: {(args.extrusion_comp_mode if args.extrusion_comp else 'off')}\n"
-            f"  cool-overhangs: {('S'+str(args.cool_fan_min)+'..'+str(args.cool_fan_max)+' ramped, probe '+str(args.cool_probe)+' mm' if (args.cool_overhangs and args.gcode_direction == 'inverse') else 'off')}\n"
+            f"  cool-overhangs: {('S'+str(args.cool_fan_min)+'..'+str(args.cool_fan_max)+' ramped, probe '+str(args.cool_probe)+' mm' + (', speed '+str(args.cool_speed)+' mm/s' if args.cool_speed and args.cool_speed > 0 else ', no speed cap') if (args.cool_overhangs and args.gcode_direction == 'inverse') else 'off')}\n"
             f"  max-z-speed  : {(str(args.max_z_speed)+' mm/s' if args.max_z_speed and args.max_z_speed > 0 else 'off')}\n"
             f"{align_info}"
             f"  subdiv-mm    : {args.subdiv_mm} mm",
@@ -89,6 +89,7 @@ def _run_gcode_transform(args, stl_path: Path, x: float, y: float, z: float) -> 
             z_slowdown=args.z_slowdown, max_z_speed=args.max_z_speed,
             cool_overhangs=args.cool_overhangs,
             cool_fan_min=args.cool_fan_min, cool_fan_max=args.cool_fan_max,
+            cool_speed=args.cool_speed,
             cool_probe=args.cool_probe, cool_min_z=args.cool_min_z,
         )
         return 0
@@ -336,6 +337,15 @@ def main(argv: list[str] | None = None) -> int:
         "--cool-fan-max", type=int, default=255, metavar="0-255",
         help="(--cool-overhangs) Fan PWM at a full bridge / worst overhang "
              "(default 255 = full).",
+    )
+    parser.add_argument(
+        "--cool-speed", type=float, default=20.0, metavar="MM/S",
+        help="(--cool-overhangs) Print speed at a full bridge / worst overhang "
+             "(default 20 mm/s; 0 = off). The feedrate twin of the cooling fan: "
+             "on the detected overhang moves F is ramped down from the slicer's "
+             "speed (degree 0) to this at a full bridge (degree 1), giving the "
+             "freshly-laid road time to set over the void. Only ever lowers F, "
+             "and composes with --z-slowdown / --max-z-speed (the lowest F wins).",
     )
     parser.add_argument(
         "--cool-probe", type=float, default=0.8, metavar="MM",

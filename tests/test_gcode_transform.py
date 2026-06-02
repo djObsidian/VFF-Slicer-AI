@@ -262,6 +262,62 @@ def test_overhang_cooling_ramps_fan_by_severity():
     print("  PASS overhang cooling ramp (S150 @0.5 → S200 @1.0; S80 restored)")
 
 
+def test_overhang_cooling_slows_feedrate():
+    """--cool-speed is the feedrate twin of the fan ramp: on the SAME detected
+    overhang moves F eases from the slicer's speed (degree 0) down to cool_speed
+    at a full bridge (degree 1), modal_f + (cool_speed·60 − modal_f)·d. Supported
+    moves keep the slicer's F; it only ever lowers F. Same stub as the fan test."""
+    class _StubBT:
+        is_3d = True
+        mesh = object()
+        def invert_points_batch(self, xyz):
+            return np.asarray(xyz, dtype=np.float64).copy()  # identity
+        def overhang_degree(self, xyz, probe=0.8, min_z=0.6):
+            z = np.asarray(xyz, dtype=np.float64)[:, 2]
+            d = np.zeros(len(z))
+            d[(z >= 5) & (z < 8)] = 0.5   # partial overhang
+            d[z >= 8] = 1.0               # full bridge
+            return d
+
+    gcode = (
+        "M83\n"
+        "G1 X0 Y0 Z1 F3000\n"   # 50 mm/s modal
+        "G1 X1 Y0 Z1 E1\n"   # supported → full F 3000
+        "G1 X2 Y0 Z6 E1\n"   # degree 0.5 → 3000 + (1200-3000)*0.5 = 2100
+        "G1 X3 Y0 Z9 E1\n"   # degree 1.0 → cool_speed 20 mm/s = 1200
+    )
+    with tempfile.TemporaryDirectory() as td:
+        ip = Path(td) / "in.gcode"
+        op = Path(td) / "out.gcode"
+        ip.write_text(gcode, encoding="utf-8")
+        stats = backtransform_gcode_file(
+            ip, op, _StubBT(), subdiv_mm=100, n_jobs=1, verbose=False,
+            direction="inverse", extrusion_comp=False,
+            cool_overhangs=True, cool_fan_min=100, cool_fan_max=200,
+            cool_speed=20.0,
+        )
+        lines = op.read_text(encoding="utf-8").splitlines()
+
+    def f_at(lines, xtag):
+        f = None
+        for ln in lines:
+            if not _MOVE_RE.match(ln.strip()):
+                continue
+            mf = re.search(r"\bF(-?[0-9.]+)", ln)
+            if mf:
+                f = float(mf.group(1))
+            if xtag in ln:
+                return f
+        return None
+
+    assert abs(f_at(lines, "X1.000") - 3000) < 1, "supported move must keep full F"
+    assert abs(f_at(lines, "X2.000") - 2100) < 1, "degree 0.5 must ease F to 2100"
+    assert abs(f_at(lines, "X3.000") - 1200) < 1, "bridge must ease F to cool_speed (1200)"
+    assert stats["n_cool_slowed"] == 2, (
+        f"want 2 pieces eased by the overhang speed ramp, got {stats['n_cool_slowed']}")
+    print("  PASS overhang speed ramp (F3000 kept; 0.5→2100; bridge→1200 = 20 mm/s)")
+
+
 def test_propeller_forward_inverse_roundtrip():
     """forward then inverse on the real mesh should recover XYZ within a
     fraction of the voxel pitch (interpolation error only)."""
@@ -302,6 +358,7 @@ def main() -> int:
         test_max_z_speed_hard_caps_z_velocity,
         test_max_z_speed_caps_travel_moves_too,
         test_overhang_cooling_ramps_fan_by_severity,
+        test_overhang_cooling_slows_feedrate,
         test_propeller_forward_inverse_roundtrip,
     ]
     failures = 0

@@ -634,13 +634,14 @@ def _write_transformed_gcode(
     escale: np.ndarray | None = None, z_slowdown: float = 1.0,
     overhang_deg: np.ndarray | None = None, cool_fan_min: int = 128,
     cool_fan_max: int = 255, cool_linger: int = 3, max_z_speed: float = 0.0,
+    cool_speed: float = 20.0,
 ) -> dict:
     """Pass 3: stream-write the unit list, reading move endpoints from xyz_out.
 
     `escale` (per-point extrusion multiplier, parallel to xyz_out) applies
     extrusion compensation: only positive relative E is scaled.
 
-    Two independent feedrate tweaks (both compose — the lowest F wins, and the
+    Three independent feedrate tweaks (all compose — the lowest F wins, and the
     slicer's intended F is tracked and restored when a move no longer needs it):
 
     `max_z_speed` (mm/s, 0 = off): a HARD cap on the Z-axis velocity component.
@@ -658,12 +659,21 @@ def _write_transformed_gcode(
     onto steep sections; use `max_z_speed` to actually bound Z velocity. e.g. 0.5
     = halve F on the steepest parts.
 
+    `cool_speed` (mm/s, 0 = off): the overhang SPEED ease, the feedrate twin of
+    the cooling fan. On the same overhang/bridge moves the fan boosts (see
+    `overhang_deg`), F is ramped down from the slicer's speed at degree 0 to
+    `cool_speed` at a full bridge (degree 1) — `modal_f + (cool_speed·60 −
+    modal_f)·d` — giving the freshly-laid road time to set over the void. Only
+    ever lowers F (never speeds a move the slicer already runs slower); needs
+    `overhang_deg` (i.e. --cool-overhangs), since it reuses that severity.
+
     `overhang_deg` (per-point severity in [0,1], parallel to xyz_out): ramp the
     fan over overhang/bridge moves — see BackTransform3D.overhang_degree. Per
     printing move the worst (max) degree d of its pieces picks a fan by linear
     interpolation `cool_fan_min + d·(cool_fan_max − cool_fan_min)` (so a slight
     overhang gets a gentle boost, a full bridge gets the max), applied only
-    where it exceeds the slicer's own fan. Supported moves (d = 0) get no boost.
+    where it exceeds the slicer's own fan. The same d also drives `cool_speed`.
+    Supported moves (d = 0) get no boost.
     The slicer's own M106/M107 are tracked; while a boost is active they're
     swallowed and restored once the part is supported again for `cool_linger`
     moves of hysteresis (so the fan doesn't flap)."""
@@ -672,15 +682,19 @@ def _write_transformed_gcode(
     cur = None         # last written position (cx, cy, cz)
     modal_f = None     # slicer's intended feedrate (mm/min), un-scaled
     emitted_f = None   # F value last actually written
-    n_slowed = 0       # pieces whose F we reduced (either tweak)
+    n_slowed = 0       # pieces whose F we reduced (any tweak)
     n_zcapped = 0      # pieces limited specifically by the Z-velocity cap
+    n_cool_slowed = 0  # pieces eased by the overhang speed ramp
     do_slow = z_slowdown < 1.0
     do_zcap = max_z_speed and max_z_speed > 0
     _z_cap_mmin = float(max_z_speed) * 60.0 if do_zcap else 0.0  # mm/s → mm/min
-    do_feed = do_slow or do_zcap
 
     # --- overhang cooling state ---
     do_cool = overhang_deg is not None
+    # The overhang speed ease rides on the same severity, so it needs do_cool.
+    do_cool_speed = do_cool and cool_speed and cool_speed > 0
+    _cool_f_mmin = float(cool_speed) * 60.0 if do_cool_speed else 0.0  # mm/s → mm/min
+    do_feed = do_slow or do_zcap or do_cool_speed
     cool_span = max(0, int(cool_fan_max) - int(cool_fan_min))
     cool_on = False          # is our boost currently overriding the fan?
     cur_boost = 0            # the fan value we last forced (while cool_on)
@@ -718,16 +732,19 @@ def _write_transformed_gcode(
             if f_val is not None:
                 modal_f = f_val
             # --- overhang cooling, ramped per printing move ---
+            # The move's worst severity also drives the speed ease in the piece
+            # loop below; default 0 (supported / non-printing → no boost, no slow).
+            move_deg = 0.0
             if do_cool and out_cmd == "G1" and e_val is not None:
                 seg = overhang_deg[start_idx:start_idx + n_pieces]
-                deg = float(seg.max()) if seg.size else 0.0
-                if deg > 0.0:
+                move_deg = float(seg.max()) if seg.size else 0.0
+                if move_deg > 0.0:
                     n_cool_moves += 1
                     since_overhang = 0
                     # lerp min→max by severity, but never drop below the slicer.
-                    eff = max(int(round(cool_fan_min + cool_span * deg)), slicer_fan_val)
+                    eff = max(int(round(cool_fan_min + cool_span * move_deg)), slicer_fan_val)
                     if eff > slicer_fan_val and (not cool_on or eff != cur_boost):
-                        fo.write(f"M106 S{eff} ; vff cool overhang {int(round(deg*100))}%\n")
+                        fo.write(f"M106 S{eff} ; vff cool overhang {int(round(move_deg*100))}%\n")
                         lines_out += 1
                         n_cool_boosts += 1
                         cool_on, cur_boost = True, eff
@@ -777,10 +794,19 @@ def _write_transformed_gcode(
                         f_cap = _z_cap_mmin * seg_len / dz
                         if f_cap < target_f:
                             target_f, zcapped = f_cap, True
+                    cooled = False
+                    if do_cool_speed and move_deg > 0.0:
+                        # Ease F toward cool_speed by overhang severity: full F at
+                        # degree 0, cool_speed at a bridge. Only ever lowers F.
+                        cool_target = modal_f + (_cool_f_mmin - modal_f) * move_deg
+                        if cool_target < target_f:
+                            target_f, cooled = cool_target, True
                     if target_f < modal_f - 1e-9:
                         n_slowed += 1
                         if zcapped:
                             n_zcapped += 1
+                        if cooled:
+                            n_cool_slowed += 1
                     if emitted_f is None or abs(target_f - emitted_f) > 1e-3:
                         parts.append(f"F{target_f:g}")
                         emitted_f = target_f
@@ -799,6 +825,7 @@ def _write_transformed_gcode(
             lines_out += 1
     return {
         "lines_out": lines_out, "n_slowed": n_slowed, "n_zcapped": n_zcapped,
+        "n_cool_slowed": n_cool_slowed,
         "n_cool_boosts": n_cool_boosts, "n_cool_moves": n_cool_moves,
     }
 
@@ -818,6 +845,7 @@ def backtransform_gcode_file(
     cool_overhangs: bool = False,
     cool_fan_min: int = 128,
     cool_fan_max: int = 255,
+    cool_speed: float = 20.0,
     cool_probe: float = 0.8,
     cool_min_z: float = 0.6,
 ) -> dict:
@@ -932,17 +960,19 @@ def backtransform_gcode_file(
         "deformed-space XYZ inverted to original (non-planar) space"
         + ("; extrusion volume-compensated" if escale is not None else "")
         + (f"; overhang cooling S{cool_fan_min}..{cool_fan_max} ramped"
+           + (f", speed→{cool_speed:g}mm/s" if cool_speed and cool_speed > 0 else "")
            if overhang_deg is not None else "")
         + "\n"
     )
     _w = _write_transformed_gcode(
         out_path, units, xyz_orig, header, escale=escale, z_slowdown=z_slowdown,
         max_z_speed=max_z_speed, overhang_deg=overhang_deg,
-        cool_fan_min=cool_fan_min, cool_fan_max=cool_fan_max,
+        cool_fan_min=cool_fan_min, cool_fan_max=cool_fan_max, cool_speed=cool_speed,
     )
     stats["lines_out"] = _w["lines_out"]
     stats["n_slowed"] = _w["n_slowed"]
     stats["n_zcapped"] = _w["n_zcapped"]
+    stats["n_cool_slowed"] = _w["n_cool_slowed"]
     stats["n_cool_boosts"] = _w["n_cool_boosts"]
     stats["n_cool_moves"] = _w["n_cool_moves"]
 
@@ -981,11 +1011,16 @@ def backtransform_gcode_file(
                 f"had F scaled down{extra}"
             )
         if "n_overhang_pts" in stats:
+            sl = stats.get("n_cool_slowed", 0)
+            speed_note = (
+                f"; {sl:,} pieces eased toward {cool_speed:g} mm/s"
+                if cool_speed and cool_speed > 0 and sl else ""
+            )
             print(
                 f"[backtransform] overhang cooling: {stats['n_overhang_pts']:,} unsupported "
                 f"points on {stats['n_cool_moves']:,} moves → {stats['n_cool_boosts']:,} fan "
                 f"changes ramped S{cool_fan_min}..{cool_fan_max} by overhang severity "
-                "(overhangs/bridges the slicer scheduled from the flat mesh)"
+                f"(overhangs/bridges the slicer scheduled from the flat mesh){speed_note}"
             )
         print(
             f"[backtransform] timing: parse {stats['t_parse_s']:.2f}s  "
