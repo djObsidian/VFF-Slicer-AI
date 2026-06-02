@@ -29,8 +29,13 @@ viewer = ["pyvista>=0.43", "vtk>=9.2"]
 # Eikonal depth method (--depth-method fmm). The default 'vectors' method and
 # 'dijkstra' need only scipy, so this is optional.
 fmm = ["scikit-fmm>=2023.4.2"]
+# Algebraic-multigrid acceleration for the full-3D deform solve. Optional with a
+# graceful fallback to plain CG (solve_deformation_map), so the core install
+# never breaks if no pyamg wheel exists yet for a new Python. Big speedup at
+# fine pitch (0.2-0.12), memory-light (unlike a direct LU's 3D fill-in).
+solver = ["pyamg>=5.0"]
 # Everything.
-all = ["pyvista>=0.43", "vtk>=9.2", "scikit-fmm>=2023.4.2"]
+all = ["pyvista>=0.43", "vtk>=9.2", "scikit-fmm>=2023.4.2", "pyamg>=5.0"]
 
 [project.scripts]
 vff = "vff.__main__:main"

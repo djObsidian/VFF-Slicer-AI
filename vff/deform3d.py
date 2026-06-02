@@ -47,7 +47,7 @@ import numpy as np
 import trimesh
 from scipy.ndimage import distance_transform_edt
 from scipy.sparse import coo_array
-from scipy.sparse.linalg import cg, spsolve
+from scipy.sparse.linalg import cg
 from scipy.spatial.transform import Rotation
 
 from .growth import GrowthResult
@@ -411,14 +411,44 @@ def solve_deformation_map(
     a_mat = (lap + coo_array((pen, (rng, rng)), shape=(n_model, n_model))).tocsr()
     # seeds: penalty drags U_seed → 0; RHS there stays small.
 
+    # Speed: precondition the (shared) system with ONE algebraic-multigrid
+    # hierarchy built from the matrix, reused for all 3 coordinate RHS. AMG is
+    # the right solver for a graph Laplacian — the iteration count stays ~O(1) as
+    # the grid refines (plain CG needs ~O(N^(1/3)) iters and is the fine-pitch
+    # bottleneck), and the hierarchy is memory-light (~the matrix size), unlike a
+    # direct LU whose 3D fill-in explodes into swap. pyamg is an OPTIONAL dep:
+    # if it's missing (or AMG setup fails) we fall back to plain CG — same
+    # answer, just slower. No spsolve fallback anywhere: a direct solve of this
+    # 3D system is exactly the out-of-memory trap we're avoiding; CG returns its
+    # best iterate even when it doesn't fully converge.
+    M = None
+    try:
+        import pyamg
+        # pyamg's compiled kernels require 32-bit CSR index arrays; scipy gives
+        # int64 here (built from argwhere). Downcast a copy (n_model and nnz are
+        # both well under 2^31) — otherwise the AMG setup raises and we'd
+        # silently fall back to plain CG.
+        a_csr = a_mat.tocsr()
+        a32 = a_csr.copy()
+        a32.indices = a32.indices.astype(np.int32)
+        a32.indptr = a32.indptr.astype(np.int32)
+        M = pyamg.smoothed_aggregation_solver(a32).aspreconditioner()
+    except Exception:  # noqa: BLE001 — pyamg absent or AMG setup failed
+        M = None
+
+    def _solve(rhs, precond, iters):
+        try:
+            return cg(a_mat, rhs, rtol=rtol, maxiter=iters, M=precond)
+        except TypeError:  # SciPy < 1.12 used `tol`
+            return cg(a_mat, rhs, tol=rtol, maxiter=iters, M=precond)
+
     u_model = np.zeros((n_model, 3), dtype=np.float64)
     for c in range(3):
-        try:
-            sol, info = cg(a_mat, b_u[:, c], rtol=rtol, maxiter=maxiter)
-        except TypeError:  # SciPy < 1.12
-            sol, info = cg(a_mat, b_u[:, c], tol=rtol, maxiter=maxiter)
-        if info != 0:
-            sol = spsolve(a_mat, b_u[:, c])
+        sol, info = _solve(b_u[:, c], M, maxiter)
+        if info != 0 and M is not None:
+            # AMG-CG stalled (rare) → retry plain CG, more iterations. Still
+            # memory-bounded; never a direct factorization.
+            sol, info = _solve(b_u[:, c], None, maxiter * 4)
         u_model[:, c] = sol
     phi_model = Pm + u_model
 

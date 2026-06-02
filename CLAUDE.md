@@ -29,7 +29,11 @@ PASS/FAIL per case. Run them after changing `deform3d.py`, `deform.py`,
 
 Reinstall / new deps: `./.venv/Scripts/python.exe -m pip install -e .` (deps in
 `pyproject.toml`; viewer/`pyvista` is the optional `[viewer]` extra — vtk wheels
-lag new Python, keep it out of the headless paths).
+lag new Python, keep it out of the headless paths). The `[solver]` extra
+(`pyamg`) accelerates the full-3D deform solve ~2-4× at fine pitch (0.2-0.12);
+optional with a graceful fall back to plain CG (`solve_deformation_map`), so a
+missing wheel never breaks the core install. Install with `pip install -e
+.[solver]` (or `pip install pyamg`).
 
 ## Architecture (where things live)
 
