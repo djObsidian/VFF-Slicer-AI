@@ -18,6 +18,50 @@ overhangs that print without support.
 
 ---
 
+## The backstory
+
+I'd wanted a non‑planar slicer for years. I watched CNC Kitchen's
+conical‑slicing experiments, read the papers, drooled over the demos — but none
+of it generalised past one trick at a time. FullControl GCode had its
+90°‑overhang party pieces, but those don't scale and the thin in‑air beads curl
+up as the plastic shrinks.
+
+Then one boring afternoon at an old job I opened my notes and made a shitpost.
+It went straight into the drawer.
+
+![First napkin sketch: grow a build‑direction field up from the bed, follow the
+natural layers](docs/images/initial_shitpost1.png)
+![Second sketch: surface approximation, the tilt‑clamp on the build vector, voxel
+size = h_min/2](docs/images/initial_shitpost2.png)
+
+The idea is simple: take the model, voxelize it, find the bed, flood everything
+that touches the bed, run the fill outward, build vector fields from the fill
+iterations, clamp the turn so you don't smash the print head, build surfaces
+from those fields, then steal CNC Kitchen's conical trick — **deform → slice
+with a normal slicer → deform the G‑code back** → ??? → profit.
+
+But I was scared of it. I don't *like* programming; I've spent years trying to
+escape the scary world of code, and it keeps chasing me down. So I chickened
+out and the idea went back in the drawer.
+
+Years passed. The **S4 Slicer** came out — almost exactly this — but it wants a
+supercomputer to run in any reasonable time and is built around its own bespoke
+4‑axis printer. Close, but NOT IT.
+
+Then work handed me ~~a machine gun~~ Claude Code. I fed it the idea AND OFF WE
+WENT.
+
+Where we are now: we can print bridges and round holes.
+
+![Bridge test sliced with non‑planar layers spanning the
+gap](docs/images/bridge_test.png)
+![Round‑hole test: layers arch over the bore instead of
+bridging flat](docs/images/round_hole_test.png)
+
+That's it for now — still very much in development.
+
+---
+
 ## Installation
 
 Python 3.10+, Windows / Linux / macOS. Dependencies are declared in
