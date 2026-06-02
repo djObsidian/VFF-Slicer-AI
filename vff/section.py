@@ -72,8 +72,19 @@ def build_growth_surfaces(
     # Inside-only depth (scaled to the integer step scale). We deliberately
     # IGNORE smoothed_depth_field's outside fill here and recompute the air
     # ourselves with the tangent law below.
+    #
+    # outside_mode MUST be "extend" (nearest-inside), NOT "vertical": the air
+    # fill is overwritten below, but the Gaussian smoothing inside it still SEES
+    # those outside values at the model boundary. "vertical" puts height (k −
+    # k_bed) in the air, which near a wide overhang (a mushroom cap) is much
+    # LOWER than the inside path-distance there — so smoothing drags the
+    # cap-edge values down and manufactures a FALSE interior maximum, i.e. a
+    # closed iso-surface that the deformation does not actually have. "extend"
+    # is continuous across the boundary, so smoothing introduces no such dip;
+    # a genuine interior extremum (a real fold) still shows. (Measured on the
+    # mushroom: "vertical" → 2 spurious closed loops, "extend" → 0.)
     field_in = smoothed_depth_field(
-        gr, sigma=smooth_sigma, method=depth_method, outside_mode="vertical"
+        gr, sigma=smooth_sigma, method=depth_method, outside_mode="extend"
     )
     scale = 1.0
     if inside.any() and gr.n_steps > 1:
