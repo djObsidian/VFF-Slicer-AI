@@ -848,6 +848,7 @@ def backtransform_gcode_file(
     cool_speed: float = 20.0,
     cool_probe: float = 0.8,
     cool_min_z: float = 0.6,
+    keep_first_layer: bool = True,
 ) -> dict:
     """Three-pass batched G-code transform using a BackTransform's depth field.
 
@@ -913,6 +914,44 @@ def backtransform_gcode_file(
 
     t2 = _time.perf_counter()
 
+    # First layer untouched: leave every move at (or below) the first sliced
+    # layer EXACTLY as in the input gcode — pure identity. The map's bed-blend
+    # only RAMPS the displacement to ~0 near the plate, so the first layer still
+    # picks up a few % of deformation, and the brim/skirt (printed OUTSIDE the
+    # part's footprint, where Φ is the nearest-inside displacement) lifts off the
+    # bed → ruined adhesion. A hard passthrough keeps it dead flat. Threshold =
+    # first-layer plane + half a layer, auto-detected from the two lowest
+    # distinct move-Z's (works for the deformed gcode's flat layer planes).
+    first_layer_mask = None
+    stats["n_first_layer_kept"] = 0
+    if keep_first_layer and n_pts:
+        zin = xyz_def[:, 2]
+        # Detect the first-layer plane from DEPOSITING moves only (E increasing),
+        # so a stray prime/retract/travel Z (often Z0, a single point) doesn't
+        # skew it: first-layer plane = lowest deposition Z, layer height = gap to
+        # the next deposition Z. Then pass through EVERYTHING at/below that plane
+        # + half a layer (incl. the prime move beneath it).
+        deposits = np.zeros(zin.shape[0], dtype=bool)
+        for u in units:
+            if u[0] == "raw":
+                continue
+            _, out_cmd, e_val, _f, _tail, n_pieces, start_idx, e_rel, e_start = u
+            if e_val is not None and (
+                (e_rel and e_val > 1e-9) or (not e_rel and e_val > e_start + 1e-9)
+            ):
+                deposits[start_idx:start_idx + n_pieces] = True
+        if deposits.any():
+            zp = np.unique(np.round(zin[deposits], 3))
+            z_fl = float(zp[0])
+            layer_h = float(zp[1] - zp[0]) if zp.size > 1 else 0.0
+            thresh = z_fl + (0.5 * layer_h if layer_h > 1e-6 else 1e-3)
+            fl = zin <= thresh
+            if fl.any():
+                xyz_orig[fl] = xyz_def[fl]      # identity: print it as sliced
+                first_layer_mask = fl
+                stats["n_first_layer_kept"] = int(fl.sum())
+                stats["first_layer_z"] = z_fl
+
     z_orig_min = float("inf")
     z_orig_max = float("-inf")
     if n_pts:
@@ -939,6 +978,10 @@ def backtransform_gcode_file(
             gap = bt.dmap.layer_gap_ratio(orig_pts)  # ∂orig_z/∂def_z
             escale = gap if direction == "inverse" else 1.0 / np.where(np.abs(gap) > 1e-3, gap, 1e-3)
             escale = np.clip(escale, 0.3, 3.0)
+        # First layer is identity (passed through) → no road deformation → no
+        # extrusion compensation there either.
+        if first_layer_mask is not None:
+            escale[first_layer_mask] = 1.0
         stats["e_comp_mode"] = extrusion_comp_mode
         stats["e_comp_mean"] = float(escale.mean())
         stats["e_comp_range"] = (float(escale.min()), float(escale.max()))
@@ -996,6 +1039,12 @@ def backtransform_gcode_file(
             f"[backtransform] deformed Z: [{stats['z_min']:.3f}, {stats['z_max']:.3f}] mm  "
             f"→ original Z: [{stats['z_orig_min']:.3f}, {stats['z_orig_max']:.3f}] mm"
         )
+        if stats.get("n_first_layer_kept"):
+            print(
+                f"[backtransform] first layer (Z≈{stats.get('first_layer_z', 0.0):.3f} mm): "
+                f"{stats['n_first_layer_kept']:,} points left as-sliced — identity, "
+                "no deformation (brim/bed adhesion preserved)"
+            )
         if "e_comp_mean" in stats:
             lo, hi = stats["e_comp_range"]
             print(

@@ -47,7 +47,11 @@ def _identity_bt() -> BackTransform:
 
 
 def _run(gcode_text: str, direction: str = "forward", subdiv_mm: float = 1.0,
-         z_slowdown: float = 1.0, max_z_speed: float = 0.0) -> list[str]:
+         z_slowdown: float = 1.0, max_z_speed: float = 0.0,
+         keep_first_layer: bool = False) -> list[str]:
+    # keep_first_layer defaults False here so the feedrate/E tests below (whose
+    # toy gcode sits at a single low Z) aren't reshaped by the first-layer
+    # passthrough — that behaviour has its own test.
     bt = _identity_bt()
     with tempfile.TemporaryDirectory() as td:
         ip = Path(td) / "in.gcode"
@@ -56,7 +60,7 @@ def _run(gcode_text: str, direction: str = "forward", subdiv_mm: float = 1.0,
         backtransform_gcode_file(
             ip, op, bt, subdiv_mm=subdiv_mm, n_jobs=1,
             verbose=False, direction=direction, z_slowdown=z_slowdown,
-            max_z_speed=max_z_speed,
+            max_z_speed=max_z_speed, keep_first_layer=keep_first_layer,
         )
         return op.read_text(encoding="utf-8").splitlines()
 
@@ -318,6 +322,55 @@ def test_overhang_cooling_slows_feedrate():
     print("  PASS overhang speed ramp (F3000 kept; 0.5→2100; bridge→1200 = 20 mm/s)")
 
 
+def test_keep_first_layer_passthrough():
+    """--keep-first-layer leaves moves at the first sliced layer EXACTLY as in
+    the input (pure identity) while higher layers are transformed — guards
+    brim/bed adhesion. Stub inverse lifts every point +5mm in Z; with the flag
+    the first layer must NOT lift, without it everything lifts."""
+    class _ShiftBT:
+        is_3d = True
+        mesh = None  # disables overhang cooling gate
+        def invert_points_batch(self, xyz):
+            out = np.asarray(xyz, dtype=np.float64).copy()
+            out[:, 2] += 5.0
+            return out
+
+    gcode = (
+        "M83\n"
+        "G1 X0 Y0 Z0.2 F1800\n"
+        "G1 X5 Y0 Z0.2 E1\n"      # first layer (z=0.2)
+        "G1 X5 Y0 Z0.44 F1800\n"
+        "G1 X0 Y0 Z0.44 E1\n"     # second layer (z=0.44)
+    )
+
+    def run(keep):
+        with tempfile.TemporaryDirectory() as td:
+            ip, op = Path(td) / "in.gcode", Path(td) / "out.gcode"
+            ip.write_text(gcode, encoding="utf-8")
+            stats = backtransform_gcode_file(
+                ip, op, _ShiftBT(), subdiv_mm=100, n_jobs=1, verbose=False,
+                direction="inverse", extrusion_comp=False, cool_overhangs=False,
+                keep_first_layer=keep)
+            return op.read_text(encoding="utf-8").splitlines(), stats
+
+    def zs(lines):
+        out = []
+        for ln in lines:
+            if _MOVE_RE.match(ln.strip()):
+                m = re.search(r"\bZ(-?[0-9.]+)", ln)
+                if m:
+                    out.append(round(float(m.group(1)), 3))
+        return out
+
+    kept, st = run(True)
+    moved, _ = run(False)
+    assert min(zs(kept)) == 0.2, f"first layer must stay at Z0.2, got {sorted(set(zs(kept)))}"
+    assert any(abs(z - 5.44) < 1e-6 for z in zs(kept)), "second layer must be transformed (+5)"
+    assert min(zs(moved)) > 5.0, f"--no-keep-first-layer must lift it too, got {sorted(set(zs(moved)))}"
+    assert st["n_first_layer_kept"] >= 1, "expected first-layer points to be kept"
+    print("  PASS keep-first-layer (Z0.2 kept identity; layer 2 lifted to 5.44; off → all lift)")
+
+
 def test_propeller_forward_inverse_roundtrip():
     """forward then inverse on the real mesh should recover XYZ within a
     fraction of the voxel pitch (interpolation error only)."""
@@ -359,6 +412,7 @@ def main() -> int:
         test_max_z_speed_caps_travel_moves_too,
         test_overhang_cooling_ramps_fan_by_severity,
         test_overhang_cooling_slows_feedrate,
+        test_keep_first_layer_passthrough,
         test_propeller_forward_inverse_roundtrip,
     ]
     failures = 0

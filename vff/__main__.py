@@ -92,6 +92,7 @@ def _run_gcode_transform(args, stl_path: Path, x: float, y: float, z: float) -> 
             cool_fan_min=args.cool_fan_min, cool_fan_max=args.cool_fan_max,
             cool_speed=args.cool_speed,
             cool_probe=args.cool_probe, cool_min_z=args.cool_min_z,
+            keep_first_layer=args.keep_first_layer,
         )
         return 0
 
@@ -179,6 +180,7 @@ def _run_gcode_transform(args, stl_path: Path, x: float, y: float, z: float) -> 
         subdiv_mm=args.subdiv_mm, n_jobs=args.jobs,
         direction=args.gcode_direction, z_slowdown=args.z_slowdown,
         max_z_speed=args.max_z_speed,
+        keep_first_layer=args.keep_first_layer,
     )
     return 0
 
@@ -316,6 +318,17 @@ def main(argv: list[str] | None = None) -> int:
              "the toolpath itself so the planner sees honest feedrates instead "
              "of silently dragging the whole move down to obey Z. Flat moves are "
              "untouched. Composes with --z-slowdown (the lower F wins).",
+    )
+    parser.add_argument(
+        "--keep-first-layer", action=argparse.BooleanOptionalAction, default=True,
+        help="(gcode transform) Leave the first sliced layer EXACTLY as in the "
+             "input gcode — pure identity, no deformation. The map's bed-blend "
+             "only ramps the displacement toward 0 near the plate, so the first "
+             "layer still picks up a few %% of deformation and the brim/skirt "
+             "(printed outside the part's footprint) lifts off the bed. This "
+             "pins it flat for adhesion. Default on; --no-keep-first-layer to "
+             "deform the first layer too. Threshold auto-detected (first layer "
+             "plane + half a layer).",
     )
     parser.add_argument(
         "--extrusion-comp-mode", choices=["vertical", "volume"], default="vertical",
