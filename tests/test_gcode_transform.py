@@ -371,6 +371,52 @@ def test_keep_first_layer_passthrough():
     print("  PASS keep-first-layer (Z0.2 kept identity; layer 2 lifted to 5.44; off → all lift)")
 
 
+def test_flatten_travel_z():
+    """--flatten-travel-z straightens Z on travel (non-extruding) moves so they
+    don't plunge following the deformed layer into the air under a bridge, while
+    PRINTING moves still follow the curve. Stub inverse dives Z ~2mm at the
+    middle (X≈10) of a move."""
+    class _DiveBT:
+        is_3d = True
+        mesh = None
+        def invert_points_batch(self, xyz):
+            out = np.asarray(xyz, dtype=np.float64).copy()
+            out[:, 2] -= np.clip(1.0 - ((out[:, 0] - 10.0) / 5.0) ** 2, 0.0, 1.0) * 2.0
+            return out
+
+    def run(gcode, flatten):
+        with tempfile.TemporaryDirectory() as td:
+            ip, op = Path(td) / "i.gcode", Path(td) / "o.gcode"
+            ip.write_text(gcode, encoding="utf-8")
+            backtransform_gcode_file(
+                ip, op, _DiveBT(), subdiv_mm=2.0, n_jobs=1, verbose=False,
+                direction="inverse", extrusion_comp=False, cool_overhangs=False,
+                keep_first_layer=False, flatten_travel_z=flatten)
+            return op.read_text(encoding="utf-8").splitlines()
+
+    def min_z_between(lines, xlo, xhi):
+        zs = []
+        for ln in lines:
+            if not _MOVE_RE.match(ln.strip()):
+                continue
+            mx, mz = re.search(r"\bX([0-9.]+)", ln), re.search(r"\bZ([0-9.]+)", ln)
+            if mx and mz and xlo <= float(mx.group(1)) <= xhi:
+                zs.append(float(mz.group(1)))
+        return min(zs) if zs else None
+
+    # Bridge ends are printed (E) at Z5; the middle is a travel across the gap.
+    travel = ("M83\nG1 X5 Y0 Z5 E1 F1800\n"       # bridge end A (print)
+              "G1 X15 Y0 Z5 F9000\n"               # TRAVEL across gap (no E)
+              "G1 X20 Y0 Z5 E1 F1800\n")           # bridge end B (print)
+    assert min_z_between(run(travel, False), 8, 12) < 4.0, "stub should dive without flatten"
+    assert min_z_between(run(travel, True), 8, 12) > 4.8, "travel Z must be straightened (no dive)"
+    printing = ("M83\nG1 X5 Y0 Z5 E1 F1800\n"
+                "G1 X15 Y0 Z5 E1 F1800\n"          # same span but PRINTING (has E)
+                "G1 X20 Y0 Z5 E1 F1800\n")
+    assert min_z_between(run(printing, True), 8, 12) < 4.0, "printing move must keep following the curve"
+    print("  PASS flatten-travel-z (travel dive ~3→5 removed; printing move still dives)")
+
+
 def test_propeller_forward_inverse_roundtrip():
     """forward then inverse on the real mesh should recover XYZ within a
     fraction of the voxel pitch (interpolation error only)."""
@@ -413,6 +459,7 @@ def main() -> int:
         test_overhang_cooling_ramps_fan_by_severity,
         test_overhang_cooling_slows_feedrate,
         test_keep_first_layer_passthrough,
+        test_flatten_travel_z,
         test_propeller_forward_inverse_roundtrip,
     ]
     failures = 0

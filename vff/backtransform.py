@@ -830,6 +830,49 @@ def _write_transformed_gcode(
     }
 
 
+def _flatten_travel_z(units: list, xyz_orig: np.ndarray, min_dip: float = 0.05) -> int:
+    """Straighten Z over runs of NON-extruding (travel) moves in original space.
+
+    A travel across a bridge/overhang gap is a flat line in the sliced (deformed)
+    gcode, but the inverse maps it onto the deformed layer, which DIVES below the
+    part in the air under the bridge — so the nozzle plunges in Z for no reason
+    (it never touches the bed, just wastes Z motion). The slicer emits such a
+    travel as MANY short moves, so the dive is a V across the whole run, not
+    within one move — we operate on maximal runs of consecutive travel points
+    (bounded by printing moves) and clamp each run's Z UP to the straight ramp
+    between the bounding (printing) endpoints: `Z ← max(Z, ramp)`. That removes
+    the downward dive while PRESERVING any genuine Z-hop above the ramp (collision
+    avoidance) and the net layer-to-layer climb. XY is left as-mapped; printing
+    moves (E) are untouched — they must follow the real curved layer. Returns the
+    number of runs straightened (dipped > `min_dip` mm below the chord)."""
+    n_pts = xyz_orig.shape[0]
+    if n_pts == 0:
+        return 0
+    is_travel = np.zeros(n_pts, dtype=bool)
+    for u in units:
+        if u[0] == "raw":
+            continue
+        _, _out_cmd, e_val, _f, _tail, n_pieces, start_idx, _e_rel, _e_start = u
+        if e_val is None:                       # non-extruding move = travel
+            is_travel[start_idx:start_idx + n_pieces] = True
+    # Maximal runs of consecutive travel points (vectorised boundary detection).
+    d = np.diff(np.concatenate(([0], is_travel.view(np.int8), [0])))
+    starts = np.where(d == 1)[0]
+    ends = np.where(d == -1)[0]                  # exclusive
+    z = xyz_orig[:, 2]
+    n_flat = 0
+    for a, b in zip(starts, ends):
+        z_before = z[a - 1] if a > 0 else z[a]
+        z_after = z[b] if b < n_pts else z[b - 1]
+        m = b - a
+        ramp = z_before + (z_after - z_before) * (np.arange(1, m + 1) / (m + 1))
+        seg = z[a:b]
+        if float((ramp - seg).max()) > min_dip:  # a real downward dive
+            n_flat += 1
+        z[a:b] = np.maximum(seg, ramp)            # clamp dives up; keep hops
+    return n_flat
+
+
 def backtransform_gcode_file(
     input_path: str | Path,
     output_path: str | Path,
@@ -849,6 +892,7 @@ def backtransform_gcode_file(
     cool_probe: float = 0.8,
     cool_min_z: float = 0.6,
     keep_first_layer: bool = True,
+    flatten_travel_z: bool = True,
 ) -> dict:
     """Three-pass batched G-code transform using a BackTransform's depth field.
 
@@ -913,6 +957,14 @@ def backtransform_gcode_file(
             xyz_orig = np.concatenate(results, axis=0)
 
     t2 = _time.perf_counter()
+
+    # Travel Z-straighten: a travel across a bridge/overhang gap follows the
+    # deformed layer's downward dive in the air → wasteful Z plunge. Ramp its Z
+    # straight between endpoints. Done BEFORE the first-layer passthrough so any
+    # first-layer travel is then restored to pure identity below.
+    stats["n_travel_flattened"] = 0
+    if flatten_travel_z and n_pts:
+        stats["n_travel_flattened"] = _flatten_travel_z(units, xyz_orig)
 
     # First layer untouched: leave every move at (or below) the first sliced
     # layer EXACTLY as in the input gcode — pure identity. The map's bed-blend
@@ -1044,6 +1096,11 @@ def backtransform_gcode_file(
                 f"[backtransform] first layer (Z≈{stats.get('first_layer_z', 0.0):.3f} mm): "
                 f"{stats['n_first_layer_kept']:,} points left as-sliced — identity, "
                 "no deformation (brim/bed adhesion preserved)"
+            )
+        if stats.get("n_travel_flattened"):
+            print(
+                f"[backtransform] travel Z: {stats['n_travel_flattened']:,} travel moves "
+                "straightened (no Z plunge into the air under bridges/overhangs)"
             )
         if "e_comp_mean" in stats:
             lo, hi = stats["e_comp_range"]

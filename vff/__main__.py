@@ -93,6 +93,7 @@ def _run_gcode_transform(args, stl_path: Path, x: float, y: float, z: float) -> 
             cool_speed=args.cool_speed,
             cool_probe=args.cool_probe, cool_min_z=args.cool_min_z,
             keep_first_layer=args.keep_first_layer,
+            flatten_travel_z=args.flatten_travel_z,
         )
         return 0
 
@@ -181,6 +182,7 @@ def _run_gcode_transform(args, stl_path: Path, x: float, y: float, z: float) -> 
         direction=args.gcode_direction, z_slowdown=args.z_slowdown,
         max_z_speed=args.max_z_speed,
         keep_first_layer=args.keep_first_layer,
+        flatten_travel_z=args.flatten_travel_z,
     )
     return 0
 
@@ -329,6 +331,16 @@ def main(argv: list[str] | None = None) -> int:
              "pins it flat for adhesion. Default on; --no-keep-first-layer to "
              "deform the first layer too. Threshold auto-detected (first layer "
              "plane + half a layer).",
+    )
+    parser.add_argument(
+        "--flatten-travel-z", action=argparse.BooleanOptionalAction, default=True,
+        help="(gcode transform) Straighten Z on travel (non-extruding) moves: a "
+             "travel across a bridge/overhang gap otherwise follows the deformed "
+             "layer's downward dive in the air, plunging the nozzle in Z for no "
+             "reason (it never touches the bed, just wastes Z motion). Ramps the "
+             "travel's Z straight between its endpoints (XY untouched); printing "
+             "moves still follow the real curved layer. Default on; "
+             "--no-flatten-travel-z to keep travels on the deformed surface.",
     )
     parser.add_argument(
         "--extrusion-comp-mode", choices=["vertical", "volume"], default="vertical",
