@@ -1,19 +1,22 @@
-"""Render an XZ-plane cross-section of the growth (layer) surfaces to an image.
+"""Render an XZ-plane cross-section of the print's layer surfaces to an image.
 
 Headless / off-screen — no interactive window, so it sidesteps the
 interactive-viewer issues and is good for batch figures.
 
-The growth surfaces are the iso-surfaces of the depth field (by default the
-vector-integrated potential, so each surface is perpendicular to the growth
-direction). Cutting them with the XZ plane (normal +Y) at the model's Y
-centre yields the layer curves you'd see in a vertical cross-section of the
-print — exactly the picture that shows how non-planar the layers are and
-how the tilt clamp limits their slope on overhangs.
+What the layers are depends on `deform_mode` (so the section matches the path
+that actually deforms the part):
+  - "3d": the ACTUAL layers the full-3D map produces — iso-surfaces of the
+    deformed-Z field Φ_z over the original grid, clipped to the part. A planar
+    slicer cuts the deformed mesh at flat z_def planes; these are the curved
+    surfaces those map back to. A FOLD shows as a self-touching/closed curve —
+    a faithful debug view of what the 3D method generates.
+  - "z-only": iso-surfaces of the scalar depth field (the vector-integrated /
+    harmonic potential), what the Z-only path uses.
 
-The layer curves (the surfaces' intersection with the plane) are drawn, plus
-the model's OWN section outline on top in a contrasting colour — the part
-boundary cut by the same plane — so it's always legible over the layer lines.
-Nothing else — no voxels or arrows.
+Cutting with the XZ plane (normal +Y) at the model's Y centre yields the layer
+curves of a vertical cross-section. The model's OWN section outline is drawn on
+top in a contrasting colour (the part boundary cut by the same plane), always
+legible over the layer lines. Nothing else — no voxels or arrows.
 """
 
 from __future__ import annotations
@@ -162,6 +165,51 @@ def build_growth_surfaces(
     return surf
 
 
+def build_deform_layer_surfaces(
+    dmap, gr: GrowthResult, mesh: trimesh.Trimesh | None,
+    *, layer_step: float | None = None,
+) -> tuple[pv.PolyData, float, float]:
+    """Iso-surfaces of the deformed-Z field Φ_z over the ORIGINAL grid — the
+    ACTUAL layers the full-3D map (deform3d) produces, in original coordinates.
+
+    A planar slicer cuts the deformed mesh at flat planes z_def = c; the inverse
+    maps those back to the curved surface {Φ_z(p) = c} in the part. So these are
+    exactly the layers the 3D method generates — NOT a separate scalar-field
+    proxy. A genuine fold shows as a self-touching / closed curve (det J ≤ 0),
+    which is precisely what we want a debug section to reveal.
+
+    `Φ` is defined on the whole grid (deform3d extends it into the air as the
+    nearest in-model displacement), so the raw contours run out into the air;
+    we clip them to the model to keep only real in-part layers. Returns
+    (surface, z_lo, z_hi) — the deformed-Z range over the model, for the clim."""
+    nx, ny, nz = gr.step.shape
+    phiz = np.ascontiguousarray(dmap.phi[..., 2], dtype=np.float32)
+    grid = pv.ImageData(
+        dimensions=(nx + 1, ny + 1, nz + 1),
+        spacing=(dmap.pitch, dmap.pitch, dmap.pitch),
+        origin=(float(dmap.origin[0]), float(dmap.origin[1]), float(dmap.origin[2])),
+    )
+    grid.cell_data["z_def"] = phiz.flatten(order="F")
+    pgrid = grid.cell_data_to_point_data()
+
+    inside = gr.step >= 0
+    zin = phiz[inside]
+    lo, hi = float(zin.min()), float(zin.max())
+    step = layer_step if (layer_step and layer_step > 0) else dmap.pitch
+    n = max(1, int(round((hi - lo) / step)))
+    isos = [lo + (i + 0.5) * step for i in range(n)]
+    isos = [c for c in isos if lo < c < hi] or [0.5 * (lo + hi)]
+    surf = pgrid.contour(isosurfaces=isos, scalars="z_def")
+
+    # Drop deform3d's air extrapolation: keep only the layers inside the part.
+    if surf.n_points and mesh is not None:
+        try:
+            surf = surf.clip_surface(pv.wrap(mesh), invert=True)
+        except Exception:  # noqa: BLE001 — implicit clip can fail on odd meshes
+            pass
+    return surf, lo, hi
+
+
 def save_xz_section(
     mesh: trimesh.Trimesh,
     out_path: str,
@@ -170,6 +218,7 @@ def save_xz_section(
     max_tilt_deg: float = 30.0,
     smooth_sigma: float = 2.0,
     depth_method: str = "vectors",
+    deform_mode: str = "z-only",
     section_y: float | None = None,
     window_size: tuple[int, int] = (1600, 1000),
     line_width: float = 2.5,
@@ -178,13 +227,30 @@ def save_xz_section(
     """Compute growth, build the layer surfaces, cut them with the XZ plane,
     and save an orthographic image of the resulting curves to `out_path`.
 
+    `deform_mode` picks WHAT the section shows, matching the deformation path:
+      - "3d": the ACTUAL layers of the full-3D map — iso-surfaces of the
+        deformed-Z field Φ_z (build_deform_layer_surfaces). A fold shows as a
+        closed/self-touching curve. This is the faithful debug view.
+      - "z-only" (default): iso-surfaces of the scalar depth field
+        (build_growth_surfaces) — what the Z-only path uses.
+
     Returns the number of points in the section (0 means the plane missed
     the geometry — bad `section_y`). The slice is taken at the model's Y
     centre unless `section_y` is given.
     """
     vg = voxelize_solid(mesh, pitch=pitch)
     gr = compute_growth(vg, max_tilt_deg=max_tilt_deg)
-    surf = build_growth_surfaces(gr, smooth_sigma=smooth_sigma, depth_method=depth_method)
+    if deform_mode == "3d":
+        from .deform3d import solve_deformation_map
+        dmap = solve_deformation_map(
+            gr, displacement_smooth_sigma=smooth_sigma, max_tilt_deg=max_tilt_deg,
+            depth_method=depth_method,
+        )
+        surf, z_lo, z_hi = build_deform_layer_surfaces(dmap, gr, mesh)
+        scalar_name, clim = "z_def", [z_lo, z_hi]
+    else:
+        surf = build_growth_surfaces(gr, smooth_sigma=smooth_sigma, depth_method=depth_method)
+        scalar_name, clim = "step", [0.0, max(float(gr.n_steps - 1), 1.0)]
 
     cx = 0.5 * (mesh.bounds[0, 0] + mesh.bounds[1, 0])
     cz = 0.5 * (mesh.bounds[0, 2] + mesh.bounds[1, 2])
@@ -203,12 +269,12 @@ def save_xz_section(
     if section.n_points > 0:
         pl.add_mesh(
             section,
-            scalars="step",
+            scalars=scalar_name,
             cmap=cmap,
             line_width=line_width,
             show_scalar_bar=False,
             lighting=False,
-            clim=[0.0, max(float(gr.n_steps - 1), 1.0)],
+            clim=clim,
         )
     # Model contour ON TOP of the layer curves. The view is orthographic down
     # +Y with the camera on the +Y side, so nudging the outline toward the

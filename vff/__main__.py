@@ -605,13 +605,15 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.section_xz:
         from .section import save_xz_section
-        print(f"Rendering XZ growth-surface section -> {args.section_xz} ...", flush=True)
+        kind = "3D Φ_z layer" if args.deform_mode == "3d" else "growth-surface"
+        print(f"Rendering XZ {kind} section -> {args.section_xz} ...", flush=True)
         n_pts = save_xz_section(
             mesh, args.section_xz,
             pitch=args.pitch,
             max_tilt_deg=args.max_tilt,
             smooth_sigma=args.smooth_sigma,
             depth_method=args.depth_method,
+            deform_mode=args.deform_mode,
             section_y=args.section_y,
         )
         if n_pts == 0:
