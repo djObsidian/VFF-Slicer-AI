@@ -287,6 +287,153 @@ def integrate_vectors_to_potential(growth: GrowthResult, eps: float = 1e-6) -> n
     return out
 
 
+def harmonic_potential_from_bed(growth: GrowthResult, eps: float = 1e-9) -> np.ndarray:
+    """Harmonic layer potential φ solving Δφ = 0 inside the model, with
+
+        φ = 0                     on the bed-contact layer        (Dirichlet)
+        φ = height-above-bed      on every TOP voxel (air above)  (Dirichlet)
+        ∂φ/∂n = 0                 on all other boundaries         (Neumann)
+
+    This is the principled alternative to the distance/vector routes. Because φ
+    is a genuine potential, its level sets have three properties the others lack
+    (see GROWTH_SURFACES_MATH.md for the derivation):
+
+      1. ∇φ is their EXACT normal — "the step-n vectors are normal to surface n"
+         holds by construction, with no curl residual to fight (the clamped
+         vector field is not a gradient, so `integrate_vectors_to_potential`
+         only matches it in least squares; here there is nothing to mismatch).
+
+      2. No closed surfaces inside the part. A graph-harmonic function obeys the
+         discrete maximum principle: no interior local max/min, so no nested
+         shells at a bottleneck like a mushroom cap. (Distance fields —
+         vectors/fmm/dijkstra — develop an interior maximum there and ring it
+         with closed level sets.)
+
+      3. No inherited concavity. Harmonic = minimal Dirichlet energy = the
+         flattest field the boundary conditions allow: flat horizontal planes
+         in a straight column, a dome through a constriction, flattening again
+         above it — instead of copying the geometry's downward bulge.
+
+    The TOP is pinned to its height above the bed (not a flat constant), so in
+    simple regions φ ≈ z and the layers are horizontal planes with near-uniform
+    spacing; the field only bunches (|∇φ| rises) where the cross-section
+    constricts. NO tilt clamp is applied here — in genuine overhang regions the
+    layers may exceed max_tilt (a 3-axis overhang, to be handled by support /
+    bridging or a later tilt-constrained variant). Diffusing only through model
+    voxels makes every air boundary no-flux automatically, so layers slide along
+    walls and overhang undersides (meeting them perpendicularly) rather than
+    being forced to terminate on them.
+
+    Discretization: a 26-connectivity graph Laplacian L over model voxels (an
+    M-matrix → discrete max principle). Dirichlet is imposed by ELIMINATION, not
+    a penalty — the known bed/top columns are moved to the RHS and we solve the
+    reduced interior system L_ff·φ_f = −L_fk·φ_k with CG. (A large-diagonal
+    penalty, as in `integrate_vectors_to_potential`, makes the system stiff so
+    CG halts on the penalty-dominated residual before the boundary values reach
+    a SOURCE-FREE interior — harmonic has no divergence RHS to carry them, so the
+    bulk would stay at its initial 0. Elimination leaves the well-conditioned
+    interior Laplacian and resolves it cleanly.) A tiny `eps` on the free
+    diagonal covers any component disconnected from a Dirichlet node.
+
+    Returns: float32 grid (nx, ny, nz), φ in voxel-height units inside the
+    model, +inf outside (filled in later by smoothed_depth_field).
+    """
+    matrix = growth.step >= 0
+    nx, ny, nz = matrix.shape
+    n_model = int(matrix.sum())
+    if n_model == 0:
+        return np.full(matrix.shape, np.inf, dtype=np.float32)
+
+    order = np.argwhere(matrix).astype(np.int64)          # (M, 3) voxel coords
+    flat_idx = np.full(matrix.shape, -1, dtype=np.int64)
+    flat_idx[matrix] = np.arange(n_model)
+
+    # 13 canonical offsets — one per ±pair, so every edge is assembled once.
+    canon = [
+        (dx, dy, dz)
+        for dx in (-1, 0, 1) for dy in (-1, 0, 1) for dz in (-1, 0, 1)
+        if (dx, dy, dz) > (0, 0, 0)
+    ]
+
+    rows_l, cols_l, vals_l = [], [], []
+    for off in canon:
+        nbr = order + np.asarray(off, dtype=np.int64)
+        inb = (
+            (nbr[:, 0] >= 0) & (nbr[:, 0] < nx)
+            & (nbr[:, 1] >= 0) & (nbr[:, 1] < ny)
+            & (nbr[:, 2] >= 0) & (nbr[:, 2] < nz)
+        )
+        src = np.where(inb)[0]
+        if src.size == 0:
+            continue
+        nb = nbr[src]
+        jj = flat_idx[nb[:, 0], nb[:, 1], nb[:, 2]]
+        valid = jj >= 0
+        if not valid.any():
+            continue
+        i_arr = src[valid]
+        j_arr = jj[valid]
+        ones = np.ones(i_arr.size, dtype=np.float64)
+        # Edge (i,j) of the graph Laplacian: +1 on the diagonals, −1 off.
+        rows_l += [i_arr, j_arr, i_arr, j_arr]
+        cols_l += [i_arr, j_arr, j_arr, i_arr]
+        vals_l += [ones, ones, -ones, -ones]
+
+    rows = np.concatenate(rows_l)
+    cols = np.concatenate(cols_l)
+    vals = np.concatenate(vals_l)
+    lap = coo_array((vals, (rows, cols)), shape=(n_model, n_model)).tocsr()
+
+    # Dirichlet sets. Bed = lowest non-empty Z layer (φ=0); top = model voxel
+    # with air directly above (+Z neighbour outside the model). Both are pinned
+    # to height-above-bed — bed voxels sit at k_bed so that is 0 for them, the
+    # top to its own height (so φ≈z in simple regions, layers ≈ horizontal).
+    has_in_z = matrix.any(axis=(0, 1))
+    k_bed = int(np.argmax(has_in_z))
+    bed_grid = np.zeros_like(matrix)
+    bed_grid[:, :, k_bed] = matrix[:, :, k_bed]
+    above = np.zeros_like(matrix)
+    above[:, :, :-1] = matrix[:, :, 1:]       # above[...,k] = matrix[...,k+1]
+    top_grid = matrix & ~above & ~bed_grid
+
+    known_grid = bed_grid | top_grid
+    known_coords = np.argwhere(known_grid)
+    known_local = flat_idx[known_grid]                       # C-order, aligned
+    phi_known = (known_coords[:, 2] - k_bed).astype(np.float64)
+
+    is_known = np.zeros(n_model, dtype=bool)
+    is_known[known_local] = True
+    free_local = np.where(~is_known)[0]
+    if free_local.size == 0:                                 # everything pinned
+        phi = np.zeros(n_model, dtype=np.float64)
+        phi[known_local] = phi_known
+    else:
+        # Eliminate the knowns: L_ff·φ_f = −L_fk·φ_k. Reduced system is SPD and
+        # well-conditioned (no penalty stiffness). eps guards any free island
+        # with no path to a Dirichlet node.
+        L_ff = lap[free_local][:, free_local]
+        L_fk = lap[free_local][:, known_local]
+        rhs = -(L_fk @ phi_known)
+        nf = free_local.size
+        rng_f = np.arange(nf)
+        L_ff = (L_ff + coo_array((np.full(nf, eps), (rng_f, rng_f)),
+                                 shape=(nf, nf))).tocsr()
+        try:
+            phi_free, info = cg(L_ff, rhs, rtol=1e-8, maxiter=10000)
+        except TypeError:  # SciPy < 1.12 used `tol` instead of `rtol`.
+            phi_free, info = cg(L_ff, rhs, tol=1e-8, maxiter=10000)
+        if info != 0:
+            from scipy.sparse.linalg import spsolve
+            phi_free = spsolve(L_ff, rhs)
+        phi = np.empty(n_model, dtype=np.float64)
+        phi[known_local] = phi_known
+        phi[free_local] = phi_free
+
+    out = np.full(matrix.shape, np.inf, dtype=np.float32)
+    out[matrix] = phi.astype(np.float32)
+    return out
+
+
 def smoothed_depth_field(
     growth: GrowthResult,
     sigma: float = 2.0,
@@ -301,6 +448,11 @@ def smoothed_depth_field(
            - "vectors" (DEFAULT): least-squares scalar potential whose
              gradient matches the CLAMPED growth vectors, so the tilt clamp
              actually shapes the layer surfaces.
+           - "harmonic": Δφ=0 with φ=0 on the bed and φ=height on the top
+             voxels (Neumann elsewhere). Level sets are exact normals to ∇φ,
+             never close inside the part (max principle), and don't inherit
+             the geometry's concavity. No tilt clamp. See
+             harmonic_potential_from_bed.
            - "fmm": Eikonal geodesic distance from the bed (scikit-fmm),
              C1-smooth; falls back to "dijkstra" if scikit-fmm is missing.
            - "dijkstra": weighted-Dijkstra geodesic distance (face/edge/
@@ -343,6 +495,8 @@ def smoothed_depth_field(
     #                C0 only, can show small kinks at cell boundaries.
     if method == "vectors":
         geo = integrate_vectors_to_potential(growth)
+    elif method == "harmonic":
+        geo = harmonic_potential_from_bed(growth)
     elif method == "fmm" and _HAVE_SKFMM:
         geo = fmm_distance_from_bed(growth)
     else:

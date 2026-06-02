@@ -245,12 +245,16 @@ def main(argv: list[str] | None = None) -> int:
              "z-only smooths the DEPTH field. Lower = sharper; higher = smoother/weaker.",
     )
     parser.add_argument(
-        "--depth-method", choices=["vectors", "fmm", "dijkstra"], default="vectors",
+        "--depth-method", choices=["vectors", "harmonic", "fmm", "dijkstra"], default="vectors",
         help="Inside-model depth computation. 'vectors' (default): integrate the CLAMPED "
              "growth vector field into a potential whose level sets are the layer surfaces "
              "(surfaces perpendicular to the growth direction; tilt clamp shapes them). "
-             "'fmm' (Eikonal, C1 smooth, requires scikit-fmm) or 'dijkstra' (discrete "
-             "shortest path, C0) — both ignore the clamp and follow raw geodesic depth.",
+             "'harmonic': solve Laplace Δφ=0 (φ=0 on the bed, φ=height on top voxels) — "
+             "level sets are exact normals to ∇φ, never close inside the part (no shells "
+             "at a mushroom cap), and don't inherit the geometry's concavity; NO tilt clamp "
+             "(overhangs may exceed max-tilt). 'fmm' (Eikonal, C1 smooth, requires scikit-fmm) "
+             "or 'dijkstra' (discrete shortest path, C0) — both ignore the clamp and follow "
+             "raw geodesic depth.",
     )
     parser.add_argument(
         "--deform-mode", choices=["z-only", "3d"], default="z-only",
