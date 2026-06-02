@@ -94,6 +94,7 @@ def _run_gcode_transform(args, stl_path: Path, x: float, y: float, z: float) -> 
             cool_probe=args.cool_probe, cool_min_z=args.cool_min_z,
             keep_first_layer=args.keep_first_layer,
             flatten_travel_z=args.flatten_travel_z,
+            smooth_bridges=args.smooth_bridges, smooth_bridges_tol=args.smooth_bridges_tol,
         )
         return 0
 
@@ -183,6 +184,7 @@ def _run_gcode_transform(args, stl_path: Path, x: float, y: float, z: float) -> 
         max_z_speed=args.max_z_speed,
         keep_first_layer=args.keep_first_layer,
         flatten_travel_z=args.flatten_travel_z,
+        smooth_bridges=args.smooth_bridges, smooth_bridges_tol=args.smooth_bridges_tol,
     )
     return 0
 
@@ -341,6 +343,22 @@ def main(argv: list[str] | None = None) -> int:
              "travel's Z straight between its endpoints (XY untouched); printing "
              "moves still follow the real curved layer. Default on; "
              "--no-flatten-travel-z to keep travels on the deformed surface.",
+    )
+    parser.add_argument(
+        "--smooth-bridges", action=argparse.BooleanOptionalAction, default=True,
+        help="(gcode transform) Adaptive curvature subdivision of PRINTING moves: "
+             "uniform subdivision is uniform in deformed space, so the map's "
+             "stretch leaves it COARSE in original space exactly where it curves "
+             "(a bridge valley becomes a sharp V instead of a smooth arc). Refine "
+             "segments whose transformed midpoint deviates from the chord by more "
+             "than --smooth-bridges-tol, over a few passes (flat regions stay "
+             "coarse). Default on; --no-smooth-bridges to disable.",
+    )
+    parser.add_argument(
+        "--smooth-bridges-tol", type=float, default=0.1, metavar="MM",
+        help="(--smooth-bridges) Max chord deviation (mm) a printing segment may "
+             "have before it's subdivided (default 0.1). Smaller = smoother arcs "
+             "but more points; 0 disables.",
     )
     parser.add_argument(
         "--extrusion-comp-mode", choices=["vertical", "volume"], default="vertical",

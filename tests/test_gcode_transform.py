@@ -417,6 +417,66 @@ def test_flatten_travel_z():
     print("  PASS flatten-travel-z (travel dive ~3→5 removed; printing move still dives)")
 
 
+def test_smooth_bridges_curvature_refine():
+    """--smooth-bridges adaptively subdivides a PRINTING move where the inverse
+    bends it (a smooth curve coarsely sampled → a V), until the chord deviation
+    drops below the tol. Stub inverse bends Z as a parabola in X (sharpest near
+    X=10); a flat/linear region must NOT be refined."""
+    class _BendBT:
+        is_3d = True
+        mesh = None
+        def invert_points_batch(self, xyz):
+            out = np.asarray(xyz, dtype=np.float64).copy()
+            out[:, 2] -= np.clip(1.0 - ((out[:, 0] - 10.0) / 5.0) ** 2, 0.0, 1.0) * 3.0
+            return out
+
+    gcode = "M83\nG1 X5 Y0 Z5 E1 F1800\nG1 X15 Y0 Z5 E1 F1800\n"  # printing, spans the curve
+
+    def run(smooth):
+        with tempfile.TemporaryDirectory() as td:
+            ip, op = Path(td) / "i.gcode", Path(td) / "o.gcode"
+            ip.write_text(gcode, encoding="utf-8")
+            st = backtransform_gcode_file(
+                ip, op, _BendBT(), subdiv_mm=2.0, n_jobs=1, verbose=False,
+                direction="inverse", extrusion_comp=False, cool_overhangs=False,
+                keep_first_layer=False, flatten_travel_z=False,
+                smooth_bridges=smooth, smooth_bridges_tol=0.1)
+            return op.read_text(encoding="utf-8").splitlines(), st
+
+    def xz(lines):
+        out = []
+        for ln in lines:
+            if not _MOVE_RE.match(ln.strip()):
+                continue
+            mx, mz = re.search(r"\bX([0-9.]+)", ln), re.search(r"\bZ([0-9.]+)", ln)
+            if mx and mz:
+                out.append((float(mx.group(1)), float(mz.group(1))))
+        return out
+
+    def max_chord_dev(pts):  # interior point vs the chord of its neighbours, in the curved span
+        d = 0.0
+        for i in range(1, len(pts) - 1):
+            (x0, z0), (x1, z1), (x2, z2) = pts[i - 1], pts[i], pts[i + 1]
+            if not (6.0 <= x1 <= 14.0) or x2 == x0:
+                continue
+            d = max(d, abs(z1 - (z0 + (z2 - z0) * (x1 - x0) / (x2 - x0))))
+        return d
+
+    off, st_off = run(False)
+    on, st_on = run(True)
+    assert st_on["n_curve_refined"] > 0, "refinement must fire on the curved move"
+    assert len(xz(on)) > len(xz(off)), f"smooth must add points ({len(xz(on))} vs {len(xz(off))})"
+    assert max_chord_dev(xz(off)) > 0.3, "uncorrected curve should be coarse"
+    assert max_chord_dev(xz(on)) < 0.15, f"refined curve must be smooth ({max_chord_dev(xz(on)):.3f} mm)"
+    # E conservation: uniform doubling keeps pieces equal, so total extrusion is
+    # unchanged (the unequal-piece bug would have skewed it).
+    total_e = sum(float(m.group(1)) for ln in on
+                  if _MOVE_RE.match(ln.strip()) for m in [_E_RE.search(ln)] if m)
+    assert abs(total_e - 2.0) < 1e-4, f"refinement must conserve total E (got {total_e:.5f}, want 2.0)"
+    print(f"  PASS smooth-bridges ({len(xz(off))}→{len(xz(on))} pts; "
+          f"chord dev {max_chord_dev(xz(off)):.2f}→{max_chord_dev(xz(on)):.2f} mm)")
+
+
 def test_propeller_forward_inverse_roundtrip():
     """forward then inverse on the real mesh should recover XYZ within a
     fraction of the voxel pitch (interpolation error only)."""
@@ -460,6 +520,7 @@ def main() -> int:
         test_overhang_cooling_slows_feedrate,
         test_keep_first_layer_passthrough,
         test_flatten_travel_z,
+        test_smooth_bridges_curvature_refine,
         test_propeller_forward_inverse_roundtrip,
     ]
     failures = 0

@@ -873,6 +873,93 @@ def _flatten_travel_z(units: list, xyz_orig: np.ndarray, min_dip: float = 0.05) 
     return n_flat
 
 
+def _adaptive_refine_curvature(
+    units: list, xyz_def: np.ndarray, xyz_orig: np.ndarray, transform_fn,
+    tol: float = 0.1, min_seg: float = 0.1, max_passes: int = 4,
+) -> tuple[list, np.ndarray, np.ndarray, int]:
+    """Adaptive curvature subdivision of PRINTING moves: refine where the
+    transform bends the toolpath, so a sharp V (e.g. a bridge valley, where the
+    map stretches a uniform deformed-space step into a long curved original
+    segment) becomes a smooth arc.
+
+    Uniform subdivision is uniform in the INPUT (deformed) space; the map's
+    stretch makes it coarse in the OUTPUT (original) space exactly where it
+    curves. Per pass, for every segment between consecutive points of a printing
+    move (including the entry segment from the previous point), we transform the
+    segment's input-midpoint and measure how far the result sits from the chord
+    of the segment's output endpoints. Segments deviating > `tol` mm (and longer
+    than `min_seg` mm in input space) get the midpoint spliced in; repeat up to
+    `max_passes` (each pass halves the still-bending pieces). Flat/gently-curved
+    regions stay coarse (deviation below tol). Extrusion conserves itself — the
+    writer splits each move's E across its (now finer) pieces.
+
+    Only PRINTING moves (E increasing) are refined; travels are handled by
+    _flatten_travel_z. Returns (units, xyz_def, xyz_orig, n_points_inserted).
+
+    A refined move is subdivided UNIFORMLY (doubled): inserting only the sharp
+    segment's midpoint would make the move's pieces unequal in deformed length,
+    but `_write_transformed_gcode` splits E equally per piece — so unequal pieces
+    would mis-distribute extrusion (a half-length piece getting full E → local
+    over-extrusion exactly at the valley). Doubling keeps every piece equal, so
+    the existing uniform E split stays correct; the cost is a few extra points on
+    a move that only bends locally."""
+    n_inserted = 0
+    for _ in range(max_passes):
+        mids, owners, meta = [], [], {}            # midpoints, (unit, seg j), unit→start_idx
+        for ui, u in enumerate(units):
+            if u[0] != "move":
+                continue
+            _, _oc, e_val, _f, _t, n_pieces, start_idx, e_rel, e_start = u
+            depositing = e_val is not None and (
+                (e_rel and e_val > 1e-9) or (not e_rel and e_val > e_start + 1e-9))
+            if not depositing or start_idx == 0:
+                continue
+            span = np.linalg.norm(xyz_def[start_idx + n_pieces - 1] - xyz_def[start_idx - 1])
+            if span / n_pieces < min_seg:          # pieces already at the floor — stop
+                continue
+            meta[ui] = start_idx
+            for j in range(n_pieces):
+                mids.append(0.5 * (xyz_def[start_idx - 1 + j] + xyz_def[start_idx + j]))
+                owners.append((ui, j))
+        if not mids:
+            break
+        mids_in = np.asarray(mids, dtype=np.float64)
+        mids_out = np.asarray(transform_fn(mids_in), dtype=np.float64)
+        all_mids: dict = {}                        # unit → {seg j: (mid_in, mid_out)}
+        dev_max: dict = {}                         # unit → worst chord deviation
+        for k, (ui, j) in enumerate(owners):
+            s = meta[ui]
+            chord_mid = 0.5 * (xyz_orig[s - 1 + j] + xyz_orig[s + j])
+            all_mids.setdefault(ui, {})[j] = (mids_in[k], mids_out[k])
+            dev_max[ui] = max(dev_max.get(ui, 0.0), float(np.linalg.norm(mids_out[k] - chord_mid)))
+        marked = {ui for ui, d in dev_max.items() if d > tol}
+        if not marked:
+            break
+        new_def, new_orig, new_units = [], [], []
+        for ui, u in enumerate(units):
+            if u[0] != "move":
+                new_units.append(u)
+                continue
+            _, out_cmd, e_val, f, tail, n_pieces, start_idx, e_rel, e_start = u
+            ns = len(new_def)
+            if ui in marked:                       # uniform double: insert every segment midpoint
+                mm = all_mids[ui]
+                for j in range(n_pieces):
+                    new_def.append(mm[j][0]); new_orig.append(mm[j][1])
+                    new_def.append(xyz_def[start_idx + j]); new_orig.append(xyz_orig[start_idx + j])
+                np_new = 2 * n_pieces
+                n_inserted += n_pieces
+            else:
+                for j in range(n_pieces):
+                    new_def.append(xyz_def[start_idx + j]); new_orig.append(xyz_orig[start_idx + j])
+                np_new = n_pieces
+            new_units.append(("move", out_cmd, e_val, f, tail, np_new, ns, e_rel, e_start))
+        units = new_units
+        xyz_def = np.asarray(new_def, dtype=np.float64)
+        xyz_orig = np.asarray(new_orig, dtype=np.float64)
+    return units, xyz_def, xyz_orig, n_inserted
+
+
 def backtransform_gcode_file(
     input_path: str | Path,
     output_path: str | Path,
@@ -893,6 +980,8 @@ def backtransform_gcode_file(
     cool_min_z: float = 0.6,
     keep_first_layer: bool = True,
     flatten_travel_z: bool = True,
+    smooth_bridges: bool = True,
+    smooth_bridges_tol: float = 0.1,
 ) -> dict:
     """Three-pass batched G-code transform using a BackTransform's depth field.
 
@@ -957,6 +1046,19 @@ def backtransform_gcode_file(
             xyz_orig = np.concatenate(results, axis=0)
 
     t2 = _time.perf_counter()
+
+    # Adaptive curvature subdivision: refine printing moves where the transform
+    # bends the path (a bridge valley etc.), turning a coarse V into a smooth
+    # arc. Done first, so the finer pieces flow through travel-flatten /
+    # first-layer / extrusion-comp / cooling / write. Only the full-3D map
+    # exposes a usable transform here (z-only has one too, both work).
+    stats["n_curve_refined"] = 0
+    if smooth_bridges and smooth_bridges_tol > 0 and n_pts:
+        transform_fn = bt.forward_points_batch if direction == "forward" else bt.invert_points_batch
+        units, xyz_def, xyz_orig, n_ref = _adaptive_refine_curvature(
+            units, xyz_def, xyz_orig, transform_fn, tol=smooth_bridges_tol)
+        stats["n_curve_refined"] = n_ref
+        n_pts = xyz_orig.shape[0]
 
     # Travel Z-straighten: a travel across a bridge/overhang gap follows the
     # deformed layer's downward dive in the air → wasteful Z plunge. Ramp its Z
@@ -1096,6 +1198,12 @@ def backtransform_gcode_file(
                 f"[backtransform] first layer (Z≈{stats.get('first_layer_z', 0.0):.3f} mm): "
                 f"{stats['n_first_layer_kept']:,} points left as-sliced — identity, "
                 "no deformation (brim/bed adhesion preserved)"
+            )
+        if stats.get("n_curve_refined"):
+            print(
+                f"[backtransform] curvature refine: +{stats['n_curve_refined']:,} points "
+                f"inserted where the map bends the path > {smooth_bridges_tol:g} mm "
+                "(bridge valleys / sharp curves smoothed to arcs)"
             )
         if stats.get("n_travel_flattened"):
             print(
