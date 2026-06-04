@@ -397,6 +397,79 @@ def test_modal_feedrate_tracks_standalone_F_lines():
           "not stale travel 30000→15600)")
 
 
+def test_bead_preview_rewrites_width_height():
+    """--preview-bead rewrites the slicer's flat ;HEIGHT:/;WIDTH: tags to the REAL
+    deformed road so a loaded-gcode viewer draws it faithfully. With a stub whose
+    layer-gap ratio is 1.5 above z=5 (layers fan out 50%):
+      HEIGHT ← H0·gap                       → 0.2·1.5 = 0.3 everywhere above z=5
+      WIDTH  ← W0·(E_mult/gap):
+        comp OFF (E_mult=1)      → 0.45·(1/1.5)  = 0.30  (width spreads, volume kept)
+        comp vertical (E_mult=gap)→ 0.45·(1.5/1.5)= 0.45  (fixed-width nozzle)
+    The first layer (identity) keeps the nominal tags, and the slicer's own
+    one-decimal ';HEIGHT:0.2' is swallowed (re-emitted at full precision)."""
+    class _Dmap:
+        def layer_gap_ratio(self, xyz):
+            z = np.asarray(xyz, dtype=np.float64)[:, 2]
+            return np.where(z >= 5.0, 1.5, 1.0)
+
+    class _StubBT:
+        is_3d = True
+        mesh = object()
+        dmap = _Dmap()
+        def invert_points_batch(self, xyz):
+            return np.asarray(xyz, dtype=np.float64).copy()  # identity
+
+    gcode = (
+        "M83\n"
+        ";HEIGHT:0.2\n"
+        ";WIDTH:0.45\n"
+        "G1 X0 Y0 Z1 F1800\n"
+        "G1 X10 Y0 Z1 E1\n"    # first layer (z=1) → nominal road kept
+        "G1 X10 Y0 Z6 F1800\n"  # travel up to z=6
+        "G1 X20 Y0 Z6 E1\n"    # deposit where layers fanned out (gap 1.5)
+    )
+
+    def run(comp):
+        with tempfile.TemporaryDirectory() as td:
+            ip, op = Path(td) / "i.gcode", Path(td) / "o.gcode"
+            ip.write_text(gcode, encoding="utf-8")
+            backtransform_gcode_file(
+                ip, op, _StubBT(), subdiv_mm=100, n_jobs=1, verbose=False,
+                direction="inverse", extrusion_comp=comp, extrusion_comp_mode="vertical",
+                cool_overhangs=False, preview_bead=True)
+            return op.read_text(encoding="utf-8").splitlines()
+
+    def tags_before(lines, xtag):
+        h = w = None
+        for ln in lines:
+            s = ln.strip()
+            if s.startswith(";HEIGHT:"):
+                h = float(s.split(":", 1)[1])
+            elif s.startswith(";WIDTH:"):
+                w = float(s.split(":", 1)[1])
+            elif _MOVE_RE.match(s) and xtag in ln:
+                return h, w
+        return h, w
+
+    # Comp OFF: height grows, width spreads to preserve the (uncompensated) volume.
+    off = run(False)
+    h6, w6 = tags_before(off, "X20.000")
+    assert abs(h6 - 0.3) < 1e-3, f"deformed HEIGHT must be 0.2*1.5=0.3, got {h6}"
+    assert abs(w6 - 0.3) < 1e-3, f"comp-off WIDTH must be 0.45/1.5=0.3, got {w6}"
+    h1, w1 = tags_before(off, "X10.000")   # first layer = identity = nominal
+    assert abs(h1 - 0.2) < 1e-3 and abs(w1 - 0.45) < 1e-3, (
+        f"first-layer road must stay nominal (0.2/0.45), got {h1}/{w1}")
+    assert ";HEIGHT:0.2" not in off, "slicer's flat tag must be swallowed, not passed through"
+    assert any(";HEIGHT:0.300000" in ln for ln in off), "must re-emit the real height tag"
+
+    # Comp vertical: the vertical nozzle keeps road WIDTH fixed, all change in height.
+    on = run(True)
+    h6c, w6c = tags_before(on, "X20.000")
+    assert abs(h6c - 0.3) < 1e-3, f"deformed HEIGHT must be 0.3, got {h6c}"
+    assert abs(w6c - 0.45) < 1e-3, f"vertical-comp WIDTH must stay nominal 0.45, got {w6c}"
+    print("  PASS bead preview (gap 1.5 → HEIGHT 0.3; WIDTH 0.30 comp-off / 0.45 vertical)")
+
+
 def test_keep_first_layer_passthrough():
     """--keep-first-layer leaves moves at the first sliced layer EXACTLY as in
     the input (pure identity) while higher layers are transformed — guards
@@ -594,6 +667,7 @@ def main() -> int:
         test_overhang_cooling_ramps_fan_by_severity,
         test_overhang_cooling_slows_feedrate,
         test_modal_feedrate_tracks_standalone_F_lines,
+        test_bead_preview_rewrites_width_height,
         test_keep_first_layer_passthrough,
         test_flatten_travel_z,
         test_smooth_bridges_curvature_refine,

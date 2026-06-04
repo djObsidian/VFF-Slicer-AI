@@ -253,6 +253,9 @@ positional: STL                 path to STL (default ./propeller_fixed_flat.stl)
   --cool-fan-max 0..255         (3d inverse) fan PWM at a full bridge (default 255); lerp by severity
   --cool-speed MM/S             (3d inverse) print speed at a full bridge (default 20; 0 = off); lerp from slicer F
   --cool-probe MM               (3d inverse) downward support-probe column depth (default 0.8)
+  --preview-bead / --no-preview-bead   (3d inverse) rewrite ;HEIGHT:/;WIDTH: so a loaded-gcode
+                               viewer draws the real deformed road (H0*gap, W0*Emult/gap) — cosmetic,
+                               comments only, default on
 
   --export PATH                 save the deformed mesh
   --no-viewer                   skip the interactive viewer (batch)

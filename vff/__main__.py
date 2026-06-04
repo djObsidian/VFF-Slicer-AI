@@ -74,6 +74,7 @@ def _run_gcode_transform(args, stl_path: Path, x: float, y: float, z: float) -> 
             f"  extrusion-comp: {(args.extrusion_comp_mode if args.extrusion_comp else 'off')}\n"
             f"  cool-overhangs: {('S'+str(args.cool_fan_min)+'..'+str(args.cool_fan_max)+' ramped, probe '+str(args.cool_probe)+' mm' + (', speed '+str(args.cool_speed)+' mm/s' if args.cool_speed and args.cool_speed > 0 else ', no speed cap') if (args.cool_overhangs and args.gcode_direction == 'inverse') else 'off')}\n"
             f"  max-z-speed  : {(str(args.max_z_speed)+' mm/s' if args.max_z_speed and args.max_z_speed > 0 else 'off')}\n"
+            f"  preview-bead : {('on (real deformed road in viewer)' if (args.preview_bead and args.gcode_direction == 'inverse') else 'off')}\n"
             f"{align_info}"
             f"  subdiv-mm    : {args.subdiv_mm} mm",
             flush=True,
@@ -95,6 +96,7 @@ def _run_gcode_transform(args, stl_path: Path, x: float, y: float, z: float) -> 
             keep_first_layer=args.keep_first_layer,
             flatten_travel_z=args.flatten_travel_z,
             smooth_bridges=args.smooth_bridges, smooth_bridges_tol=args.smooth_bridges_tol,
+            preview_bead=args.preview_bead,
         )
         return 0
 
@@ -185,6 +187,7 @@ def _run_gcode_transform(args, stl_path: Path, x: float, y: float, z: float) -> 
         keep_first_layer=args.keep_first_layer,
         flatten_travel_z=args.flatten_travel_z,
         smooth_bridges=args.smooth_bridges, smooth_bridges_tol=args.smooth_bridges_tol,
+        preview_bead=args.preview_bead,
     )
     return 0
 
@@ -359,6 +362,18 @@ def main(argv: list[str] | None = None) -> int:
         help="(--smooth-bridges) Max chord deviation (mm) a printing segment may "
              "have before it's subdivided (default 0.1). Smaller = smoother arcs "
              "but more points; 0 disables.",
+    )
+    parser.add_argument(
+        "--preview-bead", action=argparse.BooleanOptionalAction, default=True,
+        help="(gcode transform, inverse + 3d) Rewrite the slicer's ;HEIGHT:/;WIDTH: "
+             "comments so a LOADED-gcode preview (PrusaSlicer's viewer renders the "
+             "road volume from those tags and ignores E) draws the REAL deformed "
+             "bead — taller where layers fan out, pinched where they compress — "
+             "instead of the flat nominal road. HEIGHT←H0·gap, WIDTH←W0·(Emult/gap) "
+             "so width×height equals the actually-deposited volume (matches the "
+             "extrusion comp). Cosmetic: comments only, never the motion/E, so it "
+             "can't change the print. Default on; --no-preview-bead to leave the "
+             "slicer's flat tags.",
     )
     parser.add_argument(
         "--extrusion-comp-mode", choices=["vertical", "volume"], default="vertical",

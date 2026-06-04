@@ -635,6 +635,8 @@ def _write_transformed_gcode(
     overhang_deg: np.ndarray | None = None, cool_fan_min: int = 128,
     cool_fan_max: int = 255, cool_linger: int = 3, max_z_speed: float = 0.0,
     cool_speed: float = 20.0,
+    bead_h_mult: np.ndarray | None = None, bead_w_mult: np.ndarray | None = None,
+    bead_eps: float = 0.003,
 ) -> dict:
     """Pass 3: stream-write the unit list, reading move endpoints from xyz_out.
 
@@ -676,7 +678,21 @@ def _write_transformed_gcode(
     Supported moves (d = 0) get no boost.
     The slicer's own M106/M107 are tracked; while a boost is active they're
     swallowed and restored once the part is supported again for `cool_linger`
-    moves of hysteresis (so the fan doesn't flap)."""
+    moves of hysteresis (so the fan doesn't flap).
+
+    `bead_h_mult` / `bead_w_mult` (per-point multipliers parallel to xyz_out,
+    None = off): the BEAD PREVIEW. The slicer's `;HEIGHT:`/`;WIDTH:` tags
+    describe the FLAT nominal road; after the non-planar inverse the real bead
+    is taller/shorter (layers fan out or pinch) and possibly wider. A loaded
+    G-code preview (PrusaSlicer's viewer) renders the volume straight from those
+    tags and ignores E, so without this it draws every road at the flat nominal
+    — hiding both the real layer-thickness variation and the extrusion comp. We
+    track the slicer's modal nominal height/width, SWALLOW its tags, and re-emit
+    `;HEIGHT: H₀·bead_h_mult` / `;WIDTH: W₀·bead_w_mult` before each relative-E
+    deposit (deduped: only when the value moves by more than `bead_eps` mm, so
+    flat stretches emit once and the bloat tracks the actual variation). This is
+    cosmetic — comments only, no motion/E change — so it never affects the print,
+    only what the viewer draws."""
     _REF_SLOPE = 0.5   # |dz|/len at ~30° (the default --max-tilt); full slowdown here
     lines_out = 0
     cur = None         # last written position (cx, cy, cz)
@@ -704,13 +720,21 @@ def _write_transformed_gcode(
     n_cool_boosts = 0        # M106 lines we injected
     n_cool_moves = 0         # printing moves with an overhang ramp
 
+    # --- bead-preview state ---
+    do_bead = bead_h_mult is not None
+    cur_height = None        # slicer's modal nominal layer height (;HEIGHT:)
+    cur_width = None         # slicer's modal nominal road width  (;WIDTH:)
+    emitted_height = None    # last ;HEIGHT: we re-emitted (for dedup)
+    emitted_width = None     # last ;WIDTH:  we re-emitted (for dedup)
+    n_bead_tags = 0          # ;HEIGHT:/;WIDTH: lines we re-emitted
+
     with out_path.open("w", encoding="utf-8", newline="\n") as fo:
         fo.write(header)
         lines_out += 1
         for u in units:
             if u[0] == "raw":
                 text = u[1]
-                if do_cool or do_feed:
+                if do_cool or do_feed or do_bead:
                     tok = text.lstrip().split()
                     cmd0 = tok[0].upper() if tok else ""
                     if do_cool and cmd0 in ("M106", "M107"):
@@ -741,6 +765,20 @@ def _write_transformed_gcode(
                         if fv is not None:
                             modal_f = fv
                             emitted_f = fv  # this F is now live in the stream
+                    elif do_bead and cmd0.startswith((";HEIGHT:", ";WIDTH:")):
+                        # Swallow the slicer's flat-nominal road tags and stash
+                        # them — we re-emit per-deposit values reflecting the real
+                        # (deformed) bead in the piece loop below.
+                        try:
+                            val = float(cmd0.split(":", 1)[1])
+                        except (ValueError, IndexError):
+                            val = None
+                        if val is not None:
+                            if cmd0.startswith(";HEIGHT:"):
+                                cur_height = val
+                            else:
+                                cur_width = val
+                            continue  # suppressed; re-emitted adjusted below
                 fo.write(text + "\n")
                 lines_out += 1
                 continue
@@ -796,6 +834,26 @@ def _write_transformed_gcode(
                         # the last segment. (No comp — see docstring.)
                         e_piece = e_start + (e_val - e_start) * (piece + 1) / n_pieces
                         parts.append(f"E{e_piece:.5f}")
+                # --- bead preview: re-emit the real (deformed) road dimensions ---
+                # Only for relative-E deposits (matches the extrusion-comp gate);
+                # written here, before this piece's G1, so the viewer applies them
+                # to it. Deduped against the last emitted value so flat stretches
+                # stay quiet and the extra lines track the actual variation.
+                if (do_bead and e_rel and e_val is not None and e_val > 0
+                        and cur_height is not None):
+                    h = cur_height * float(bead_h_mult[pi])
+                    if emitted_height is None or abs(h - emitted_height) > bead_eps:
+                        fo.write(f";HEIGHT:{h:.6f}\n")
+                        lines_out += 1
+                        n_bead_tags += 1
+                        emitted_height = h
+                    if cur_width is not None and bead_w_mult is not None:
+                        w = cur_width * float(bead_w_mult[pi])
+                        if emitted_width is None or abs(w - emitted_width) > bead_eps:
+                            fo.write(f";WIDTH:{w:.6f}\n")
+                            lines_out += 1
+                            n_bead_tags += 1
+                            emitted_width = w
                 # --- feedrate: soft z-slowdown and/or hard Z-velocity cap ---
                 if do_feed and cur is not None and modal_f is not None:
                     dz = abs(oz - cur[2])
@@ -843,6 +901,7 @@ def _write_transformed_gcode(
         "lines_out": lines_out, "n_slowed": n_slowed, "n_zcapped": n_zcapped,
         "n_cool_slowed": n_cool_slowed,
         "n_cool_boosts": n_cool_boosts, "n_cool_moves": n_cool_moves,
+        "n_bead_tags": n_bead_tags,
     }
 
 
@@ -998,6 +1057,7 @@ def backtransform_gcode_file(
     flatten_travel_z: bool = True,
     smooth_bridges: bool = True,
     smooth_bridges_tol: float = 0.1,
+    preview_bead: bool = True,
 ) -> dict:
     """Three-pass batched G-code transform using a BackTransform's depth field.
 
@@ -1168,6 +1228,31 @@ def backtransform_gcode_file(
         overhang_deg = bt.overhang_degree(xyz_orig, probe=cool_probe, min_z=cool_min_z)
         stats["n_overhang_pts"] = int((overhang_deg > 0).sum())
 
+    # Bead preview: rewrite the slicer's ;HEIGHT:/;WIDTH: tags so a loaded-G-code
+    # preview (PrusaSlicer's viewer renders the volume from the tags and ignores
+    # E) draws the REAL deformed road, not the flat nominal. Comments only — never
+    # the motion or E — so it can't change the print. Inverse + full-3D map only
+    # (it needs the layer-gap ratio). Per-point multipliers, applied modally:
+    #   HEIGHT ← H₀ · gap           gap = ∂orig_z/∂def_z, the true vertical spacing
+    #   WIDTH  ← W₀ · (E_mult/gap)   so WIDTH·HEIGHT = the real deposited volume —
+    #     vertical comp (E_mult=gap)   → W₀ (fixed-width nozzle), change all in height;
+    #     volume comp   (E_mult=1/det) → cross-section scales 1/det;
+    #     no comp       (E_mult=1)     → width spreads as 1/gap (volume preserved).
+    bead_h_mult = bead_w_mult = None
+    if (preview_bead and direction == "inverse"
+            and getattr(bt, "is_3d", False) and getattr(bt, "dmap", None) is not None
+            and n_pts):
+        gap = np.clip(bt.dmap.layer_gap_ratio(xyz_orig), 0.3, 3.0)
+        e_mult = escale if escale is not None else np.ones(n_pts)
+        bead_h_mult = gap
+        bead_w_mult = np.clip(e_mult / gap, 0.3, 3.0)
+        if first_layer_mask is not None:   # identity first layer → nominal road
+            bead_h_mult[first_layer_mask] = 1.0
+            bead_w_mult[first_layer_mask] = 1.0
+        stats["bead_preview"] = True
+        stats["bead_h_range"] = (float(bead_h_mult.min()), float(bead_h_mult.max()))
+        stats["bead_w_range"] = (float(bead_w_mult.min()), float(bead_w_mult.max()))
+
     header = (
         "; backtransformed by vff/backtransform.py — "
         "deformed-space XYZ inverted to original (non-planar) space"
@@ -1181,6 +1266,7 @@ def backtransform_gcode_file(
         out_path, units, xyz_orig, header, escale=escale, z_slowdown=z_slowdown,
         max_z_speed=max_z_speed, overhang_deg=overhang_deg,
         cool_fan_min=cool_fan_min, cool_fan_max=cool_fan_max, cool_speed=cool_speed,
+        bead_h_mult=bead_h_mult, bead_w_mult=bead_w_mult,
     )
     stats["lines_out"] = _w["lines_out"]
     stats["n_slowed"] = _w["n_slowed"]
@@ -1188,6 +1274,7 @@ def backtransform_gcode_file(
     stats["n_cool_slowed"] = _w["n_cool_slowed"]
     stats["n_cool_boosts"] = _w["n_cool_boosts"]
     stats["n_cool_moves"] = _w["n_cool_moves"]
+    stats["n_bead_tags"] = _w["n_bead_tags"]
 
     t3 = _time.perf_counter()
 
@@ -1232,6 +1319,15 @@ def backtransform_gcode_file(
                 f"[backtransform] extrusion comp ({stats['e_comp_mode']}): "
                 f"mean x{stats['e_comp_mean']:.3f} (range x{lo:.2f}..x{hi:.2f}) "
                 f"— E rescaled for the deformation"
+            )
+        if stats.get("bead_preview"):
+            hlo, hhi = stats["bead_h_range"]
+            wlo, whi = stats["bead_w_range"]
+            print(
+                f"[backtransform] bead preview: {stats['n_bead_tags']:,} ;HEIGHT:/;WIDTH: "
+                f"tags rewritten to the real deformed road "
+                f"(height x{hlo:.2f}..x{hhi:.2f}, width x{wlo:.2f}..x{whi:.2f} of nominal) "
+                f"— viewer-only, no print change"
             )
         if stats.get("n_slowed"):
             zc = stats.get("n_zcapped", 0)
