@@ -322,6 +322,81 @@ def test_overhang_cooling_slows_feedrate():
     print("  PASS overhang speed ramp (F3000 kept; 0.5→2100; bridge→1200 = 20 mm/s)")
 
 
+def test_modal_feedrate_tracks_standalone_F_lines():
+    """The feedrate tweaks must compute from the slicer's TRUE modal feedrate,
+    even when the slicer sets print speeds on their own line ("G1 F1800") and
+    only travels carry an inline F. Pass 1 stores a bare-F line as a raw
+    passthrough; pass 3 must still pick its F up as the new modal_f. Otherwise
+    modal_f sticks on the last travel's F30000, and the overhang ease computes
+    "slow down from 500 mm/s" — leaving a partial overhang FASTER than the
+    surrounding supported wall (the exact bug this guards against).
+
+    Same overhang stub as the speed-ramp test: degree 0.5 for 5≤z<8, 1.0 for
+    z≥8, 0 below."""
+    class _StubBT:
+        is_3d = True
+        mesh = object()
+        def invert_points_batch(self, xyz):
+            return np.asarray(xyz, dtype=np.float64).copy()  # identity
+        def overhang_degree(self, xyz, probe=0.8, min_z=0.6):
+            z = np.asarray(xyz, dtype=np.float64)[:, 2]
+            d = np.zeros(len(z))
+            d[(z >= 5) & (z < 8)] = 0.5
+            d[z >= 8] = 1.0
+            return d
+
+    # Print speed (30 mm/s = F1800) is set on its OWN line, the way real slicer
+    # output does; only the travel carries an inline F (F30000 = 500 mm/s).
+    gcode = (
+        "M83\n"
+        "G1 X0 Y0 Z1 F30000\n"  # travel — inline F leaks into modal in the bug
+        "G1 F1800\n"            # standalone print-speed line (must become modal)
+        "G1 X1 Y0 Z1 E1\n"     # supported wall → full print speed 1800
+        "G1 X2 Y0 Z6 E1\n"     # degree 0.5 overhang → 1800 + (1200-1800)*0.5 = 1500
+        "G1 X3 Y0 Z9 E1\n"     # degree 1.0 bridge → cool_speed 1200
+    )
+    with tempfile.TemporaryDirectory() as td:
+        ip = Path(td) / "in.gcode"
+        op = Path(td) / "out.gcode"
+        ip.write_text(gcode, encoding="utf-8")
+        backtransform_gcode_file(
+            ip, op, _StubBT(), subdiv_mm=100, n_jobs=1, verbose=False,
+            direction="inverse", extrusion_comp=False,
+            cool_overhangs=True, cool_fan_min=100, cool_fan_max=200,
+            cool_speed=20.0,
+        )
+        lines = op.read_text(encoding="utf-8").splitlines()
+
+    def f_at(lines, xtag):
+        f = None
+        for ln in lines:
+            if not _MOVE_RE.match(ln.strip()):
+                continue
+            mf = re.search(r"\bF(-?[0-9.]+)", ln)
+            if mf:
+                f = float(mf.group(1))
+            if xtag in ln:
+                return f
+        return None
+
+    supported = f_at(lines, "X1.000")
+    overhang = f_at(lines, "X2.000")
+    bridge = f_at(lines, "X3.000")
+    assert abs(supported - 1800) < 1, (
+        f"supported wall must run at the standalone print speed 1800, got {supported}")
+    assert abs(overhang - 1500) < 1, (
+        f"partial overhang must ease from 1800 (→1500), not from the stale "
+        f"travel F30000 (→15600); got {overhang}")
+    assert abs(bridge - 1200) < 1, f"bridge must ease to cool_speed 1200, got {bridge}"
+    # The invariant the user cares about: an overhang is never FASTER than the
+    # supported wall it grows from.
+    assert overhang < supported, (
+        f"overhang ({overhang}) must not print faster than the supported wall "
+        f"({supported})")
+    print("  PASS modal F tracks standalone lines (overhang eased from 1800→1500, "
+          "not stale travel 30000→15600)")
+
+
 def test_keep_first_layer_passthrough():
     """--keep-first-layer leaves moves at the first sliced layer EXACTLY as in
     the input (pure identity) while higher layers are transformed — guards
@@ -518,6 +593,7 @@ def main() -> int:
         test_max_z_speed_caps_travel_moves_too,
         test_overhang_cooling_ramps_fan_by_severity,
         test_overhang_cooling_slows_feedrate,
+        test_modal_feedrate_tracks_standalone_F_lines,
         test_keep_first_layer_passthrough,
         test_flatten_travel_z,
         test_smooth_bridges_curvature_refine,

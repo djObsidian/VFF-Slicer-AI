@@ -710,10 +710,10 @@ def _write_transformed_gcode(
         for u in units:
             if u[0] == "raw":
                 text = u[1]
-                if do_cool:
+                if do_cool or do_feed:
                     tok = text.lstrip().split()
                     cmd0 = tok[0].upper() if tok else ""
-                    if cmd0 in ("M106", "M107"):
+                    if do_cool and cmd0 in ("M106", "M107"):
                         if cmd0 == "M107":
                             slicer_fan_val = 0
                         else:
@@ -725,6 +725,22 @@ def _write_transformed_gcode(
                         # when the overhang ends); otherwise pass it through.
                         if cool_on:
                             continue
+                    elif do_feed and cmd0 in ("G0", "G1", "G00", "G01"):
+                        # A bare feedrate line ("G1 F1800" with no XYZ/E) carries
+                        # no movement, so pass 1 stored it as a raw passthrough —
+                        # but it still updates the slicer's MODAL feedrate. Track
+                        # it here so the tweaks below ease/cap from the slicer's
+                        # true intended print speed. Otherwise modal_f is stuck on
+                        # the last *inline* F, which (for slicers that emit print
+                        # speeds on their own line) is the previous travel's
+                        # F30000 — making the overhang ease compute "slow down
+                        # from 500 mm/s", so a partial overhang lands FASTER than
+                        # the Z-capped tilted walls around it.
+                        fv = next((float(v) for lt, v in _TOKEN_RE.findall(text)
+                                   if lt == "F"), None)
+                        if fv is not None:
+                            modal_f = fv
+                            emitted_f = fv  # this F is now live in the stream
                 fo.write(text + "\n")
                 lines_out += 1
                 continue
