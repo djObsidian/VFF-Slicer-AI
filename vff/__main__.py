@@ -72,7 +72,7 @@ def _run_gcode_transform(args, stl_path: Path, x: float, y: float, z: float) -> 
             f"  smooth-sigma : {args.smooth_sigma} (must match the export)\n"
             f"  depth-method : {args.depth_method} (must match the export)\n"
             f"  extrusion-comp: {(args.extrusion_comp_mode if args.extrusion_comp else 'off')}\n"
-            f"  cool-overhangs: {('S'+str(args.cool_fan_min)+'..'+str(args.cool_fan_max)+' ramped, probe '+str(args.cool_probe)+' mm' + (', speed '+str(args.cool_speed)+' mm/s' if args.cool_speed and args.cool_speed > 0 else ', no speed cap') if (args.cool_overhangs and args.gcode_direction == 'inverse') else 'off')}\n"
+            f"  detect-overhangs: {('S'+str(args.cool_fan_min)+'..'+str(args.cool_fan_max)+' ramped, probe '+str(args.overhang_probe)+' mm' + (', bridge-speed '+str(args.bridge_speed)+' mm/s' if args.bridge_speed and args.bridge_speed > 0 else ', no speed cap') if (args.detect_overhangs and args.gcode_direction == 'inverse') else 'off')}\n"
             f"  max-z-speed  : {(str(args.max_z_speed)+' mm/s' if args.max_z_speed and args.max_z_speed > 0 else 'off')}\n"
             f"  preview-bead : {('on (real deformed road in viewer)' if (args.preview_bead and args.gcode_direction == 'inverse') else 'off')}\n"
             f"{align_info}"
@@ -89,10 +89,10 @@ def _run_gcode_transform(args, stl_path: Path, x: float, y: float, z: float) -> 
             subdiv_mm=args.subdiv_mm, n_jobs=1, direction=args.gcode_direction,
             extrusion_comp=args.extrusion_comp, extrusion_comp_mode=args.extrusion_comp_mode,
             z_slowdown=args.z_slowdown, max_z_speed=args.max_z_speed,
-            cool_overhangs=args.cool_overhangs,
+            detect_overhangs=args.detect_overhangs,
             cool_fan_min=args.cool_fan_min, cool_fan_max=args.cool_fan_max,
-            cool_speed=args.cool_speed,
-            cool_probe=args.cool_probe, cool_min_z=args.cool_min_z,
+            bridge_speed=args.bridge_speed,
+            overhang_probe=args.overhang_probe, cool_min_z=args.cool_min_z,
             keep_first_layer=args.keep_first_layer,
             flatten_travel_z=args.flatten_travel_z,
             smooth_bridges=args.smooth_bridges, smooth_bridges_tol=args.smooth_bridges_tol,
@@ -385,29 +385,30 @@ def main(argv: list[str] | None = None) -> int:
              "On the propeller they differ ~12% and opposite sign in the bulk.",
     )
     parser.add_argument(
-        "--cool-overhangs", action=argparse.BooleanOptionalAction, default=True,
+        "--detect-overhangs", action=argparse.BooleanOptionalAction, default=True,
         help="(--deform-mode 3d, --gcode-direction inverse) Re-detect overhangs/"
-             "bridges on the ORIGINAL-space toolpath and force the fan to "
-             "--cool-fan there. The slicer schedules cooling from the deformed, "
-             "flat mesh; after the inverse, surfaces it saw as flat can hang over "
-             "a void in the real part. Default on; --no-cool-overhangs to disable "
-             "(e.g. ABS/ASA, or to skip the extra mesh-containment pass).",
+             "bridges on the ORIGINAL-space toolpath and react there (boost the "
+             "fan to --cool-fan-* and ease the speed to --bridge-speed). The "
+             "slicer schedules cooling from the deformed, FLAT mesh; after the "
+             "inverse, surfaces it saw as flat can hang over a void in the real "
+             "part. Default on; --no-detect-overhangs to disable (e.g. ABS/ASA, "
+             "or to skip the extra mesh-containment pass).",
     )
     parser.add_argument(
         "--cool-fan-min", type=int, default=128, metavar="0-255",
-        help="(--cool-overhangs) Fan PWM at the LIGHTEST detected overhang "
+        help="(--detect-overhangs) Fan PWM at the LIGHTEST detected overhang "
              "(default 128). The fan ramps linearly from here to --cool-fan-max "
              "with overhang severity (like a slicer's per-overlap fan curve). "
              "Only ever raises the fan above the slicer's own value.",
     )
     parser.add_argument(
         "--cool-fan-max", type=int, default=255, metavar="0-255",
-        help="(--cool-overhangs) Fan PWM at a full bridge / worst overhang "
+        help="(--detect-overhangs) Fan PWM at a full bridge / worst overhang "
              "(default 255 = full).",
     )
     parser.add_argument(
-        "--cool-speed", type=float, default=20.0, metavar="MM/S",
-        help="(--cool-overhangs) Print speed at a full bridge / worst overhang "
+        "--bridge-speed", type=float, default=20.0, metavar="MM/S",
+        help="(--detect-overhangs) Print speed on a full bridge / worst overhang "
              "(default 20 mm/s; 0 = off). The feedrate twin of the cooling fan: "
              "on the detected overhang moves F is ramped down from the slicer's "
              "speed (degree 0) to this at a full bridge (degree 1), giving the "
@@ -415,32 +416,34 @@ def main(argv: list[str] | None = None) -> int:
              "and composes with --z-slowdown / --max-z-speed (the lowest F wins).",
     )
     parser.add_argument(
-        "--cool-probe", type=float, default=0.8, metavar="MM",
-        help="(--cool-overhangs) Depth (mm) of the downward support-probe "
-             "column. Severity = fraction of that column (4 samples) that is "
-             "air below the point: 0 = solid right below (no boost), 1 = air all "
-             "the way (bridge → --cool-fan-max). Default 0.8 (~a few layers).",
+        "--overhang-probe", type=float, default=0.8, metavar="MM",
+        help="(--detect-overhangs) How far (mm) to look STRAIGHT DOWN from each "
+             "road to decide if it is supported. The nozzle is vertical, so a "
+             "point is held up only by part material directly below it; we sample "
+             "4 depths from 0 to this and the overhang severity is the fraction "
+             "that land in air (outside the mesh): 0 = solid right below (no "
+             "boost / full speed), 1 = air all the way down = a bridge (→ "
+             "--cool-fan-max, --bridge-speed). Bigger = stricter (counts a point "
+             "as unsupported unless material reaches deeper). Default 0.8 (~a few "
+             "layers).",
     )
     parser.add_argument(
         "--cool-min-z", type=float, default=0.6, metavar="MM",
-        help="(--cool-overhangs) Never flag points within this height of the "
+        help="(--detect-overhangs) Never flag points within this height of the "
              "plate (the bed supports them). Default 0.6 mm.",
     )
     parser.add_argument(
         "--export", metavar="PATH",
         help="Save the deformed mesh to PATH right after startup (.stl, .ply, .obj, .glb — any "
-             "format trimesh supports). Computes voxels + growth + deform first.",
-    )
-    parser.add_argument(
-        "--no-viewer", action="store_true",
-        help="Skip the interactive viewer. Useful with --export for batch use.",
+             "format trimesh supports). Computes voxels + growth + deform first. "
+             "Batch: produces the file and exits without opening the viewer.",
     )
     parser.add_argument(
         "--section-xz", metavar="PATH",
         help="Render an XZ-plane cross-section (normal +Y) of the growth layer "
              "surfaces and save it to PATH (.png). Only the surfaces' cut curves "
-             "are drawn, orthographic, looking down Y. Headless/off-screen. "
-             "Combine with --no-viewer for a pure batch figure.",
+             "are drawn, orthographic, looking down Y. Headless/off-screen — saves "
+             "the figure and exits without opening the viewer.",
     )
     parser.add_argument(
         "--section-y", type=float, default=None,
@@ -658,8 +661,6 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.export:
         viewer.save_deformed(args.export)
-        if args.no_viewer and not args.section_xz:
-            return 0
 
     if args.section_xz:
         from .section import save_xz_section
@@ -681,14 +682,21 @@ def main(argv: list[str] | None = None) -> int:
             )
         else:
             print(f"  saved ({n_pts:,} section points).", flush=True)
-        if args.no_viewer:
-            return 0
+
+    # A G-code transform alongside --export still runs (then returns): both are
+    # batch producers.
+    if args.gcode_in:
+        return _run_gcode_transform(args, stl_path, x, y, z)
+
+    # --export / --section-xz are batch artifact producers: emit the file(s) and
+    # exit without opening the interactive viewer. (The 3D path never reaches
+    # here — it returns headless far above.) Only a bare run, or --preview-gcode,
+    # opens the viewer.
+    if args.export or args.section_xz:
+        return 0
 
     if args.preview_gcode:
         viewer.load_gcode_preview(args.preview_gcode)
-
-    if args.gcode_in:
-        return _run_gcode_transform(args, stl_path, x, y, z)
 
     print(
         "Viewer ready. Hotkeys: M/V/B  G/C/N/H/D/O  [ / ]  Up/Down  F5",

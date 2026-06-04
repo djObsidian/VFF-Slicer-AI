@@ -19,8 +19,8 @@ __all__ = [
 
 def __getattr__(name: str):
     # Lazy: the viewer pulls in pyvista/VTK, which the headless paths
-    # (--no-viewer, --gcode-in, batch export) don't need. Importing the
-    # package must not require a GUI stack — only touch it on demand.
+    # (--gcode-in, --export, --section-xz, any 3d batch) don't need. Importing
+    # the package must not require a GUI stack — only touch it on demand.
     if name == "Viewer":
         from .viewer import Viewer
         return Viewer

@@ -95,7 +95,7 @@ deform → slice → un‑deform:
 # 1. Export the deformed mesh. --subdivide-error refines coarse flat regions
 #    (e.g. a bore ceiling) so they can actually bow with the deformation.
 vff part.stl --deform-mode 3d --max-tilt 30 --subdivide-error 0.1 \
-    --export deformed.stl --no-viewer
+    --export deformed.stl
 
 # 2. Slice deformed.stl in PrusaSlicer / Cura.
 #    IMPORTANT: relative extrusion (M83), model centered on the bed.
@@ -127,7 +127,7 @@ vff.preview result.gcode        #  E = toggle extrusion,  T = toggle travel
 | `--z-slowdown FACTOR` | (gcode) **Soft ease** for steep non‑planar moves: ×1 flat → ×FACTOR at a 30°+ climb (e.g. `0.5` halves the steepest). Default `1.0` = off. Gentles the *transition* onto steep sections; use `--max-z-speed` to actually bound Z velocity. Composes with it (lower F wins). |
 | `--pitch MM` | Voxel size (default 1.0). Smaller = finer field, more RAM. |
 | `--smooth-sigma N` | Displacement smoothing in voxels (default 2.0). Higher = smoother mesh / fewer folds, softer domes; lower = sharper. |
-| `--cool-overhangs` | (gcode `inverse`) Re‑detect overhangs/bridges on the *original‑space* toolpath and **ramp** the fan there by severity — surfaces the slicer saw as flat (well‑supported) but which become unsupported after the inverse. Fan lerps from `--cool-fan-min` (light overhang, default 128) to `--cool-fan-max` (full bridge, default 255), like a slicer's per‑overlap fan curve; only ever raises the slicer's fan. The feedrate is eased in step: `--cool-speed` (default 20 mm/s, 0 = off) lerps F from the slicer's speed down to that at a full bridge, giving the road time to set over the void (only ever lowers F; composes with `--z-slowdown`/`--max-z-speed`). `--no-cool-overhangs` disables; tune with `--cool-probe` (column depth). |
+| `--detect-overhangs` | (gcode `inverse`) Re‑detect overhangs/bridges on the *original‑space* toolpath and **react** there by severity — surfaces the slicer saw as flat (well‑supported) but which become unsupported after the inverse. Fan lerps from `--cool-fan-min` (light overhang, default 128) to `--cool-fan-max` (full bridge, default 255), like a slicer's per‑overlap fan curve; only ever raises the slicer's fan. The feedrate is eased in step: `--bridge-speed` (default 20 mm/s, 0 = off) lerps F from the slicer's speed down to that at a full bridge, giving the road time to set over the void (only ever lowers F; composes with `--z-slowdown`/`--max-z-speed`). `--no-detect-overhangs` disables; tune the support check with `--overhang-probe` (how far to look straight down). |
 
 The interactive viewer (`vff part.stl`, no flags) shows voxels / growth field /
 deformed mesh by hotkey, but currently visualizes the **Z‑only** legacy map.

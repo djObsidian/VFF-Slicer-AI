@@ -248,18 +248,18 @@ positional: STL                 path to STL (default ./propeller_fixed_flat.stl)
   --remesh adaptive|uniform     (3d --export) refine method (default adaptive = Rivara longest-edge bisection)
   --extrusion-comp / --no-extrusion-comp   (3d) rescale E for the deformation (default on)
   --extrusion-comp-mode vertical|volume    (3d) comp model (default vertical = 3-axis)
-  --cool-overhangs / --no-cool-overhangs   (3d inverse) ramp fan on re-detected overhangs/bridges (default on)
+  --detect-overhangs / --no-detect-overhangs   (3d inverse) re-detect overhangs/bridges and
+                               react (fan + speed) on the original-space toolpath (default on)
   --cool-fan-min 0..255         (3d inverse) fan PWM at the lightest overhang (default 128)
   --cool-fan-max 0..255         (3d inverse) fan PWM at a full bridge (default 255); lerp by severity
-  --cool-speed MM/S             (3d inverse) print speed at a full bridge (default 20; 0 = off); lerp from slicer F
-  --cool-probe MM               (3d inverse) downward support-probe column depth (default 0.8)
+  --bridge-speed MM/S           (3d inverse) print speed on a full bridge (default 20; 0 = off); lerp from slicer F
+  --overhang-probe MM           (3d inverse) how far to look straight down for support (default 0.8)
   --preview-bead / --no-preview-bead   (3d inverse) rewrite ;HEIGHT:/;WIDTH: so a loaded-gcode
                                viewer draws the real deformed road (H0*gap, W0*Emult/gap) — cosmetic,
                                comments only, default on
 
-  --export PATH                 save the deformed mesh
-  --no-viewer                   skip the interactive viewer (batch)
-  --section-xz PATH             headless XZ cross-section of the growth surfaces
+  --export PATH                 save the deformed mesh (batch: writes the file and exits, no viewer)
+  --section-xz PATH             headless XZ cross-section of the growth surfaces (writes and exits)
   --preview-gcode PATH          overlay a G-code file in the viewer
 
   --gcode-in PATH               input G-code to transform

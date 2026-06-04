@@ -667,7 +667,7 @@ def _write_transformed_gcode(
     `cool_speed` at a full bridge (degree 1) — `modal_f + (cool_speed·60 −
     modal_f)·d` — giving the freshly-laid road time to set over the void. Only
     ever lowers F (never speeds a move the slicer already runs slower); needs
-    `overhang_deg` (i.e. --cool-overhangs), since it reuses that severity.
+    `overhang_deg` (i.e. --detect-overhangs), since it reuses that severity.
 
     `overhang_deg` (per-point severity in [0,1], parallel to xyz_out): ramp the
     fan over overhang/bridge moves — see BackTransform3D.overhang_degree. Per
@@ -1047,11 +1047,11 @@ def backtransform_gcode_file(
     extrusion_comp_mode: str = "vertical",
     z_slowdown: float = 1.0,
     max_z_speed: float = 0.0,
-    cool_overhangs: bool = False,
+    detect_overhangs: bool = False,
     cool_fan_min: int = 128,
     cool_fan_max: int = 255,
-    cool_speed: float = 20.0,
-    cool_probe: float = 0.8,
+    bridge_speed: float = 20.0,
+    overhang_probe: float = 0.8,
     cool_min_z: float = 0.6,
     keep_first_layer: bool = True,
     flatten_travel_z: bool = True,
@@ -1222,10 +1222,10 @@ def backtransform_gcode_file(
     # inverse exposes the original mesh to grade "how much material is below this
     # point?" into a [0,1] severity. See BackTransform3D.overhang_degree.
     overhang_deg = None
-    if (cool_overhangs and direction == "inverse"
+    if (detect_overhangs and direction == "inverse"
             and getattr(bt, "is_3d", False) and getattr(bt, "mesh", None) is not None
             and n_pts):
-        overhang_deg = bt.overhang_degree(xyz_orig, probe=cool_probe, min_z=cool_min_z)
+        overhang_deg = bt.overhang_degree(xyz_orig, probe=overhang_probe, min_z=cool_min_z)
         stats["n_overhang_pts"] = int((overhang_deg > 0).sum())
 
     # Bead preview: rewrite the slicer's ;HEIGHT:/;WIDTH: tags so a loaded-G-code
@@ -1258,14 +1258,14 @@ def backtransform_gcode_file(
         "deformed-space XYZ inverted to original (non-planar) space"
         + ("; extrusion volume-compensated" if escale is not None else "")
         + (f"; overhang cooling S{cool_fan_min}..{cool_fan_max} ramped"
-           + (f", speed→{cool_speed:g}mm/s" if cool_speed and cool_speed > 0 else "")
+           + (f", speed→{bridge_speed:g}mm/s" if bridge_speed and bridge_speed > 0 else "")
            if overhang_deg is not None else "")
         + "\n"
     )
     _w = _write_transformed_gcode(
         out_path, units, xyz_orig, header, escale=escale, z_slowdown=z_slowdown,
         max_z_speed=max_z_speed, overhang_deg=overhang_deg,
-        cool_fan_min=cool_fan_min, cool_fan_max=cool_fan_max, cool_speed=cool_speed,
+        cool_fan_min=cool_fan_min, cool_fan_max=cool_fan_max, cool_speed=bridge_speed,
         bead_h_mult=bead_h_mult, bead_w_mult=bead_w_mult,
     )
     stats["lines_out"] = _w["lines_out"]
@@ -1339,8 +1339,8 @@ def backtransform_gcode_file(
         if "n_overhang_pts" in stats:
             sl = stats.get("n_cool_slowed", 0)
             speed_note = (
-                f"; {sl:,} pieces eased toward {cool_speed:g} mm/s"
-                if cool_speed and cool_speed > 0 and sl else ""
+                f"; {sl:,} pieces eased toward {bridge_speed:g} mm/s"
+                if bridge_speed and bridge_speed > 0 and sl else ""
             )
             print(
                 f"[backtransform] overhang cooling: {stats['n_overhang_pts']:,} unsupported "

@@ -249,7 +249,7 @@ def test_overhang_cooling_ramps_fan_by_severity():
         stats = backtransform_gcode_file(
             ip, op, _StubBT(), subdiv_mm=100, n_jobs=1, verbose=False,
             direction="inverse", extrusion_comp=False,
-            cool_overhangs=True, cool_fan_min=100, cool_fan_max=200,
+            detect_overhangs=True, cool_fan_min=100, cool_fan_max=200,
         )
         lines = op.read_text(encoding="utf-8").splitlines()
 
@@ -297,8 +297,8 @@ def test_overhang_cooling_slows_feedrate():
         stats = backtransform_gcode_file(
             ip, op, _StubBT(), subdiv_mm=100, n_jobs=1, verbose=False,
             direction="inverse", extrusion_comp=False,
-            cool_overhangs=True, cool_fan_min=100, cool_fan_max=200,
-            cool_speed=20.0,
+            detect_overhangs=True, cool_fan_min=100, cool_fan_max=200,
+            bridge_speed=20.0,
         )
         lines = op.read_text(encoding="utf-8").splitlines()
 
@@ -362,8 +362,8 @@ def test_modal_feedrate_tracks_standalone_F_lines():
         backtransform_gcode_file(
             ip, op, _StubBT(), subdiv_mm=100, n_jobs=1, verbose=False,
             direction="inverse", extrusion_comp=False,
-            cool_overhangs=True, cool_fan_min=100, cool_fan_max=200,
-            cool_speed=20.0,
+            detect_overhangs=True, cool_fan_min=100, cool_fan_max=200,
+            bridge_speed=20.0,
         )
         lines = op.read_text(encoding="utf-8").splitlines()
 
@@ -436,7 +436,7 @@ def test_bead_preview_rewrites_width_height():
             backtransform_gcode_file(
                 ip, op, _StubBT(), subdiv_mm=100, n_jobs=1, verbose=False,
                 direction="inverse", extrusion_comp=comp, extrusion_comp_mode="vertical",
-                cool_overhangs=False, preview_bead=True)
+                detect_overhangs=False, preview_bead=True)
             return op.read_text(encoding="utf-8").splitlines()
 
     def tags_before(lines, xtag):
@@ -497,7 +497,7 @@ def test_keep_first_layer_passthrough():
             ip.write_text(gcode, encoding="utf-8")
             stats = backtransform_gcode_file(
                 ip, op, _ShiftBT(), subdiv_mm=100, n_jobs=1, verbose=False,
-                direction="inverse", extrusion_comp=False, cool_overhangs=False,
+                direction="inverse", extrusion_comp=False, detect_overhangs=False,
                 keep_first_layer=keep)
             return op.read_text(encoding="utf-8").splitlines(), stats
 
@@ -538,7 +538,7 @@ def test_flatten_travel_z():
             ip.write_text(gcode, encoding="utf-8")
             backtransform_gcode_file(
                 ip, op, _DiveBT(), subdiv_mm=2.0, n_jobs=1, verbose=False,
-                direction="inverse", extrusion_comp=False, cool_overhangs=False,
+                direction="inverse", extrusion_comp=False, detect_overhangs=False,
                 keep_first_layer=False, flatten_travel_z=flatten)
             return op.read_text(encoding="utf-8").splitlines()
 
@@ -586,7 +586,7 @@ def test_smooth_bridges_curvature_refine():
             ip.write_text(gcode, encoding="utf-8")
             st = backtransform_gcode_file(
                 ip, op, _BendBT(), subdiv_mm=2.0, n_jobs=1, verbose=False,
-                direction="inverse", extrusion_comp=False, cool_overhangs=False,
+                direction="inverse", extrusion_comp=False, detect_overhangs=False,
                 keep_first_layer=False, flatten_travel_z=False,
                 smooth_bridges=smooth, smooth_bridges_tol=0.1)
             return op.read_text(encoding="utf-8").splitlines(), st
