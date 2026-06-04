@@ -38,3 +38,6 @@ S4_Slicer/
 # Regenerable deformed-mesh artifacts (Z-only + full-3D comparison)
 deformed_zonly.stl
 deformed_3d.stl
+
+# Local ad-hoc test parts (not pipeline fixtures)
+gfkilox-case_top_r2.stl
