@@ -16,6 +16,16 @@ overhangs that print without support.
 > slicer: thin features and self‑intersecting meshes still need manual tuning.
 > See [Limitations](#limitations--backlog).
 
+## Example
+Produced with:
+```sh
+vff .\example_in\overtest_1.stl --deform-mode 3d --max-tilt 35 --subdivide-error 0.1 --pitch 0.2 --export .\example_out_mid\overtest_deformed.stl --volume 220x220x250
+
+vff .\example_in\overtest_1.stl --deform-mode 3d --max-tilt 35 --pitch 0.2 --gcode-in .\example_out_mid\overtest_deformed.gcode --gcode-out .\example_out_gcode\overtest1_res.gcode --gcode-direction inverse --subdiv-mm 0.5
+```
+![Hex ring overhang test gcode](docs/images/hexa_overhang_test_gcode.png)
+![Hex ring overhang test actual](docs/images/hexa_overhang_test_printed.png)
+
 ---
 
 ## The backstory
