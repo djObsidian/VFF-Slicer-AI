@@ -23,6 +23,9 @@ vff .\example_in\overtest_1.stl --deform-mode 3d --max-tilt 35 --subdivide-error
 
 vff .\example_in\overtest_1.stl --deform-mode 3d --max-tilt 35 --pitch 0.2 --gcode-in .\example_out_mid\overtest_deformed.gcode --gcode-out .\example_out_gcode\overtest1_res.gcode --gcode-direction inverse --subdiv-mm 0.5
 ```
+
+Sliced with Prusaslicer 2.9.2, you can extract settings from `\example_out_mid\overtest_deformed.gcode`
+
 ![Hex ring overhang test gcode](docs/images/hexa_overhang_test_gcode.png)
 ![Hex ring overhang test actual](docs/images/hexa_overhang_test_printed.png)
 
