@@ -7,6 +7,8 @@ Cura, …) cut it, and then transforms that planar G‑code back into **curved
 layers that follow the part's shape** — no stair‑stepping on curved tops, and
 overhangs that print without support.
 
+VFF stands for **V**olumetric **F**lood **F**ill, basically a 3d version of [Flood Fill](https://en.wikipedia.org/wiki/Flood_fill) algorithm with more than 1 starting point.
+
 🇷🇺 [Русская версия — README_ru.md](README_ru.md) ·
 🛠 [Internals & full reference — ARCHITECTURE.md](ARCHITECTURE.md)
 
